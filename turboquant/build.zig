@@ -38,4 +38,18 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
+
+    const bench_mod = b.addModule("bench", .{
+        .root_source_file = b.path("src/bench.zig"),
+        .target = target,
+    });
+    bench_mod.addImport("turboquant", turboquant_mod);
+
+    const bench_exe = b.addExecutable(.{
+        .name = "bench",
+        .root_module = bench_mod,
+    });
+
+    const bench_step = b.step("bench", "Run benchmarks");
+    bench_step.dependOn(&b.addRunArtifact(bench_exe).step);
 }

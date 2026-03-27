@@ -23,7 +23,7 @@ jobs:
 
       - name: Run Tests
         working-directory: turboquant
-        run: zig test src/turboquant.zig -target x86_64-linux
+        run: zig build test -Dtarget=x86_64-linux
 
   release:
     needs: test
