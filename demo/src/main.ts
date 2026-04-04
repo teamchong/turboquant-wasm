@@ -7,8 +7,10 @@ import { createViewerPair, loadScene } from "./viewer.js";
 import { decompressTqply } from "./decompressor.js";
 import { renderLeftStats, renderRightStats, showRatioBadge } from "./stats.js";
 
-const DEFAULT_PLY_URL = "data/lego.ply";
-const DEFAULT_TQPLY_URL = "data/lego.tqply";
+const LFS_BASE = "https://media.githubusercontent.com/media/teamchong/turboquant-wasm/main/demo/public/data";
+const isLocal = window.location.hostname === "localhost";
+const DEFAULT_PLY_URL = isLocal ? "data/lego.ply" : `${LFS_BASE}/lego.ply`;
+const DEFAULT_TQPLY_URL = isLocal ? "data/lego.tqply" : `${LFS_BASE}/lego.tqply`;
 
 function getSceneUrls(): { plyUrl: string; tqplyUrl: string } {
   const params = new URLSearchParams(window.location.search);
