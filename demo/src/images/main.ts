@@ -18,7 +18,8 @@ function thumbUrl(url: string): string {
 interface ImageData {
   meta: ImageMeta[];
   rawVectors: Float32Array | null;
-  compressedBlobs: Uint8Array[];
+  compressedConcat: Uint8Array;
+  bytesPerVector: number;
   tq: TurboQuant;
   dim: number;
   numImages: number;
@@ -55,10 +56,7 @@ async function loadImageData(onProgress: (msg: string) => void): Promise<ImageDa
   const seed = hView.getUint32(11, true);
   const bytesPerVector = hView.getUint16(15, true);
 
-  const compressedBlobs: Uint8Array[] = [];
-  for (let i = 0; i < numImages; i++) {
-    compressedBlobs.push(new Uint8Array(tqvBuffer, 17 + i * bytesPerVector, bytesPerVector));
-  }
+  const compressedConcat = new Uint8Array(tqvBuffer, 17, numImages * bytesPerVector);
 
   onProgress("Initializing TurboQuant...");
   const tq = await TurboQuant.init({ dim, seed });
@@ -73,7 +71,8 @@ async function loadImageData(onProgress: (msg: string) => void): Promise<ImageDa
   return {
     meta,
     rawVectors,
-    compressedBlobs,
+    compressedConcat,
+    bytesPerVector,
     tq,
     dim,
     numImages,
@@ -135,15 +134,16 @@ function findSimilar(data: ImageData, queryIdx: number) {
   queryImage.src = thumbUrl(data.meta[queryIdx].url);
   querySection.classList.remove("hidden");
 
-  // Compute similarity using TQ dot product
-  const start = performance.now();
-  const scores = new Float32Array(data.numImages);
-  const queryBlob = data.compressedBlobs[queryIdx];
+  // Decode the clicked image's vector, then batch search all compressed vectors
+  const queryBlob = new Uint8Array(
+    data.compressedConcat.buffer,
+    data.compressedConcat.byteOffset + queryIdx * data.bytesPerVector,
+    data.bytesPerVector,
+  );
   const queryVec = data.tq.decode(queryBlob);
 
-  for (let i = 0; i < data.numImages; i++) {
-    scores[i] = data.tq.dot(queryVec, data.compressedBlobs[i]);
-  }
+  const start = performance.now();
+  const scores = data.tq.dotBatch(queryVec, data.compressedConcat, data.bytesPerVector);
   const tqMs = performance.now() - start;
 
   // Sort by score descending (skip self)
@@ -153,7 +153,7 @@ function findSimilar(data: ImageData, queryIdx: number) {
   // Show info
   queryInfo.innerHTML = `
     Found similar images in <span class="fast">${tqMs.toFixed(1)}ms</span>
-    using <span class="highlight">tq.dot()</span> on compressed vectors
+    using <span class="highlight">tq.dotBatch()</span> on compressed vectors
   `;
 
   renderGallery(data, ranked, scores, queryIdx);

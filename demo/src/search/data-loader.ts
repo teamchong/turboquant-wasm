@@ -7,7 +7,7 @@ import { TurboQuant } from "turboquant-wasm";
 export interface SearchData {
   passages: string[];
   rawVectors: Float32Array | null;
-  compressedBlobs: Uint8Array[];
+  compressedConcat: Uint8Array;
   tq: TurboQuant;
   dim: number;
   numVectors: number;
@@ -54,17 +54,12 @@ export async function loadSearchData(
   );
   const header = parseTqvHeader(tqvBuffer);
 
-  const compressedBlobs: Uint8Array[] = [];
   const bodyOffset = 17;
-  for (let i = 0; i < header.numVectors; i++) {
-    compressedBlobs.push(
-      new Uint8Array(
-        tqvBuffer,
-        bodyOffset + i * header.bytesPerVector,
-        header.bytesPerVector,
-      ),
-    );
-  }
+  const compressedConcat = new Uint8Array(
+    tqvBuffer,
+    bodyOffset,
+    header.numVectors * header.bytesPerVector,
+  );
 
   onProgress("Initializing TurboQuant WASM...");
   const tq = await TurboQuant.init({ dim: header.dim, seed: header.seed });
@@ -86,7 +81,7 @@ export async function loadSearchData(
   return {
     passages,
     rawVectors,
-    compressedBlobs,
+    compressedConcat,
     tq,
     dim: header.dim,
     numVectors: header.numVectors,

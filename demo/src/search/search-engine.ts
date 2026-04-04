@@ -23,12 +23,9 @@ export function search(
   data: SearchData,
   topK: number = 10,
 ): SearchComparison {
-  // TurboQuant compressed search using tq.dot()
+  // TurboQuant compressed search using dotBatch() — single WASM call
   const tqStart = performance.now();
-  const tqScores = new Float32Array(data.numVectors);
-  for (let i = 0; i < data.numVectors; i++) {
-    tqScores[i] = data.tq.dot(query, data.compressedBlobs[i]);
-  }
+  const tqScores = data.tq.dotBatch(query, data.compressedConcat, data.bytesPerVector);
   const tqTimeMs = performance.now() - tqStart;
 
   const tqTopK = topKIndices(tqScores, topK);
@@ -37,17 +34,6 @@ export function search(
     passage: data.passages[i],
     score: tqScores[i],
   }));
-
-  // Debug: verify TQ dot product quality
-  if (data.rawVectors) {
-    console.log("=== TQ dot product debug ===");
-    console.log("Query dim:", query.length, "norm:", Math.sqrt(query.reduce((s, v) => s + v * v, 0)).toFixed(4));
-    for (const idx of tqTopK.slice(0, 3)) {
-      let trueDot = 0;
-      for (let d = 0; d < data.dim; d++) trueDot += query[d] * data.rawVectors[idx * data.dim + d];
-      console.log(`  vec[${idx}]: tq.dot=${tqScores[idx].toFixed(4)}, true dot=${trueDot.toFixed(4)}`);
-    }
-  }
 
   // Brute-force uncompressed search
   let bruteResults: SearchResult[] | null = null;
