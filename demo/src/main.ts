@@ -7,8 +7,9 @@ import { createViewerPair, loadScene } from "./viewer.js";
 import { decompressTqply } from "./decompressor.js";
 import { renderLeftStats, renderRightStats, showRatioBadge } from "./stats.js";
 
-const DEFAULT_PLY_URL = "data/scene.ply";
-const DEFAULT_TQPLY_URL = "data/scene.tqply";
+const RELEASE_BASE = "https://github.com/teamchong/turboquant-wasm/releases/download/v0.2.2";
+const DEFAULT_PLY_URL = `${RELEASE_BASE}/scene.ply`;
+const DEFAULT_TQPLY_URL = `${RELEASE_BASE}/scene.tqply`;
 
 function getSceneUrls(): { plyUrl: string; tqplyUrl: string } {
   const params = new URLSearchParams(window.location.search);
