@@ -157,6 +157,7 @@ function findSimilar(data: ImageData, queryIdx: number) {
   `;
 
   renderGallery(data, ranked, scores, queryIdx);
+  window.scrollTo({ top: 0, behavior: "smooth" });
 }
 
 async function main() {
