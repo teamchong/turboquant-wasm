@@ -58,8 +58,9 @@ async function getWasm(): Promise<TurboQuantExports> {
 
   wasmReady = (async () => {
     const bytes = decodeBase64(wasmBase64);
-    const result = await WebAssembly.instantiate(bytes.buffer, {});
-    wasmInstance = result.instance.exports as unknown as TurboQuantExports;
+    const module = await WebAssembly.compile(bytes);
+    const instance = await WebAssembly.instantiate(module, {});
+    wasmInstance = instance.exports as unknown as TurboQuantExports;
     return wasmInstance;
   })();
 
