@@ -271,3 +271,17 @@ body {
 @keyframes spin {
   to { transform: rotate(360deg); }
 }
+
+.demo-nav {
+  margin-top: 8px;
+  font-size: 0.75rem;
+}
+
+.demo-nav a {
+  color: #4fc3f7;
+  text-decoration: none;
+}
+
+.demo-nav a:hover {
+  text-decoration: underline;
+}
