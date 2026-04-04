@@ -2,19 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
-    paths:
-      - 'turboquant/**'
-      - '.github/workflows/**'
-      - '.gitignore'
+    branches: [master]
   pull_request:
-    paths:
-      - 'turboquant/**'
-      - '.github/workflows/**'
-      - '.gitignore'
+    branches: [master]
 
 jobs:
-  test:
+  zig-test:
     strategy:
       fail-fast: false
       matrix:
@@ -27,11 +20,9 @@ jobs:
             target: x86_64-windows
     runs-on: ${{ matrix.os }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+      - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
 
@@ -42,3 +33,42 @@ jobs:
       - name: Run Tests
         working-directory: turboquant
         run: zig build test -Dtarget=${{ matrix.target }}
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install binaryen (wasm-opt)
+        run: sudo apt-get install -y binaryen
+
+      - name: Cache bun dependencies
+        uses: actions/cache@v4
+        with:
+          path: ~/.bun/install/cache
+          key: bun-${{ runner.os }}-${{ hashFiles('turboquant/bun.lock', 'turboquant/package.json') }}
+          restore-keys: bun-${{ runner.os }}-
+
+      - name: Install
+        working-directory: turboquant
+        run: bun install
+
+      - name: Build
+        working-directory: turboquant
+        run: bun run build
+
+      - name: Verify dist
+        working-directory: turboquant
+        run: |
+          test -f dist/index.js
+          test -f dist/index.d.ts
+          test -f dist/turboquant.wasm
+          echo "✓ All build artifacts present"

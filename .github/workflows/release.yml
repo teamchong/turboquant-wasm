@@ -1,60 +1,115 @@
 name: Release
 
 on:
+  workflow_dispatch:
   push:
-    tags:
-      - 'v*'
+    branches:
+      - master
+    paths:
+      - 'turboquant/package.json'
 
 jobs:
-  test:
+  check-version:
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      should_release: ${{ steps.version.outputs.should_release }}
 
-      - name: Setup Zig
-        uses: mlugg/setup-zig@v2
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check if version needs release
+        id: version
+        run: |
+          VERSION=$(node -p "require('./turboquant/package.json').version")
+          TAG="v$VERSION"
+          echo "Version: $VERSION, Tag: $TAG"
+
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            echo "Tag $TAG already exists, skipping release"
+            echo "should_release=false" >> $GITHUB_OUTPUT
+          else
+            echo "Version $VERSION not yet released"
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            echo "tag=$TAG" >> $GITHUB_OUTPUT
+            echo "should_release=true" >> $GITHUB_OUTPUT
+          fi
+
+  publish-npm:
+    needs: check-version
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
         with:
           version: 0.15.2
 
-      - name: Format Check
-        working-directory: turboquant
-        run: zig fmt --check src/
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
 
-      - name: Run Tests
-        working-directory: turboquant
-        run: zig build test -Dtarget=x86_64-linux
+      - name: Install binaryen (wasm-opt)
+        run: sudo apt-get install -y binaryen
 
-  release:
-    needs: test
+      - name: Install
+        working-directory: turboquant
+        run: bun install
+
+      - name: Build
+        working-directory: turboquant
+        run: bun run build
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Publish to npm (OIDC)
+        working-directory: turboquant
+        run: npm publish --provenance --access public
+
+  create-tag:
+    needs: [check-version, publish-npm]
+    if: needs.check-version.outputs.should_release == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
+
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Get version
-        id: version
-        run: echo "VERSION=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
-
-      - name: Create tarball
+      - name: Create and push tag
         run: |
-          cd turboquant
-          tar -czvf ../turboquant-${{ steps.version.outputs.VERSION }}.tar.gz \
-            build.zig \
-            build.zig.zon \
-            src \
-            LICENSE \
-            README.md \
-            docs
+          TAG="${{ needs.check-version.outputs.tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$TAG" -m "Release $TAG"
+          git push origin "$TAG"
 
-      - name: Create Release
+  release:
+    needs: [check-version, publish-npm, create-tag]
+    if: needs.check-version.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v${{ steps.version.outputs.VERSION }}
-          name: Release v${{ steps.version.outputs.VERSION }}
-          files: turboquant-${{ steps.version.outputs.VERSION }}.tar.gz
+          tag_name: ${{ needs.check-version.outputs.tag }}
           generate_release_notes: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
