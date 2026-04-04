@@ -5,7 +5,7 @@ pub const format = @import("format.zig");
 const rotation = @import("rotation.zig");
 pub const math = @import("math.zig");
 pub const polar = @import("polar.zig");
-const qjl = @import("qjl.zig");
+pub const qjl = @import("qjl.zig");
 
 pub const EncodeError = error{ InvalidDimension, OutOfMemory };
 pub const DecodeError = error{ InvalidHeader, InvalidPayload, OutOfMemory };

@@ -41,6 +41,7 @@ interface TurboQuantExports {
   tq_encode(handle: number, inputPtr: number, dim: number, outLenPtr: number): number;
   tq_decode(handle: number, compPtr: number, compLen: number, outLenPtr: number): number;
   tq_dot(handle: number, queryPtr: number, dim: number, compPtr: number, compLen: number): number;
+  tq_dot_batch(handle: number, queryPtr: number, dim: number, compPtr: number, bytesPerVector: number, numVectors: number, outScoresPtr: number): void;
   tq_alloc(len: number): number;
   tq_free(ptr: number, len: number): void;
   tq_alloc_f32(count: number): number;
@@ -230,6 +231,45 @@ export class TurboQuant {
     ex.tq_free(compPtr, compressed.length);
 
     return score;
+  }
+
+  /**
+   * Batch dot product: compute dot(query, vectors[i]) for all vectors.
+   * Much faster than calling dot() in a loop — one WASM call, query rotated once.
+   *
+   * @param query - Float32Array of length `dim`
+   * @param compressedConcat - All compressed vectors concatenated into one Uint8Array
+   * @param bytesPerVector - Size of each compressed vector (from encode().length)
+   * @returns Float32Array of scores, one per vector
+   */
+  dotBatch(query: Float32Array, compressedConcat: Uint8Array, bytesPerVector: number): Float32Array {
+    if (query.length !== this.dim) {
+      throw new Error(`TurboQuant: expected ${this.dim} dims, got ${query.length}`);
+    }
+    const numVectors = Math.floor(compressedConcat.length / bytesPerVector);
+    const ex = this.#ex;
+
+    const qPtr = wasmWriteF32(ex, query);
+    const compPtr = wasmWriteU8(ex, compressedConcat);
+    const scoresPtr = ex.tq_alloc_f32(numVectors);
+    if (!scoresPtr) {
+      ex.tq_free(qPtr, query.byteLength);
+      ex.tq_free(compPtr, compressedConcat.length);
+      throw new Error("TurboQuant: WASM alloc failed for scores");
+    }
+
+    ex.tq_dot_batch(
+      this.#handle, qPtr, this.dim,
+      compPtr, bytesPerVector, numVectors, scoresPtr,
+    );
+
+    const scores = new Float32Array(ex.memory.buffer, scoresPtr, numVectors).slice();
+
+    ex.tq_free(qPtr, query.byteLength);
+    ex.tq_free(compPtr, compressedConcat.length);
+    ex.tq_free_f32(scoresPtr, numVectors);
+
+    return scores;
   }
 
   /** Release engine resources. Call when done. */

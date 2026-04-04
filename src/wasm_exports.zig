@@ -88,6 +88,48 @@ export fn tq_dot(handle: i32, query_ptr: [*]const f32, dim: u32, compressed_ptr:
     return engine_ptr.dot(q, compressed);
 }
 
+/// Batch dot product: compute dot(query, compressed[i]) for i in 0..num_vectors.
+/// compressed_ptr points to num_vectors * bytes_per_vector contiguous bytes.
+/// Writes results to out_scores (caller-allocated f32 array of length num_vectors).
+export fn tq_dot_batch(
+    handle: i32,
+    query_ptr: [*]const f32,
+    dim: u32,
+    compressed_ptr: [*]const u8,
+    bytes_per_vector: u32,
+    num_vectors: u32,
+    out_scores: [*]f32,
+) void {
+    const idx: usize = @intCast(handle);
+    if (idx >= MAX_ENGINES) return;
+    const engine_ptr = engine_slots[idx] orelse return;
+
+    const q = query_ptr[0..dim];
+
+    // Pre-rotate query once (engine.dot rotates every call)
+    engine_ptr.rot_op.rotate(q, engine_ptr.scratch_rotated);
+    const rotated_q = engine_ptr.scratch_rotated;
+
+    for (0..num_vectors) |i| {
+        const offset = i * bytes_per_vector;
+        const compressed = compressed_ptr[offset .. offset + bytes_per_vector];
+
+        const header = turboquant.format.readHeader(compressed) catch {
+            out_scores[i] = 0;
+            continue;
+        };
+        const payload = turboquant.format.slicePayload(compressed, header) catch {
+            out_scores[i] = 0;
+            continue;
+        };
+
+        const polar_sum = turboquant.polar.dotProduct(rotated_q, payload.polar, header.max_r);
+        const qjl_sum = turboquant.qjl.estimateDotWithWorkspace(rotated_q, payload.qjl, header.gamma, &engine_ptr.qjl_workspace);
+
+        out_scores[i] = polar_sum + qjl_sum;
+    }
+}
+
 /// Allocate bytes in WASM linear memory (for JS to write into).
 export fn tq_alloc(len: u32) ?[*]u8 {
     const slice = wasm_allocator.alloc(u8, len) catch return null;
