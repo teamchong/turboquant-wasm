@@ -1,6 +1,6 @@
 {
   "name": "turboquant-wasm",
-  "version": "0.2.6",
+  "version": "0.2.7",
   "description": "TurboQuant WASM SIMD vector compression — 3 bits/dim with fast dot product. Requires relaxed SIMD (Chrome 114+, Firefox 128+, Safari 18+, Node 20+)",
   "type": "module",
   "main": "dist/index.js",

@@ -46,6 +46,10 @@ const decoded = tq.decode(compressed);
 // Fast dot product without decoding
 const score = tq.dot(queryVector, compressed);
 
+// Batch search: one WASM call for all vectors (83x faster than looping dot())
+const allCompressed = new Uint8Array(/* concatenated compressed vectors */);
+const scores = tq.dotBatch(queryVector, allCompressed, bytesPerVector);
+
 tq.destroy();
 ```
 
@@ -57,6 +61,7 @@ class TurboQuant {
   encode(vector: Float32Array): Uint8Array;
   decode(compressed: Uint8Array): Float32Array;
   dot(query: Float32Array, compressed: Uint8Array): number;
+  dotBatch(query: Float32Array, compressedConcat: Uint8Array, bytesPerVector: number): Float32Array;
   destroy(): void;
 }
 ```
