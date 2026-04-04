@@ -11,10 +11,10 @@
     <h1>turboquant<span class="dim">-wasm</span></h1>
     <p class="tagline">Shrink embedding vectors 6x. Search them without decompressing.</p>
     <p class="description">
-      Vector compression has existed for years (FAISS, ScaNN, PQ), but they require
-      a training step on your dataset first. TurboQuant (Google Research, ICLR 2026) skips that —
-      just encode any vector immediately, no codebook, no training. Three lines of code:
-      <code>encode()</code>, <code>decode()</code>, <code>dot()</code>.
+      Float32 embeddings don't compress well — gzip only shrinks them 7% (7.3 MB → 6.8 MB).
+      TurboQuant (Google Research, ICLR 2026) reduces them 6x (7.3 MB → 1.2 MB) and lets you
+      search directly on compressed data without decompressing. No training step, no codebook —
+      just <code>encode()</code>, <code>decode()</code>, <code>dot()</code>.
       This npm package runs it in the browser via WASM with relaxed SIMD.
     </p>
 
