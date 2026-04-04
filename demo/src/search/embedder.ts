@@ -1,28 +1,16 @@
 /**
  * Client-side query embedding using Transformers.js (all-MiniLM-L6-v2).
- * The ONNX model (~23MB) is downloaded once per session.
- * Cache is cleared on init to prevent OOM on mobile from stale cached data.
+ * The ONNX model (~23MB) is downloaded once and cached by the browser.
  */
 
 import { pipeline, type FeatureExtractionPipeline } from "@huggingface/transformers";
 
 let embedder: FeatureExtractionPipeline | null = null;
 
-async function clearModelCache() {
-  const cacheNames = await caches.keys();
-  for (const name of cacheNames) {
-    if (name.includes("transformers") || name.includes("onnx")) {
-      await caches.delete(name);
-    }
-  }
-}
-
 export async function initEmbedder(
   onProgress: (msg: string) => void,
 ): Promise<void> {
-  onProgress("Preparing embedding model...");
-  await clearModelCache();
-  onProgress("Loading embedding model (~23MB)...");
+  onProgress("Loading embedding model (~23MB, cached after first visit)...");
   embedder = await pipeline("feature-extraction", "Xenova/all-MiniLM-L6-v2");
   onProgress("Embedding model ready");
 }
