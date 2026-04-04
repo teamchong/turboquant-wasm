@@ -5,7 +5,7 @@
 [![gzip size](https://img.shields.io/badge/gzip-~12kB-blue)](https://www.npmjs.com/package/turboquant-wasm)
 [![license](https://img.shields.io/npm/l/turboquant-wasm)](https://github.com/teamchong/turboquant-wasm/blob/main/LICENSE)
 
-WASM + relaxed SIMD build of [botirk38/turboquant](https://github.com/botirk38/turboquant) for browsers and Node.js.
+Experimental WASM + relaxed SIMD build of [botirk38/turboquant](https://github.com/botirk38/turboquant) for browsers and Node.js.
 
 Based on the paper ["TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate"](https://arxiv.org/abs/2504.19874) (Google Research, ICLR 2026).
 
