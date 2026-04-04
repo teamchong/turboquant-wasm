@@ -9,6 +9,8 @@ WASM + relaxed SIMD build of [botirk38/turboquant](https://github.com/botirk38/t
 
 Based on the paper ["TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate"](https://arxiv.org/abs/2504.19874) (Google Research, ICLR 2026).
 
+**[Live Demo](https://teamchong.github.io/turboquant-wasm/)** — vector search, image similarity, and 3D Gaussian Splatting compression running in the browser.
+
 ## What this adds
 
 - **npm package** with embedded WASM — `npm install turboquant-wasm`
