@@ -18,17 +18,15 @@ dist/
 bun.lock
 src/js/turboquant-wasm.generated.ts
 
-# Demo data (too large for git)
+# Demo data — large 3DGS files (too large for git)
 demo/data/*.ply
 demo/data/*.tqply
 demo/data/*.splat
 demo/data/*.ksplat
-demo/data/*.bin
-demo/data/*.tqv
 demo/data/*.npy
-demo/data/passages.json
 demo/data/image_ids.json
-demo/data/image_meta.json
+# Search + image demo data are small enough to commit (~11MB)
+# so GitHub Pages deployment works without external hosting.
 
 # OS
 .DS_Store
