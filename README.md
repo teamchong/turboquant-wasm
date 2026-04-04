@@ -6,7 +6,7 @@ Based on the paper "TurboQuant: Online Vector Quantization with Near-optimal Dis
 
 ## What this adds
 
-- **npm package** with embedded WASM — `npm install turboquant`
+- **npm package** with embedded WASM — `npm install turboquant-wasm`
 - **Relaxed SIMD** — `@mulAdd` FMA maps to `f32x4.relaxed_madd`
 - **SIMD-vectorized** QJL sign packing/unpacking and scaling
 - **TypeScript API** — `TurboQuant.init()` / `encode()` / `decode()` / `dot()`
@@ -26,7 +26,7 @@ The WASM binary uses relaxed SIMD instructions:
 ## Quick Start
 
 ```ts
-import { TurboQuant } from "turboquant";
+import { TurboQuant } from "turboquant-wasm";
 
 const tq = await TurboQuant.init({ dim: 1024, seed: 42 });
 
