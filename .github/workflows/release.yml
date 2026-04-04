@@ -6,7 +6,7 @@ on:
     branches:
       - master
     paths:
-      - 'turboquant/package.json'
+      - 'package.json'
 
 jobs:
   check-version:
@@ -24,7 +24,7 @@ jobs:
       - name: Check if version needs release
         id: version
         run: |
-          VERSION=$(node -p "require('./turboquant/package.json').version")
+          VERSION=$(node -p "require('./package.json').version")
           TAG="v$VERSION"
           echo "Version: $VERSION, Tag: $TAG"
 
@@ -61,11 +61,9 @@ jobs:
         run: sudo apt-get install -y binaryen
 
       - name: Install
-        working-directory: turboquant
         run: bun install
 
       - name: Build
-        working-directory: turboquant
         run: bun run build
 
       - name: Setup Node.js
@@ -75,7 +73,6 @@ jobs:
           registry-url: 'https://registry.npmjs.org'
 
       - name: Publish to npm (OIDC)
-        working-directory: turboquant
         run: npm publish --provenance --access public
 
   create-tag:

@@ -27,11 +27,9 @@ jobs:
           version: 0.15.2
 
       - name: Format Check
-        working-directory: turboquant
         run: zig fmt --check src/
 
       - name: Run Tests
-        working-directory: turboquant
         run: zig build test -Dtarget=${{ matrix.target }}
 
   build:
@@ -54,19 +52,16 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.bun/install/cache
-          key: bun-${{ runner.os }}-${{ hashFiles('turboquant/bun.lock', 'turboquant/package.json') }}
+          key: bun-${{ runner.os }}-${{ hashFiles('bun.lock', 'package.json') }}
           restore-keys: bun-${{ runner.os }}-
 
       - name: Install
-        working-directory: turboquant
         run: bun install
 
       - name: Build
-        working-directory: turboquant
         run: bun run build
 
       - name: Verify dist
-        working-directory: turboquant
         run: |
           test -f dist/index.js
           test -f dist/index.d.ts

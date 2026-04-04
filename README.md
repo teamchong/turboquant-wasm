@@ -57,8 +57,6 @@ class TurboQuant {
 ## Building
 
 ```bash
-cd turboquant
-
 # Run tests
 zig test -target aarch64-macos src/turboquant.zig
 

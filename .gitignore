@@ -4,12 +4,7 @@
 zig-out/
 *.o
 *.a
-
-# Nested Zig builds (turboquant package)
-turboquant/.zig-cache/
-turboquant/zig-out/
-turboquant/*.o
-turboquant/*.a
+quality
 
 # Build artifacts
 profile
@@ -18,10 +13,10 @@ qjl
 *.sample.txt
 
 # Node/npm
-turboquant/node_modules/
-turboquant/dist/
-turboquant/bun.lock
-turboquant/src/js/turboquant-wasm.generated.ts
+node_modules/
+dist/
+bun.lock
+src/js/turboquant-wasm.generated.ts
 
 # OS
 .DS_Store
