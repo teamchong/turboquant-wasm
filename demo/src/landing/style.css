@@ -47,8 +47,8 @@ h1 .dim {
 
 .demos {
   display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 20px;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
   margin-bottom: 40px;
 }
 
@@ -121,7 +121,7 @@ h1 .dim {
   text-decoration: underline;
 }
 
-@media (max-width: 600px) {
+@media (max-width: 768px) {
   .demos {
     grid-template-columns: 1fr;
   }

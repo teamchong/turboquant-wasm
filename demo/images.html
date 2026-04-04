@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TurboQuant — Image Similarity Search</title>
+  <link rel="stylesheet" href="./src/images/style.css" />
+</head>
+<body>
+  <div id="app">
+    <div id="header">
+      <h1>TurboQuant <span class="dim">Image Similarity</span></h1>
+      <p class="subtitle">Click any image to find similar ones. CLIP embeddings compressed 6.4x with TurboQuant.</p>
+      <p class="note">2,000 Unsplash photos. Similarity computed via tq.dot() directly on compressed 512-dim vectors.</p>
+    </div>
+
+    <div id="main">
+      <div id="query-section" class="hidden">
+        <div id="query-image-wrap">
+          <img id="query-image" />
+        </div>
+        <div id="query-info"></div>
+        <button id="btn-clear">Show all</button>
+      </div>
+
+      <div id="stats-bar">
+        <div id="index-stats"></div>
+      </div>
+
+      <div id="gallery"></div>
+    </div>
+
+    <div id="loading-overlay">
+      <div class="spinner"></div>
+      <div id="loading-text">Loading image index...</div>
+    </div>
+  </div>
+
+  <script type="module" src="./src/images/main.ts"></script>
+</body>
+</html>
