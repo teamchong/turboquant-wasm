@@ -1,6 +1,9 @@
 /**
  * Vector search demo entry point.
  * Side-by-side: TurboQuant compressed search vs brute-force uncompressed.
+ *
+ * On desktop: loads ONNX embedding model for free-text queries.
+ * On mobile/fallback: uses pre-computed query embeddings for suggested queries.
  */
 
 import { loadSearchData, type SearchData } from "./data-loader.js";
@@ -8,6 +11,7 @@ import { search, type SearchComparison } from "./search-engine.js";
 import { initEmbedder, embedQuery } from "./embedder.js";
 
 const SUGGESTED_QUERIES = [
+  "machine learning",
   "how does the human heart pump blood",
   "history of the roman empire",
   "what causes earthquakes and tsunamis",
@@ -17,6 +21,9 @@ const SUGGESTED_QUERIES = [
   "space exploration and mars missions",
   "evolution of programming languages",
 ];
+
+let precomputedEmbeddings: Record<string, number[]> | null = null;
+let embedderReady = false;
 
 function showLoading(msg: string) {
   const overlay = document.getElementById("loading-overlay")!;
@@ -146,12 +153,42 @@ function renderSuggestedQueries(onSelect: (query: string) => void) {
   });
 }
 
+async function getQueryVector(text: string): Promise<Float32Array | null> {
+  // Try pre-computed embeddings first
+  if (precomputedEmbeddings && text in precomputedEmbeddings) {
+    return new Float32Array(precomputedEmbeddings[text]);
+  }
+
+  // Try the ONNX embedder
+  if (embedderReady) {
+    return await embedQuery(text);
+  }
+
+  return null;
+}
+
 async function main() {
   showLoading("Loading search index...");
   const data = await loadSearchData((msg) => showLoading(msg));
 
+  // Load pre-computed query embeddings (tiny, always works)
+  showLoading("Loading query embeddings...");
+  try {
+    const resp = await fetch("data/query_embeddings.json");
+    precomputedEmbeddings = await resp.json();
+  } catch {
+    precomputedEmbeddings = null;
+  }
+
+  // Try loading the ONNX embedding model (may fail on mobile)
   showLoading("Loading embedding model...");
-  await initEmbedder((msg) => showLoading(msg));
+  try {
+    await initEmbedder((msg) => showLoading(msg));
+    embedderReady = true;
+  } catch {
+    console.warn("Embedding model failed to load — using pre-computed queries only");
+    embedderReady = false;
+  }
 
   renderIndexStats(data);
   hideLoading();
@@ -162,7 +199,12 @@ async function main() {
     if (!queryText.trim()) return;
 
     const embedStart = performance.now();
-    const queryVec = await embedQuery(queryText);
+    const queryVec = await getQueryVector(queryText);
+    if (!queryVec) {
+      document.getElementById("search-info")!.innerHTML =
+        'Free-text search requires desktop. Try a <span class="fast">suggested query</span> below.';
+      return;
+    }
     const embedMs = performance.now() - embedStart;
 
     const comparison = search(queryVec, data, 10);
@@ -199,8 +241,8 @@ async function main() {
   console.log("Vector search demo ready!", {
     vectors: data.numVectors,
     dim: data.dim,
-    rawMB: (data.rawSizeBytes / 1e6).toFixed(1),
-    compressedMB: (data.compressedSizeBytes / 1e6).toFixed(1),
+    embedderReady,
+    precomputedQueries: precomputedEmbeddings ? Object.keys(precomputedEmbeddings).length : 0,
   });
 }
 
