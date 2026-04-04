@@ -116,10 +116,20 @@ pub fn decodeInto(
     const num_pairs = dim / 2;
     var bit_pos: usize = 0;
 
-    for (0..num_pairs) |i| {
-        const pair = reconstructPair(compressed, bit_pos, max_r);
+    // Unroll 2 pairs at a time for SIMD f32x4 store
+    var i: usize = 0;
+    while (i + 2 <= num_pairs) : (i += 2) {
+        const p0 = reconstructPair(compressed, bit_pos, max_r);
+        bit_pos += BITS_PER_PAIR;
+        const p1 = reconstructPair(compressed, bit_pos, max_r);
         bit_pos += BITS_PER_PAIR;
 
+        const vals: @Vector(4, f32) = .{ p0.dx, p0.dy, p1.dx, p1.dy };
+        @as(*[4]f32, @ptrCast(out[i * 2 ..].ptr)).* = vals;
+    }
+    // Handle remaining pair
+    if (i < num_pairs) {
+        const pair = reconstructPair(compressed, bit_pos, max_r);
         out[i * 2] = pair.dx;
         out[i * 2 + 1] = pair.dy;
     }
@@ -137,10 +147,21 @@ pub fn dotProduct(
     var sum: f32 = 0;
     var bit_pos: usize = 0;
 
-    for (0..num_pairs) |i| {
-        const pair = reconstructPair(compressed, bit_pos, max_r);
+    // Unroll 2 pairs at a time for SIMD f32x4 dot
+    var i: usize = 0;
+    while (i + 2 <= num_pairs) : (i += 2) {
+        const p0 = reconstructPair(compressed, bit_pos, max_r);
+        bit_pos += BITS_PER_PAIR;
+        const p1 = reconstructPair(compressed, bit_pos, max_r);
         bit_pos += BITS_PER_PAIR;
 
+        const q_vec: @Vector(4, f32) = @as(*const [4]f32, @ptrCast(q[i * 2 ..].ptr)).*;
+        const p_vec: @Vector(4, f32) = .{ p0.dx, p0.dy, p1.dx, p1.dy };
+        sum += @reduce(.Add, q_vec * p_vec);
+    }
+    // Handle remaining pair
+    if (i < num_pairs) {
+        const pair = reconstructPair(compressed, bit_pos, max_r);
         sum += q[i * 2] * pair.dx + q[i * 2 + 1] * pair.dy;
     }
 

@@ -41,14 +41,14 @@ inline fn rowDot(matrix_row: []const f32, input: []const f32, d: usize) f32 {
     var col: usize = 0;
     while (col + LANE_COUNT <= d) : (col += LANE_COUNT) {
         const m: @Vector(LANE_COUNT, f32) = matrix_row[col..][0..LANE_COUNT].*;
-        const i: @Vector(LANE_COUNT, f32) = input[col..][0..LANE_COUNT].*;
-        sum_vec += m * i;
+        const v: @Vector(LANE_COUNT, f32) = input[col..][0..LANE_COUNT].*;
+        sum_vec = @mulAdd(@Vector(LANE_COUNT, f32), m, v, sum_vec);
     }
 
     var total = @reduce(.Add, sum_vec);
 
     while (col < d) : (col += 1) {
-        total += matrix_row[col] * input[col];
+        total = @mulAdd(f32, matrix_row[col], input[col], total);
     }
     return total;
 }

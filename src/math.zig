@@ -2,10 +2,6 @@ const std = @import("std");
 
 const LANE_COUNT = std.simd.suggestVectorLength(f32) orelse 4;
 
-inline fn dotVec(a: @Vector(LANE_COUNT, f32), b: @Vector(LANE_COUNT, f32)) f32 {
-    return @reduce(.Add, a * b);
-}
-
 pub fn dot(a: []const f32, b: []const f32) f32 {
     std.debug.assert(a.len == b.len);
     const len = a.len;
@@ -14,12 +10,12 @@ pub fn dot(a: []const f32, b: []const f32) f32 {
 
     var i: usize = 0;
     while (i + LANE_COUNT <= len) : (i += LANE_COUNT) {
-        const av = a[i..][0..LANE_COUNT];
-        const bv = b[i..][0..LANE_COUNT];
-        sum_vec = @mulAdd(@Vector(LANE_COUNT, f32), @as(@Vector(LANE_COUNT, f32), av[0..LANE_COUNT].*), @as(@Vector(LANE_COUNT, f32), bv[0..LANE_COUNT].*), sum_vec);
+        const av: @Vector(LANE_COUNT, f32) = a[i..][0..LANE_COUNT].*;
+        const bv: @Vector(LANE_COUNT, f32) = b[i..][0..LANE_COUNT].*;
+        sum_vec = @mulAdd(@Vector(LANE_COUNT, f32), av, bv, sum_vec);
     }
 
-    var total = dotVec(sum_vec, @splat(1));
+    var total = @reduce(.Add, sum_vec);
 
     while (i < len) : (i += 1) {
         total += a[i] * b[i];
@@ -56,11 +52,11 @@ pub fn addScaled(out: []f32, a: []const f32, b: []const f32, scale_b: f32) void 
     while (i + LANE_COUNT <= len) : (i += LANE_COUNT) {
         const av: @Vector(LANE_COUNT, f32) = a[i..][0..LANE_COUNT].*;
         const bv: @Vector(LANE_COUNT, f32) = b[i..][0..LANE_COUNT].*;
-        @as(*[LANE_COUNT]f32, @ptrCast(out[i..])).* = av + bv * sb_vec;
+        @as(*[LANE_COUNT]f32, @ptrCast(out[i..])).* = @mulAdd(@Vector(LANE_COUNT, f32), bv, sb_vec, av);
     }
 
     while (i < len) : (i += 1) {
-        out[i] = a[i] + b[i] * scale_b;
+        out[i] = @mulAdd(f32, b[i], scale_b, a[i]);
     }
 }
 
