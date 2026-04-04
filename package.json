@@ -46,7 +46,7 @@
     "type": "git",
     "url": "git+https://github.com/teamchong/turboquant-wasm.git"
   },
-  "homepage": "https://github.com/teamchong/turboquant-wasm#readme",
+  "homepage": "https://teamchong.github.io/turboquant-wasm/",
   "author": "Steven Chong",
   "license": "MIT",
   "devDependencies": {
