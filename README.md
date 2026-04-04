@@ -1,7 +1,8 @@
 # TurboQuant WASM
 
-[![npm version](https://img.shields.io/npm/v/turboquant-wasm)](https://www.npmjs.com/package/turboquant-wasm)
-[![npm unpacked size](https://img.shields.io/npm/unpacked-size/turboquant-wasm)](https://www.npmjs.com/package/turboquant-wasm)
+[![CI](https://github.com/teamchong/turboquant-wasm/actions/workflows/ci.yml/badge.svg)](https://github.com/teamchong/turboquant-wasm/actions/workflows/ci.yml)
+[![npm](https://img.shields.io/npm/v/turboquant-wasm)](https://www.npmjs.com/package/turboquant-wasm)
+[![gzip size](https://img.shields.io/badge/gzip-~12kB-blue)](https://www.npmjs.com/package/turboquant-wasm)
 [![license](https://img.shields.io/npm/l/turboquant-wasm)](https://github.com/teamchong/turboquant-wasm/blob/main/LICENSE)
 
 WASM + relaxed SIMD build of [botirk38/turboquant](https://github.com/botirk38/turboquant) for browsers and Node.js.
