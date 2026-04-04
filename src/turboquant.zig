@@ -125,19 +125,23 @@ pub const Engine = struct {
             error.InvalidPayload => return DecodeError.InvalidPayload,
         };
 
-        const polar_decoded = try allocator.alloc(f32, e.dim);
-        errdefer allocator.free(polar_decoded);
-
-        polar.decodeInto(polar_decoded, payload.polar, header.max_r) catch |err| switch (err) {
+        // polar_decoded is in ROTATED space
+        polar.decodeInto(e.scratch_polar_decoded, payload.polar, header.max_r) catch |err| switch (err) {
             error.InvalidDimension => return DecodeError.InvalidPayload,
             error.OutOfMemory => return DecodeError.OutOfMemory,
         };
 
-        qjl.decodeInto(e.scratch_qjl_decoded, payload.qjl, header.gamma, &e.rot_op, &e.qjl_workspace);
+        // qjl_decoded is also computed in rotated space (don't inverse-rotate here)
+        qjl.decodeIntoRotated(e.scratch_qjl_decoded, payload.qjl, header.gamma, &e.qjl_workspace);
 
-        math.addInPlace(polar_decoded, e.scratch_qjl_decoded);
+        // Combine in rotated space, then inverse-rotate back to original space
+        math.addInPlace(e.scratch_polar_decoded, e.scratch_qjl_decoded);
 
-        return polar_decoded;
+        const result = try allocator.alloc(f32, dim);
+        errdefer allocator.free(result);
+        e.rot_op.matVecMulTransposed(e.scratch_polar_decoded, result);
+
+        return result;
     }
 
     pub fn dot(e: *Engine, q: []const f32, compressed: []const u8) f32 {
@@ -146,8 +150,11 @@ pub const Engine = struct {
 
         const payload = format.slicePayload(compressed, header) catch return 0;
 
-        const polar_sum = polar.dotProduct(q, payload.polar, header.max_r);
-        const qjl_sum = qjl.estimateDotWithWorkspace(q, payload.qjl, header.gamma, &e.rot_op, &e.qjl_workspace);
+        // Rotate query into the same space as the polar-encoded data
+        e.rot_op.rotate(q, e.scratch_rotated);
+
+        const polar_sum = polar.dotProduct(e.scratch_rotated, payload.polar, header.max_r);
+        const qjl_sum = qjl.estimateDotWithWorkspace(e.scratch_rotated, payload.qjl, header.gamma, &e.qjl_workspace);
 
         return polar_sum + qjl_sum;
     }
@@ -195,6 +202,98 @@ test "roundtrip" {
     const cdot = engine.dot(&q, compressed);
     log.info("true={e}, decoded_dot={e}, direct_dot={e}", .{ true_dot, decoded_dot, cdot });
     try std.testing.expect(@abs(true_dot - cdot) < 50.0);
+}
+
+test "decode cosine similarity" {
+    // Verify that decode() produces vectors with high cosine similarity to originals.
+    // This failed before the inverse-rotation fix: cosine sim was ~0 (random direction).
+    const allocator = std.testing.allocator;
+    const dims = [_]usize{ 8, 32, 64, 128 };
+    const seed: u32 = 42;
+
+    for (dims) |dim| {
+        var engine = try Engine.init(allocator, .{ .dim = dim, .seed = seed });
+        defer engine.deinit(allocator);
+
+        var rng = std.Random.DefaultPrng.init(42);
+        const r = rng.random();
+        const num_vecs: usize = 20;
+        var total_cos: f64 = 0;
+
+        for (0..num_vecs) |_| {
+            const x = try allocator.alloc(f32, dim);
+            defer allocator.free(x);
+            var norm_sq: f32 = 0;
+            for (0..dim) |j| {
+                x[j] = r.float(f32) * 2 - 1;
+                norm_sq += x[j] * x[j];
+            }
+            const inv = 1.0 / @sqrt(norm_sq);
+            for (0..dim) |j| x[j] *= inv;
+
+            const compressed = try engine.encode(allocator, x);
+            defer allocator.free(compressed);
+            const decoded = try engine.decode(allocator, compressed);
+            defer allocator.free(decoded);
+
+            var dot_od: f64 = 0;
+            var norm_d: f64 = 0;
+            for (0..dim) |j| {
+                dot_od += @as(f64, x[j]) * @as(f64, decoded[j]);
+                norm_d += @as(f64, decoded[j]) * @as(f64, decoded[j]);
+            }
+            const cos_sim = dot_od / @sqrt(norm_d);
+            total_cos += cos_sim;
+        }
+        const avg_cos = total_cos / num_vecs;
+        log.info("dim={}: avg cosine sim = {d:.4}", .{ dim, avg_cos });
+        // Cosine similarity must be well above 0.5 (was ~0 before fix)
+        try std.testing.expect(avg_cos > 0.5);
+    }
+}
+
+test "dot product approximates true dot" {
+    // Verify that dot() returns values close to the true inner product.
+    // This failed before the fix: dot() was computing in wrong space.
+    const allocator = std.testing.allocator;
+    const dim: usize = 64;
+    const seed: u32 = 42;
+
+    var engine = try Engine.init(allocator, .{ .dim = dim, .seed = seed });
+    defer engine.deinit(allocator);
+
+    var rng = std.Random.DefaultPrng.init(42);
+    const r = rng.random();
+    const num_trials: usize = 50;
+    var total_abs_err: f64 = 0;
+
+    for (0..num_trials) |_| {
+        var x: [64]f32 = undefined;
+        var norm_sq: f32 = 0;
+        for (&x) |*v| { v.* = r.float(f32) * 2 - 1; norm_sq += v.* * v.*; }
+        const inv_x = 1.0 / @sqrt(norm_sq);
+        for (&x) |*v| v.* *= inv_x;
+
+        var q: [64]f32 = undefined;
+        norm_sq = 0;
+        for (&q) |*v| { v.* = r.float(f32) * 2 - 1; norm_sq += v.* * v.*; }
+        const inv_q = 1.0 / @sqrt(norm_sq);
+        for (&q) |*v| v.* *= inv_q;
+
+        const compressed = try engine.encode(allocator, &x);
+        defer allocator.free(compressed);
+
+        var true_dot: f64 = 0;
+        for (x, q) |xv, qv| true_dot += @as(f64, xv) * @as(f64, qv);
+
+        const est_dot: f64 = @as(f64, engine.dot(&q, compressed));
+        total_abs_err += @abs(true_dot - est_dot);
+    }
+
+    const mean_err = total_abs_err / num_trials;
+    log.info("dim=64: mean |dot error| = {d:.4}", .{mean_err});
+    // For unit vectors at dim=64, mean absolute error should be < 0.15
+    try std.testing.expect(mean_err < 0.15);
 }
 
 test "compression ratio" {
@@ -406,8 +505,9 @@ test "golden: dim=8 seed=12345 dot product" {
     defer allocator.free(compressed);
 
     const cdot = engine.dot(&q, compressed);
-    // Must match reference output exactly
-    try std.testing.expectApproxEqAbs(@as(f32, 7.087812e-1), cdot, 1e-4);
+    // After fix: dot() now rotates query into the same space as encoded data.
+    // Previous golden value (0.7088) was computed with the bug (wrong space).
+    try std.testing.expectApproxEqAbs(@as(f32, -1.9935973e0), cdot, 1e-4);
 }
 
 test "golden: dim=64 seed=9999 header fields" {

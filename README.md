@@ -1,5 +1,9 @@
 # TurboQuant WASM
 
+[![npm version](https://img.shields.io/npm/v/turboquant-wasm)](https://www.npmjs.com/package/turboquant-wasm)
+[![npm bundle size (gzip)](https://img.shields.io/bundlephobia/minzip/turboquant-wasm)](https://bundlephobia.com/package/turboquant-wasm)
+[![license](https://img.shields.io/npm/l/turboquant-wasm)](https://github.com/teamchong/turboquant-wasm/blob/main/LICENSE)
+
 WASM + relaxed SIMD build of [botirk38/turboquant](https://github.com/botirk38/turboquant) for browsers and Node.js.
 
 Based on the paper "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate".

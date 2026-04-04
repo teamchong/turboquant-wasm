@@ -91,22 +91,48 @@ pub fn decodeInto(
     }
 }
 
-pub fn estimateDotWithWorkspace(
-    q: []const f32,
+/// Decode QJL bits into rotated space (no R^T applied).
+/// Used by Engine.decode() which handles the inverse rotation itself.
+pub fn decodeIntoRotated(
+    out: []f32,
     qjl_bits: []const u8,
     gamma: f32,
-    rot_op: *const rotation.RotationOperator,
+    workspace: *Workspace,
+) void {
+    const dim = out.len;
+    if (dim == 0) return;
+
+    rotation.signToVector(qjl_bits, dim, workspace.sign_vec);
+
+    // Scale sign_vec directly (stays in rotated/projected space)
+    const scale_val = SQRT_PI_OVER_2 / @as(f32, @floatFromInt(dim)) * gamma;
+    const scale_vec: @Vector(LANE_COUNT, f32) = @splat(scale_val);
+
+    var i: usize = 0;
+    while (i + LANE_COUNT <= dim) : (i += LANE_COUNT) {
+        const v: @Vector(LANE_COUNT, f32) = workspace.sign_vec[i..][0..LANE_COUNT].*;
+        @as(*[LANE_COUNT]f32, @ptrCast(out[i..])).* = v * scale_vec;
+    }
+    while (i < dim) : (i += 1) {
+        out[i] = workspace.sign_vec[i] * scale_val;
+    }
+}
+
+/// Estimate dot product between a rotated query and QJL-encoded residual.
+/// The query must already be in rotated space (caller applies R*q).
+pub fn estimateDotWithWorkspace(
+    rotated_q: []const f32,
+    qjl_bits: []const u8,
+    gamma: f32,
     workspace: *Workspace,
 ) f32 {
-    const d = q.len;
+    const d = rotated_q.len;
     if (d == 0) return 0;
-
-    rot_op.matVecMul(q, workspace.projected);
 
     // Vectorized sign extraction
     rotation.signToVector(qjl_bits, d, workspace.sign_vec);
 
-    const dot_sum = math.dot(workspace.projected, workspace.sign_vec);
+    const dot_sum = math.dot(rotated_q, workspace.sign_vec);
 
     const scale_val = SQRT_PI_OVER_2 / @as(f32, @floatFromInt(d)) * gamma;
     return dot_sum * scale_val;
@@ -174,15 +200,19 @@ test "estimateDotWithWorkspace deterministic" {
     var ws = try Workspace.init(allocator, dim);
     defer ws.deinit(allocator);
 
+    // estimateDotWithWorkspace now expects a pre-rotated query
+    var rotated_q: [dim]f32 = undefined;
     const q = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 };
+    rot_op.matVecMul(&q, &rotated_q);
+
     const residual = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 };
     const gamma: f32 = 1.5;
 
     const encoded = try encodeWithWorkspace(allocator, &residual, &rot_op, &ws);
     defer allocator.free(encoded);
 
-    const est1 = estimateDotWithWorkspace(&q, encoded, gamma, &rot_op, &ws);
-    const est2 = estimateDotWithWorkspace(&q, encoded, gamma, &rot_op, &ws);
+    const est1 = estimateDotWithWorkspace(&rotated_q, encoded, gamma, &ws);
+    const est2 = estimateDotWithWorkspace(&rotated_q, encoded, gamma, &ws);
 
     try std.testing.expectEqual(est1, est2);
 }
@@ -211,10 +241,6 @@ test "zero gamma gives zero decoded residual" {
 test "zero gamma gives zero estimated dot" {
     const allocator = std.testing.allocator;
     const dim: usize = 8;
-    const seed: u32 = 12345;
-
-    var rot_op = try rotation.RotationOperator.prepare(allocator, dim, seed);
-    defer rot_op.destroy(allocator);
 
     var ws = try Workspace.init(allocator, dim);
     defer ws.deinit(allocator);
@@ -222,6 +248,6 @@ test "zero gamma gives zero estimated dot" {
     const q = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 };
     const bits = [_]u8{ 0xAA, 0x55, 0xFF, 0x00, 0x11, 0x22, 0x33, 0x44 };
 
-    const est = estimateDotWithWorkspace(&q, &bits, 0.0, &rot_op, &ws);
+    const est = estimateDotWithWorkspace(&q, &bits, 0.0, &ws);
     try std.testing.expectEqual(0.0, est);
 }

@@ -18,6 +18,15 @@ dist/
 bun.lock
 src/js/turboquant-wasm.generated.ts
 
+# Demo data (too large for git)
+demo/data/*.ply
+demo/data/*.tqply
+demo/data/*.splat
+demo/data/*.ksplat
+demo/data/*.bin
+demo/data/*.tqv
+demo/data/passages.json
+
 # OS
 .DS_Store
 
