@@ -270,13 +270,19 @@ test "dot product approximates true dot" {
     for (0..num_trials) |_| {
         var x: [64]f32 = undefined;
         var norm_sq: f32 = 0;
-        for (&x) |*v| { v.* = r.float(f32) * 2 - 1; norm_sq += v.* * v.*; }
+        for (&x) |*v| {
+            v.* = r.float(f32) * 2 - 1;
+            norm_sq += v.* * v.*;
+        }
         const inv_x = 1.0 / @sqrt(norm_sq);
         for (&x) |*v| v.* *= inv_x;
 
         var q: [64]f32 = undefined;
         norm_sq = 0;
-        for (&q) |*v| { v.* = r.float(f32) * 2 - 1; norm_sq += v.* * v.*; }
+        for (&q) |*v| {
+            v.* = r.float(f32) * 2 - 1;
+            norm_sq += v.* * v.*;
+        }
         const inv_q = 1.0 / @sqrt(norm_sq);
         for (&q) |*v| v.* *= inv_q;
 
