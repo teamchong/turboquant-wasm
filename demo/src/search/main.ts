@@ -202,7 +202,7 @@ async function main() {
     const queryVec = await getQueryVector(queryText);
     if (!queryVec) {
       document.getElementById("search-info")!.innerHTML =
-        'Free-text search requires desktop. Try a <span class="fast">suggested query</span> below.';
+        'Embedding model not available. Try a <span class="fast">suggested query</span> below.';
       return;
     }
     const embedMs = performance.now() - embedStart;
