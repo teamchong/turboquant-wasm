@@ -1,0 +1,273 @@
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  background: #0a0a0a;
+  color: #e0e0e0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, monospace;
+  min-height: 100vh;
+}
+
+#app {
+  max-width: 800px;
+  margin: 0 auto;
+  padding: 0 16px;
+}
+
+#header {
+  text-align: center;
+  padding: 24px 0 16px;
+}
+
+#header h1 {
+  font-size: 1.5rem;
+  font-weight: 600;
+}
+
+#header .dim {
+  color: #888;
+  font-weight: 400;
+}
+
+#header .subtitle {
+  font-size: 0.9rem;
+  color: #888;
+  margin-top: 4px;
+}
+
+#header .note {
+  font-size: 0.75rem;
+  color: #555;
+  margin-top: 2px;
+}
+
+#main {
+  margin-top: 12px;
+}
+
+#search-box {
+  position: relative;
+}
+
+#search-box input {
+  width: 100%;
+  padding: 14px 16px;
+  font-size: 1rem;
+  font-family: inherit;
+  background: #1a1a1a;
+  color: #e0e0e0;
+  border: 1px solid #333;
+  border-radius: 8px;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+#search-box input:focus {
+  border-color: #4fc3f7;
+}
+
+#search-info {
+  font-size: 0.75rem;
+  color: #666;
+  margin-top: 6px;
+  text-align: right;
+}
+
+#search-info .fast {
+  color: #66bb6a;
+}
+
+#results {
+  margin-top: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.result-card {
+  background: #141414;
+  border: 1px solid #222;
+  border-radius: 8px;
+  padding: 14px 16px;
+  transition: border-color 0.15s;
+}
+
+.result-card:hover {
+  border-color: #333;
+}
+
+.result-title {
+  font-size: 0.95rem;
+  font-weight: 600;
+  color: #e0e0e0;
+  margin-bottom: 4px;
+}
+
+.result-text {
+  font-size: 0.82rem;
+  color: #999;
+  line-height: 1.5;
+}
+
+.result-meta {
+  display: flex;
+  gap: 16px;
+  margin-top: 8px;
+  font-size: 0.72rem;
+  color: #555;
+}
+
+.result-meta .score {
+  color: #4fc3f7;
+}
+
+/* Suggested queries */
+#suggested-queries {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 8px;
+}
+
+.suggestion {
+  padding: 5px 12px;
+  font-size: 0.75rem;
+  font-family: inherit;
+  background: #1a1a1a;
+  color: #888;
+  border: 1px solid #2a2a2a;
+  border-radius: 14px;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.suggestion:hover {
+  color: #4fc3f7;
+  border-color: #4fc3f7;
+}
+
+/* Side-by-side results columns */
+.results-columns {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 16px;
+}
+
+.results-col {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.col-header {
+  font-size: 0.85rem;
+  font-weight: 700;
+  padding: 8px 12px;
+  border-radius: 6px;
+  text-align: center;
+}
+
+.col-header.tq {
+  background: rgba(79, 195, 247, 0.1);
+  color: #4fc3f7;
+  border: 1px solid rgba(79, 195, 247, 0.2);
+}
+
+.col-header.brute {
+  background: rgba(255, 255, 255, 0.03);
+  color: #999;
+  border: 1px solid #222;
+}
+
+.result-card.match {
+  border-left: 3px solid #66bb6a;
+}
+
+.result-card.miss {
+  border-left: 3px solid #ef5350;
+}
+
+.result-rank {
+  font-size: 0.7rem;
+  font-weight: 700;
+  color: #555;
+  margin-bottom: 4px;
+}
+
+.match-badge {
+  color: #66bb6a;
+  font-weight: 600;
+}
+
+.miss-badge {
+  color: #ef5350;
+  font-weight: 600;
+}
+
+#stats-bar {
+  margin-top: 24px;
+  padding: 16px;
+  background: #111;
+  border-radius: 8px;
+  border: 1px solid #1a1a1a;
+}
+
+#index-stats {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+  font-size: 0.78rem;
+}
+
+.stat-item {
+  text-align: center;
+}
+
+.stat-value {
+  font-size: 1.2rem;
+  font-weight: 700;
+  color: #4fc3f7;
+}
+
+.stat-label {
+  color: #666;
+  margin-top: 2px;
+}
+
+/* Loading overlay */
+#loading-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.85);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+  gap: 16px;
+}
+
+#loading-overlay.hidden {
+  display: none;
+}
+
+#loading-text {
+  font-size: 0.9rem;
+  color: #aaa;
+}
+
+.spinner {
+  width: 36px;
+  height: 36px;
+  border: 3px solid #333;
+  border-top-color: #4fc3f7;
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}

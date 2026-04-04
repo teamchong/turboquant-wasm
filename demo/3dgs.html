@@ -1,0 +1,43 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TurboQuant 3DGS Demo — Side-by-Side Compression</title>
+  <link rel="stylesheet" href="./src/style.css" />
+</head>
+<body>
+  <div id="app">
+    <div id="header">
+      <h1>TurboQuant <span class="dim">3D Gaussian Splatting</span></h1>
+      <p class="subtitle">Proof-of-concept: general-purpose vector compression applied to SH coefficients in the browser.
+        <br><span class="note">Note: purpose-built formats (.ksplat, .spz) achieve better 3DGS compression. This demo shows TurboQuant works on real high-dimensional data via WASM.</span></p>
+    </div>
+
+    <div id="viewer-container">
+      <div id="panel-left" class="panel">
+        <div class="panel-label">Original .ply</div>
+        <div class="panel-stats" id="stats-left"></div>
+        <div class="viewer" id="viewer-left"></div>
+      </div>
+
+      <div id="divider">
+        <div class="divider-badge" id="ratio-badge"></div>
+      </div>
+
+      <div id="panel-right" class="panel">
+        <div class="panel-label">TurboQuant .tqply</div>
+        <div class="panel-stats" id="stats-right"></div>
+        <div class="viewer" id="viewer-right"></div>
+      </div>
+    </div>
+
+    <div id="loading-overlay">
+      <div class="spinner"></div>
+      <div id="loading-text">Loading scene...</div>
+    </div>
+  </div>
+
+  <script type="module" src="./src/main.ts"></script>
+</body>
+</html>

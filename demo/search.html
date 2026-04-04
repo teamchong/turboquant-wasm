@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TurboQuant — Semantic Vector Search in the Browser</title>
+  <link rel="stylesheet" href="./src/search/style.css" />
+</head>
+<body>
+  <div id="app">
+    <div id="header">
+      <h1>TurboQuant <span class="dim">Vector Search</span></h1>
+      <p class="subtitle">Compress embeddings. Search client-side. No server needed.</p>
+      <p class="note">Dot product computed directly on compressed vectors via WASM — no decompression step.</p>
+    </div>
+
+    <div id="main">
+      <div id="search-box">
+        <input type="text" id="query-input" value="machine learning" autofocus />
+        <div id="suggested-queries"></div>
+        <div id="search-info"></div>
+      </div>
+
+      <div id="stats-bar">
+        <div id="index-stats"></div>
+      </div>
+
+      <div id="results"></div>
+    </div>
+
+    <div id="loading-overlay">
+      <div class="spinner"></div>
+      <div id="loading-text">Initializing...</div>
+    </div>
+  </div>
+
+  <script type="module" src="./src/search/main.ts"></script>
+</body>
+</html>
