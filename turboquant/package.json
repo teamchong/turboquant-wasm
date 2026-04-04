@@ -1,0 +1,56 @@
+{
+  "name": "turboquant",
+  "version": "0.1.0",
+  "description": "TurboQuant WASM SIMD vector compression — 3 bits/dim with fast dot product. Requires relaxed SIMD (Chrome 114+, Firefox 128+, Safari 18+, Node 20+)",
+  "type": "module",
+  "main": "dist/index.js",
+  "module": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    },
+    "./turboquant.wasm": "./dist/turboquant.wasm"
+  },
+  "files": [
+    "dist/",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build:zig": "mkdir -p dist && zig build-exe -target wasm32-wasi -mcpu=generic+simd128+relaxed_simd -O ReleaseSmall src/wasm_exports.zig --name turboquant -fno-entry -rdynamic && mv turboquant.wasm dist/",
+    "build:opt": "wasm-opt -Oz --strip-producers --strip-target-features dist/turboquant.wasm -o dist/turboquant.wasm --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals --enable-relaxed-simd",
+    "build:embed": "node scripts/embed-wasm.mjs",
+    "build:types": "bun x tsc --emitDeclarationOnly",
+    "build:js": "bun build src/js/index.ts --outdir dist --target node --format esm --minify --sourcemap=external && bun run build:types",
+    "build": "bun run build:zig && bun run build:opt && bun run build:embed && bun run build:js",
+    "test:zig": "zig test -target aarch64-macos src/turboquant.zig",
+    "prepublishOnly": "bun run build"
+  },
+  "keywords": [
+    "vector",
+    "compression",
+    "quantization",
+    "wasm",
+    "simd",
+    "relaxed-simd",
+    "embedding",
+    "dot-product",
+    "nearest-neighbor"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/teamchong/turboquant-wasm.git"
+  },
+  "homepage": "https://github.com/teamchong/turboquant-wasm#readme",
+  "author": "Steven Chong",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}

@@ -5,6 +5,7 @@ const math = @import("math.zig");
 pub const QjlError = error{ InvalidDimension, OutOfMemory };
 
 const SQRT_PI_OVER_2: f32 = 1.2533141373155003;
+const LANE_COUNT = std.simd.suggestVectorLength(f32) orelse 4;
 
 pub const Workspace = struct {
     projected: []f32,
@@ -42,8 +43,21 @@ pub fn encodeWithWorkspace(
     const result = try allocator.alloc(u8, bits_bytes);
     @memset(result, 0);
 
-    for (workspace.projected, 0..) |val, i| {
-        if (val > 0) {
+    // Vectorized sign-bit packing: compare against zero, pack into bytes
+    var i: usize = 0;
+    // Process 8 elements at a time (one output byte)
+    while (i + 8 <= d) : (i += 8) {
+        var byte: u8 = 0;
+        inline for (0..8) |bit| {
+            if (workspace.projected[i + bit] > 0) {
+                byte |= @as(u8, 1) << bit;
+            }
+        }
+        result[i / 8] = byte;
+    }
+    // Remaining bits
+    while (i < d) : (i += 1) {
+        if (workspace.projected[i] > 0) {
             result[i / 8] |= @as(u8, 1) << @intCast(i % 8);
         }
     }
@@ -63,9 +77,17 @@ pub fn decodeInto(
     rotation.signToVector(qjl_bits, dim, workspace.sign_vec);
     rot_op.matVecMulTransposed(workspace.sign_vec, workspace.st_sign);
 
-    const scale = SQRT_PI_OVER_2 / @as(f32, @floatFromInt(dim)) * gamma;
-    for (0..dim) |i| {
-        out[i] = workspace.st_sign[i] * scale;
+    // Vectorized scaling
+    const scale_val = SQRT_PI_OVER_2 / @as(f32, @floatFromInt(dim)) * gamma;
+    const scale_vec: @Vector(LANE_COUNT, f32) = @splat(scale_val);
+
+    var i: usize = 0;
+    while (i + LANE_COUNT <= dim) : (i += LANE_COUNT) {
+        const v: @Vector(LANE_COUNT, f32) = workspace.st_sign[i..][0..LANE_COUNT].*;
+        @as(*[LANE_COUNT]f32, @ptrCast(out[i..])).* = v * scale_vec;
+    }
+    while (i < dim) : (i += 1) {
+        out[i] = workspace.st_sign[i] * scale_val;
     }
 }
 
@@ -81,15 +103,13 @@ pub fn estimateDotWithWorkspace(
 
     rot_op.matVecMul(q, workspace.projected);
 
-    for (0..d) |i| {
-        const bit = (qjl_bits[i / 8] >> @intCast(i % 8)) & 1;
-        workspace.sign_vec[i] = if (bit == 1) 1.0 else -1.0;
-    }
+    // Vectorized sign extraction
+    rotation.signToVector(qjl_bits, d, workspace.sign_vec);
 
     const dot_sum = math.dot(workspace.projected, workspace.sign_vec);
 
-    const scale = SQRT_PI_OVER_2 / @as(f32, @floatFromInt(d)) * gamma;
-    return dot_sum * scale;
+    const scale_val = SQRT_PI_OVER_2 / @as(f32, @floatFromInt(d)) * gamma;
+    return dot_sum * scale_val;
 }
 
 test "encodeWithWorkspace rejects zero dimension" {

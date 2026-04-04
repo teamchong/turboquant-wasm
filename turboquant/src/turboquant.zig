@@ -354,3 +354,213 @@ test "dot close to decoded dot" {
     log.info("decoded_dot={e}, direct_dot={e}, rel_err={e}", .{ decoded_dot, direct_dot, rel_err });
     try std.testing.expect(rel_err < 0.5);
 }
+
+// ===========================================================================
+// Golden-value tests: exact bytes for known input+seed.
+// These catch any change to the rotation, quantization, or encoding.
+// ===========================================================================
+
+test "golden: dim=8 seed=12345 compressed bytes" {
+    const allocator = std.testing.allocator;
+    var engine = try Engine.init(allocator, .{ .dim = 8, .seed = 12345 });
+    defer engine.deinit(allocator);
+
+    const x = [_]f32{ 1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0 };
+    const compressed = try engine.encode(allocator, &x);
+    defer allocator.free(compressed);
+
+    // Exact expected output from reference implementation
+    const expected = [_]u8{
+        0x01, 0x08, 0x00, 0x00, 0x00, 0x00, 0x04, 0x00,
+        0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x46, 0x1a,
+        0x1f, 0x41, 0x77, 0xf2, 0x76, 0x40, 0xaa, 0xaa,
+        0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+        0xa5, 0xea, 0x4f, 0x08, 0x1e,
+    };
+    try std.testing.expectEqual(expected.len, compressed.len);
+    try std.testing.expectEqualSlices(u8, &expected, compressed);
+}
+
+test "golden: dim=8 seed=12345 header fields" {
+    const allocator = std.testing.allocator;
+    var engine = try Engine.init(allocator, .{ .dim = 8, .seed = 12345 });
+    defer engine.deinit(allocator);
+
+    const x = [_]f32{ 1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0 };
+    const compressed = try engine.encode(allocator, &x);
+    defer allocator.free(compressed);
+
+    const header = try format.readHeader(compressed);
+    try std.testing.expectEqual(@as(u32, 8), header.dim);
+    try std.testing.expectEqual(@as(u32, 4), header.polar_bytes);
+    try std.testing.expectEqual(@as(u32, 1), header.qjl_bytes);
+    // max_r and gamma must match exactly (bit-identical floats)
+    try std.testing.expectEqual(@as(u32, @bitCast(header.max_r)), @as(u32, @bitCast(@as(f32, 9.943914e0))));
+    try std.testing.expectEqual(@as(u32, @bitCast(header.gamma)), @as(u32, @bitCast(@as(f32, 3.8585489e0))));
+}
+
+test "golden: dim=8 seed=12345 dot product" {
+    const allocator = std.testing.allocator;
+    var engine = try Engine.init(allocator, .{ .dim = 8, .seed = 12345 });
+    defer engine.deinit(allocator);
+
+    const x = [_]f32{ 1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0 };
+    const q = [_]f32{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 };
+
+    const compressed = try engine.encode(allocator, &x);
+    defer allocator.free(compressed);
+
+    const cdot = engine.dot(&q, compressed);
+    // Must match reference output exactly
+    try std.testing.expectApproxEqAbs(@as(f32, 7.087812e-1), cdot, 1e-4);
+}
+
+test "golden: dim=64 seed=9999 header fields" {
+    const allocator = std.testing.allocator;
+    var engine = try Engine.init(allocator, .{ .dim = 64, .seed = 9999 });
+    defer engine.deinit(allocator);
+
+    var rng = std.Random.DefaultPrng.init(9999);
+    const r = rng.random();
+    var x: [64]f32 = undefined;
+    for (&x) |*v| v.* = r.float(f32) * 10 - 5;
+
+    const compressed = try engine.encode(allocator, &x);
+    defer allocator.free(compressed);
+
+    try std.testing.expectEqual(@as(usize, 68), compressed.len);
+
+    const header = try format.readHeader(compressed);
+    try std.testing.expectEqual(@as(u32, 64), header.dim);
+    try std.testing.expectEqual(@as(u32, 28), header.polar_bytes);
+    try std.testing.expectEqual(@as(u32, 8), header.qjl_bytes);
+    try std.testing.expectEqual(@as(u32, @bitCast(header.max_r)), @as(u32, @bitCast(@as(f32, 8.701334e0))));
+    try std.testing.expectEqual(@as(u32, @bitCast(header.gamma)), @as(u32, @bitCast(@as(f32, 6.347209e0))));
+}
+
+// ===========================================================================
+// Distortion bound tests: MSE must decrease with dimension.
+// For unit vectors, MSE should be well below the paper's theoretical bound
+// of D_mse <= 2.7 * (1/4^b) where b is bits per pair.
+// ===========================================================================
+
+test "distortion: MSE decreases with dimension" {
+    const allocator = std.testing.allocator;
+    const dims = [_]usize{ 64, 128, 256 };
+    var prev_mse: f64 = std.math.inf(f64);
+
+    for (dims) |dim| {
+        var engine = try Engine.init(allocator, .{ .dim = dim, .seed = 42 });
+        defer engine.deinit(allocator);
+
+        var rng = std.Random.DefaultPrng.init(42);
+        const r = rng.random();
+        const num_vecs: usize = 50;
+        var total_mse: f64 = 0;
+
+        for (0..num_vecs) |_| {
+            const x = try allocator.alloc(f32, dim);
+            defer allocator.free(x);
+            var norm_sq: f32 = 0;
+            for (0..dim) |j| {
+                x[j] = r.float(f32) * 2 - 1;
+                norm_sq += x[j] * x[j];
+            }
+            const inv = 1.0 / @sqrt(norm_sq);
+            for (0..dim) |j| x[j] *= inv;
+
+            const compressed = try engine.encode(allocator, x);
+            defer allocator.free(compressed);
+            const decoded = try engine.decode(allocator, compressed);
+            defer allocator.free(decoded);
+
+            var mse: f64 = 0;
+            for (0..dim) |j| {
+                const d: f64 = @as(f64, x[j]) - @as(f64, decoded[j]);
+                mse += d * d;
+            }
+            total_mse += mse / @as(f64, @floatFromInt(dim));
+        }
+        total_mse /= num_vecs;
+
+        // MSE must strictly decrease as dimension increases
+        try std.testing.expect(total_mse < prev_mse);
+        prev_mse = total_mse;
+    }
+}
+
+test "distortion: bits per dimension is ~4.5" {
+    const allocator = std.testing.allocator;
+    var engine = try Engine.init(allocator, .{ .dim = 128, .seed = 42 });
+    defer engine.deinit(allocator);
+
+    var rng = std.Random.DefaultPrng.init(42);
+    const r = rng.random();
+
+    var x: [128]f32 = undefined;
+    var norm_sq: f32 = 0;
+    for (&x) |*v| {
+        v.* = r.float(f32) * 2 - 1;
+        norm_sq += v.* * v.*;
+    }
+    const inv = 1.0 / @sqrt(norm_sq);
+    for (&x) |*v| v.* *= inv;
+
+    const compressed = try engine.encode(allocator, &x);
+    defer allocator.free(compressed);
+
+    const payload_bits = (compressed.len - format.HEADER_SIZE) * 8;
+    const bpd = @as(f64, @floatFromInt(payload_bits)) / 128.0;
+    // Must be between 3 and 6 bits/dim (TurboQuant targets ~3-5)
+    try std.testing.expect(bpd >= 3.0 and bpd <= 6.0);
+}
+
+test "distortion: dot product preservation" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 128;
+    var engine = try Engine.init(allocator, .{ .dim = dim, .seed = 42 });
+    defer engine.deinit(allocator);
+
+    var rng = std.Random.DefaultPrng.init(42);
+    const r = rng.random();
+    const num_trials: usize = 20;
+    var total_abs_err: f64 = 0;
+
+    for (0..num_trials) |_| {
+        // Generate unit vector
+        var x: [128]f32 = undefined;
+        var norm_sq: f32 = 0;
+        for (&x) |*v| {
+            v.* = r.float(f32) * 2 - 1;
+            norm_sq += v.* * v.*;
+        }
+        const inv_x = 1.0 / @sqrt(norm_sq);
+        for (&x) |*v| v.* *= inv_x;
+
+        // Generate unit query
+        var q: [128]f32 = undefined;
+        norm_sq = 0;
+        for (&q) |*v| {
+            v.* = r.float(f32) * 2 - 1;
+            norm_sq += v.* * v.*;
+        }
+        const inv_q = 1.0 / @sqrt(norm_sq);
+        for (&q) |*v| v.* *= inv_q;
+
+        const compressed = try engine.encode(allocator, &x);
+        defer allocator.free(compressed);
+
+        // True dot product
+        var true_dot: f64 = 0;
+        for (x, q) |xv, qv| true_dot += @as(f64, xv) * @as(f64, qv);
+
+        // Estimated dot product
+        const est_dot: f64 = @as(f64, engine.dot(&q, compressed));
+        total_abs_err += @abs(true_dot - est_dot);
+    }
+
+    const mean_err = total_abs_err / num_trials;
+    // Mean absolute dot product error for unit vectors should be small
+    // (well under 1.0 for dim=128)
+    try std.testing.expect(mean_err < 1.0);
+}

@@ -17,6 +17,12 @@ qjl
 *.trace/
 *.sample.txt
 
+# Node/npm
+turboquant/node_modules/
+turboquant/dist/
+turboquant/bun.lock
+turboquant/src/js/turboquant-wasm.generated.ts
+
 # OS
 .DS_Store
 

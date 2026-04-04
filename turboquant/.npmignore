@@ -1,0 +1,20 @@
+# Source
+src/
+zig-out/
+.zig-cache/
+zig-cache/
+benchmarks/
+scripts/
+build.zig
+build.zig.zon
+
+# Dev tools
+.github/
+.claude/
+.gitignore
+tsconfig.json
+bun.lock
+
+# OS files
+.DS_Store
+*.log

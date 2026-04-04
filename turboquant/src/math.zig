@@ -16,7 +16,7 @@ pub fn dot(a: []const f32, b: []const f32) f32 {
     while (i + LANE_COUNT <= len) : (i += LANE_COUNT) {
         const av = a[i..][0..LANE_COUNT];
         const bv = b[i..][0..LANE_COUNT];
-        sum_vec += @as(@Vector(LANE_COUNT, f32), av[0..LANE_COUNT].*) * @as(@Vector(LANE_COUNT, f32), bv[0..LANE_COUNT].*);
+        sum_vec = @mulAdd(@Vector(LANE_COUNT, f32), @as(@Vector(LANE_COUNT, f32), av[0..LANE_COUNT].*), @as(@Vector(LANE_COUNT, f32), bv[0..LANE_COUNT].*), sum_vec);
     }
 
     var total = dotVec(sum_vec, @splat(1));
