@@ -16,10 +16,10 @@ export function createViewerPair(
   rightEl: HTMLElement,
   shDegree: number = 2,
 ): ViewerPair {
-  // Scene center: (5, -68, -60), extent: ~330 units
+  // Lego scene: center ~(0, 0, 0.3), extent ~2 units
   const cameraOpts = {
-    initialCameraPosition: [5, -68, 100],
-    initialCameraLookAt: [5, -68, -60],
+    initialCameraPosition: [0, -2, 4],
+    initialCameraLookAt: [0, 0, 0.3],
   };
 
   const left = new GaussianSplats3D.Viewer({
