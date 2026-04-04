@@ -9,11 +9,13 @@
 <body>
   <div id="app">
     <h1>turboquant<span class="dim">-wasm</span></h1>
-    <p class="tagline">WASM SIMD vector compression — 3 bits/dim with fast dot product</p>
+    <p class="tagline">Shrink embedding vectors 6x. Search them without decompressing.</p>
     <p class="description">
-      TurboQuant compresses high-dimensional float32 vectors to ~3 bits per dimension
-      with near-zero distortion. Inner products can be computed directly on compressed data
-      via WASM relaxed SIMD — no decompression needed.
+      Vector compression has existed for years (FAISS, ScaNN, PQ), but they require
+      a training step on your dataset first. TurboQuant (Google Research, 2024) skips that —
+      just encode any vector immediately, no codebook, no training. Three lines of code:
+      <code>encode()</code>, <code>decode()</code>, <code>dot()</code>.
+      This npm package runs it in the browser via WASM with relaxed SIMD.
     </p>
 
     <div class="demos">
@@ -21,9 +23,9 @@
         <div class="demo-icon">&#x1F50D;</div>
         <div class="demo-title">Vector Search</div>
         <div class="demo-desc">
-          Semantic search over 5K Wikipedia passages.
-          Type a query, get instant results.
-          Compressed index uses 5x less memory with identical recall.
+          Type a query, search 5K Wikipedia passages instantly — all in your browser.
+          Left column uses compressed vectors (1.2 MB), right uses uncompressed (7.7 MB).
+          Same results, 6x less data to download.
         </div>
         <span class="demo-tag primary">Primary use case</span>
       </a>
@@ -32,8 +34,9 @@
         <div class="demo-icon">&#x1F5BC;</div>
         <div class="demo-title">Image Similarity</div>
         <div class="demo-desc">
-          Click any photo to find similar ones. 1K Unsplash images with
-          description embeddings compressed 6.2x. Instant search via tq.dot().
+          Click any photo to find visually similar ones. 1K Unsplash images indexed
+          with compressed embeddings (0.2 MB instead of 1.5 MB).
+          Similarity computed directly on compressed data.
         </div>
         <span class="demo-tag primary">Primary use case</span>
       </a>
@@ -42,8 +45,8 @@
         <div class="demo-icon">&#x1F4A0;</div>
         <div class="demo-title">3D Gaussian Splatting</div>
         <div class="demo-desc">
-          Side-by-side: original .ply vs TurboQuant-compressed SH coefficients.
-          668K Gaussians, 158 MB reduced to 65 MB.
+          Side-by-side 3D scene viewer. Original file (158 MB) vs compressed (65 MB).
+          The spherical harmonic coefficients are compressed — geometry stays intact.
         </div>
         <span class="demo-tag poc">Proof of concept</span>
       </a>
