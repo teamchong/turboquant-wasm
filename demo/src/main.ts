@@ -7,8 +7,10 @@ import { createViewerPair, loadScene } from "./viewer.js";
 import { decompressTqply } from "./decompressor.js";
 import { renderLeftStats, renderRightStats, showRatioBadge } from "./stats.js";
 
-const DEFAULT_PLY_URL = "data/scene.ply";
-const DEFAULT_TQPLY_URL = "data/scene.tqply";
+// Git LFS files served via media.githubusercontent.com (supports CORS)
+const LFS_BASE = "https://media.githubusercontent.com/media/teamchong/turboquant-wasm/main/demo/public/data";
+const DEFAULT_PLY_URL = `${LFS_BASE}/scene.ply`;
+const DEFAULT_TQPLY_URL = `${LFS_BASE}/scene.tqply`;
 
 function getSceneUrls(): { plyUrl: string; tqplyUrl: string } {
   const params = new URLSearchParams(window.location.search);
