@@ -7,7 +7,7 @@
 
 WASM + relaxed SIMD build of [botirk38/turboquant](https://github.com/botirk38/turboquant) for browsers and Node.js.
 
-Based on the paper "TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate".
+Based on the paper ["TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate"](https://arxiv.org/abs/2504.19874) (Google Research, ICLR 2026).
 
 ## What this adds
 
@@ -35,7 +35,7 @@ import { TurboQuant } from "turboquant-wasm";
 
 const tq = await TurboQuant.init({ dim: 1024, seed: 42 });
 
-// Compress a vector (~3 bits/dim, ~6x compression)
+// Compress a vector (~4.5 bits/dim, ~6x compression)
 const compressed = tq.encode(myFloat32Array);
 
 // Decode back
@@ -86,7 +86,7 @@ Encoding preserves inner products — verified by golden-value tests and distort
 ## Credits
 
 - [botirk38/turboquant](https://github.com/botirk38/turboquant) — original Zig implementation
-- Google's TurboQuant paper — algorithm design
+- [TurboQuant paper](https://arxiv.org/abs/2504.19874) (Google Research, ICLR 2026) — algorithm design
 
 ## License
 
