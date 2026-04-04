@@ -28,6 +28,7 @@ demo/data/*.tqv
 demo/data/*.npy
 demo/data/passages.json
 demo/data/image_ids.json
+demo/data/image_meta.json
 
 # OS
 .DS_Store

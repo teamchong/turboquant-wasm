@@ -4,11 +4,19 @@
 
 import { TurboQuant } from "turboquant-wasm";
 
-const UNSPLASH_THUMB = (id: string) =>
-  `https://images.unsplash.com/photo-${id}?w=200&h=200&fit=crop&auto=format&q=75`;
+interface ImageMeta {
+  id: string;
+  url: string;
+  desc: string;
+}
+
+function thumbUrl(url: string): string {
+  // Unsplash image URLs support dynamic resizing via query params
+  return url + "?w=200&h=200&fit=crop&auto=format&q=75";
+}
 
 interface ImageData {
-  ids: string[];
+  meta: ImageMeta[];
   rawVectors: Float32Array | null;
   compressedBlobs: Uint8Array[];
   tq: TurboQuant;
@@ -36,8 +44,8 @@ function formatBytes(bytes: number): string {
 }
 
 async function loadImageData(onProgress: (msg: string) => void): Promise<ImageData> {
-  onProgress("Loading image IDs...");
-  const ids: string[] = await fetch("data/image_ids.json").then((r) => r.json());
+  onProgress("Loading image metadata...");
+  const meta: ImageMeta[] = await fetch("data/image_meta.json").then((r) => r.json());
 
   onProgress("Loading compressed CLIP embeddings...");
   const tqvBuffer = await fetch("data/image_compressed.tqv").then((r) => r.arrayBuffer());
@@ -63,7 +71,7 @@ async function loadImageData(onProgress: (msg: string) => void): Promise<ImageDa
   } catch { /* compressed-only mode */ }
 
   return {
-    ids,
+    meta,
     rawVectors,
     compressedBlobs,
     tq,
@@ -92,19 +100,19 @@ function renderGallery(
 ) {
   const gallery = document.getElementById("gallery")!;
   const indices = order ?? Array.from({ length: data.numImages }, (_, i) => i);
-  const displayCount = Math.min(indices.length, 100); // show top 100
+  const displayCount = Math.min(indices.length, 100);
 
   gallery.innerHTML = indices
     .slice(0, displayCount)
     .map((idx) => {
-      const id = data.ids[idx];
+      const m = data.meta[idx];
       const sel = idx === selectedIdx ? " selected" : "";
       const scoreBadge =
         scores && idx !== selectedIdx
           ? `<div class="score-badge">${scores[idx].toFixed(3)}</div>`
           : "";
       return `<div class="gallery-item${sel}" data-idx="${idx}">
-        <img src="${UNSPLASH_THUMB(id)}" loading="lazy" alt="Photo ${id}" />
+        <img src="${thumbUrl(m.url)}" loading="lazy" alt="${m.desc}" />
         ${scoreBadge}
       </div>`;
     })
@@ -124,7 +132,7 @@ function findSimilar(data: ImageData, queryIdx: number) {
   const queryImage = document.getElementById("query-image") as HTMLImageElement;
   const queryInfo = document.getElementById("query-info")!;
 
-  queryImage.src = UNSPLASH_THUMB(data.ids[queryIdx]);
+  queryImage.src = thumbUrl(data.meta[queryIdx].url);
   querySection.classList.remove("hidden");
 
   // Compute similarity using TQ dot product
