@@ -10,10 +10,9 @@
   <div id="app">
     <div id="header">
       <h1>TurboQuant <span class="dim">Vector Search</span></h1>
-      <p class="subtitle">Compress embeddings. Search client-side. No server needed.</p>
-      <p class="note">Dot product computed directly on compressed vectors via WASM — no decompression step.</p>
-      <p class="note">TurboQuant is lossy (~3 bits/dim). Top results match, but borderline results near the ranking cutoff
-        may swap due to small score differences (~0.02). This is the expected tradeoff: 6x less memory for ~80-100% recall.</p>
+      <p class="subtitle">Search 5K Wikipedia passages entirely in your browser. The search index is 1.2 MB instead of 7.7 MB.</p>
+      <p class="note">Left: TurboQuant searches compressed vectors directly (no decompression). Right: brute-force on full float32 vectors.
+        Top results match. Borderline results near the cutoff may swap — that's the tradeoff for 6x less data.</p>
     </div>
 
     <div id="main">

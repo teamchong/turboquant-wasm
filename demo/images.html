@@ -10,8 +10,9 @@
   <div id="app">
     <div id="header">
       <h1>TurboQuant <span class="dim">Image Similarity</span></h1>
-      <p class="subtitle">Click any image to find similar ones. Description embeddings compressed 6.2x with TurboQuant.</p>
-      <p class="note">1,000 Unsplash photos. Similarity computed via tq.dot() directly on compressed 384-dim vectors.</p>
+      <p class="subtitle">Click any image to find similar ones. The entire image index is just 0.2 MB (compressed from 1.5 MB).</p>
+      <p class="note">1,000 Unsplash photos. Each image is represented by a 384-dim embedding vector, compressed 6x with TurboQuant.
+        Similarity is computed directly on the compressed vectors — no decompression needed.</p>
     </div>
 
     <div id="main">
