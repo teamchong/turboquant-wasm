@@ -66,4 +66,40 @@ jobs:
           test -f dist/index.js
           test -f dist/index.d.ts
           test -f dist/turboquant.wasm
-          echo "✓ All build artifacts present"
+          echo "All build artifacts present"
+
+  benchmark:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Benchmark — dim=64
+        run: |
+          timeout 120 zig build quality -Dtarget=x86_64-linux -- 64 500 10 20 2>&1 | tee /tmp/bench-64.txt
+
+      - name: Benchmark — dim=128
+        run: |
+          timeout 120 zig build quality -Dtarget=x86_64-linux -- 128 500 10 20 2>&1 | tee /tmp/bench-128.txt
+
+      - name: Benchmark — dim=256
+        run: |
+          timeout 120 zig build quality -Dtarget=x86_64-linux -- 256 500 10 20 2>&1 | tee /tmp/bench-256.txt
+
+      - name: Post benchmark results
+        if: always()
+        run: |
+          echo '## Benchmark Results' >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          for dim in 64 128 256; do
+            echo "<details><summary>dim=$dim (N=500, k=10, queries=20)</summary>" >> $GITHUB_STEP_SUMMARY
+            echo '' >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat /tmp/bench-$dim.txt >> $GITHUB_STEP_SUMMARY 2>/dev/null || echo 'No output' >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo '</details>' >> $GITHUB_STEP_SUMMARY
+            echo '' >> $GITHUB_STEP_SUMMARY
+          done
