@@ -48,11 +48,13 @@ pub fn sinTable() *const [8]f32 {
 }
 
 inline fn unpackOne(compressed: []const u8, bit_pos: usize) struct { r: f32, bucket: u3 } {
-    var combined: u7 = 0;
-    for (0..BITS_PER_PAIR) |j| {
-        const bit: u7 = @intCast((compressed[(bit_pos + j) / 8] >> @intCast((bit_pos + j) % 8)) & 1);
-        combined = (combined << 1) | bit;
-    }
+    const byte_idx = bit_pos / 8;
+    const bit_off: u4 = @intCast(bit_pos % 8);
+    const lo = @as(u16, compressed[byte_idx]);
+    const hi: u16 = if (byte_idx + 1 < compressed.len) compressed[byte_idx + 1] else 0;
+    // Encode writes MSB-first, so reverse the 7 bits after extraction
+    const raw: u7 = @intCast(((lo | (hi << 8)) >> bit_off) & 0x7F);
+    const combined = @bitReverse(raw);
     const r = @as(f32, @floatFromInt((combined >> THETA_BITS) & 0xF)) / R_LEVELS;
     const bucket = @as(u3, @intCast(combined & 0x7));
     return .{ .r = r, .bucket = bucket };
