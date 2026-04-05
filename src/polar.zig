@@ -39,6 +39,20 @@ const direction_vectors: [ANGLE_BUCKETS][2]f32 = init: {
     break :init dirs;
 };
 
+// Precomputed (dx, dy) for all 128 possible 7-bit values (16 radii × 8 angles).
+// Indexed by raw combined byte: pair_lut[combined] = { r/15 * cos(theta), r/15 * sin(theta) }
+// Caller multiplies by max_r. One indexed load replaces unpack + 2 table lookups + multiply.
+const pair_lut: [128][2]f32 = init: {
+    var lut: [128][2]f32 = undefined;
+    for (0..128) |c| {
+        const r_norm = @as(f32, @floatFromInt((c >> 3) & 0xF)) / 15.0;
+        const bucket = c & 0x7;
+        const theta = @as(f32, @floatFromInt(bucket)) / THETA_LEVELS * TWO_PI - PI;
+        lut[c] = .{ r_norm * @cos(theta), r_norm * @sin(theta) };
+    }
+    break :init lut;
+};
+
 pub fn cosTable() *const [8]f32 {
     return &polar_cos_table;
 }
@@ -47,25 +61,13 @@ pub fn sinTable() *const [8]f32 {
     return &polar_sin_table;
 }
 
-inline fn unpackOne(compressed: []const u8, bit_pos: usize) struct { r: f32, bucket: u3 } {
+pub inline fn reconstructPair(compressed: []const u8, bit_pos: usize, max_r: f32) struct { dx: f32, dy: f32 } {
     const byte_idx = bit_pos / 8;
     const bit_off: u4 = @intCast(bit_pos % 8);
-    // Buffer has 1 byte padding so byte_idx+1 is always safe
     const window = @as(u16, compressed[byte_idx]) | (@as(u16, compressed[byte_idx + 1]) << 8);
     const combined: u7 = @intCast((window >> bit_off) & 0x7F);
-    const r = @as(f32, @floatFromInt((combined >> THETA_BITS) & 0xF)) / R_LEVELS;
-    const bucket = @as(u3, @intCast(combined & 0x7));
-    return .{ .r = r, .bucket = bucket };
-}
-
-pub inline fn reconstructPair(compressed: []const u8, bit_pos: usize, max_r: f32) struct { dx: f32, dy: f32 } {
-    const unpacked = unpackOne(compressed, bit_pos);
-    const r = unpacked.r * max_r;
-    const bucket = unpacked.bucket;
-    return .{
-        .dx = r * polar_cos_table[bucket],
-        .dy = r * polar_sin_table[bucket],
-    };
+    const entry = pair_lut[combined];
+    return .{ .dx = entry[0] * max_r, .dy = entry[1] * max_r };
 }
 
 pub fn encode(
