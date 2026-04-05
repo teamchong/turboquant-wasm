@@ -11,6 +11,12 @@ Based on the paper ["TurboQuant: Online Vector Quantization with Near-optimal Di
 
 **[Live Demo](https://teamchong.github.io/turboquant-wasm/)** — vector search, image similarity, and 3D Gaussian Splatting compression running in the browser.
 
+## Why TurboQuant?
+
+Float32 embedding indexes are large — 1M vectors × 384-dim = 1.5GB. They don't fit in mobile RAM, take minutes to download, and gzip only saves ~7% because float32 has high entropy.
+
+TurboQuant compresses them 6x (1.5GB → 240MB) and searches directly on compressed data without decompressing. No training step — unlike PQ/OPQ, just `init({ dim, seed })` and encode any vector immediately.
+
 ## What this adds
 
 - **npm package** with embedded WASM — `npm install turboquant-wasm`
