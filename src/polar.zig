@@ -148,24 +148,52 @@ pub fn dotProduct(
     if (dim == 0 or dim % 2 != 0) return 0;
 
     const num_pairs = dim / 2;
-    var sum: f32 = 0;
+    // 4 independent f32x4 accumulators — breaks sequential dependency chain
+    // (gguf-runner technique: tree reduction instead of linear chain)
+    var s0: @Vector(4, f32) = @splat(0);
+    var s1: @Vector(4, f32) = @splat(0);
+    var s2: @Vector(4, f32) = @splat(0);
+    var s3: @Vector(4, f32) = @splat(0);
     var bit_pos: usize = 0;
 
-    // Unroll 2 pairs at a time for SIMD f32x4 dot
     var i: usize = 0;
-    while (i + 2 <= num_pairs) : (i += 2) {
+    while (i + 8 <= num_pairs) : (i += 8) {
         const p0 = reconstructPair(compressed, bit_pos, max_r);
         bit_pos += BITS_PER_PAIR;
         const p1 = reconstructPair(compressed, bit_pos, max_r);
         bit_pos += BITS_PER_PAIR;
+        const q0: @Vector(4, f32) = @as(*const [4]f32, @ptrCast(q[i * 2 ..].ptr)).*;
+        s0 += q0 * @Vector(4, f32){ p0.dx, p0.dy, p1.dx, p1.dy };
 
-        const q_vec: @Vector(4, f32) = @as(*const [4]f32, @ptrCast(q[i * 2 ..].ptr)).*;
-        const p_vec: @Vector(4, f32) = .{ p0.dx, p0.dy, p1.dx, p1.dy };
-        sum += @reduce(.Add, q_vec * p_vec);
+        const p2 = reconstructPair(compressed, bit_pos, max_r);
+        bit_pos += BITS_PER_PAIR;
+        const p3 = reconstructPair(compressed, bit_pos, max_r);
+        bit_pos += BITS_PER_PAIR;
+        const q1: @Vector(4, f32) = @as(*const [4]f32, @ptrCast(q[i * 2 + 4 ..].ptr)).*;
+        s1 += q1 * @Vector(4, f32){ p2.dx, p2.dy, p3.dx, p3.dy };
+
+        const p4 = reconstructPair(compressed, bit_pos, max_r);
+        bit_pos += BITS_PER_PAIR;
+        const p5 = reconstructPair(compressed, bit_pos, max_r);
+        bit_pos += BITS_PER_PAIR;
+        const q2: @Vector(4, f32) = @as(*const [4]f32, @ptrCast(q[i * 2 + 8 ..].ptr)).*;
+        s2 += q2 * @Vector(4, f32){ p4.dx, p4.dy, p5.dx, p5.dy };
+
+        const p6 = reconstructPair(compressed, bit_pos, max_r);
+        bit_pos += BITS_PER_PAIR;
+        const p7 = reconstructPair(compressed, bit_pos, max_r);
+        bit_pos += BITS_PER_PAIR;
+        const q3: @Vector(4, f32) = @as(*const [4]f32, @ptrCast(q[i * 2 + 12 ..].ptr)).*;
+        s3 += q3 * @Vector(4, f32){ p6.dx, p6.dy, p7.dx, p7.dy };
     }
-    // Handle remaining pair
-    if (i < num_pairs) {
+
+    // Tree reduction
+    var sum = @reduce(.Add, (s0 + s1) + (s2 + s3));
+
+    // Handle remaining pairs
+    while (i < num_pairs) : (i += 1) {
         const pair = reconstructPair(compressed, bit_pos, max_r);
+        bit_pos += BITS_PER_PAIR;
         sum += q[i * 2] * pair.dx + q[i * 2 + 1] * pair.dy;
     }
 
