@@ -122,7 +122,7 @@ pub fn decodeIntoRotated(
 /// The query must already be in rotated space (caller applies R*q).
 /// Fused: reads sign bits and accumulates dot product in one pass,
 /// avoids materializing the 384-float sign_vec buffer (saves 7.5MB memory traffic per batch).
-pub fn estimateDotWithWorkspace(
+pub inline fn estimateDotWithWorkspace(
     rotated_q: []const f32,
     qjl_bits: []const u8,
     gamma: f32,
@@ -162,6 +162,42 @@ pub fn estimateDotWithWorkspace(
         dot_sum += rotated_q[i] * sign;
     }
 
+    const scale_val = SQRT_PI_OVER_2 / @as(f32, @floatFromInt(d)) * gamma;
+    return dot_sum * scale_val;
+}
+
+/// Fast QJL dot with precomputed query sum.
+/// dot(q, ±1) = 2 * sum(q[i] where bit=1) - sum_all
+/// Avoids IEEE sign bit manipulation — just multiply by 0.0 or 1.0.
+pub inline fn estimateDotFast(
+    rotated_q: []const f32,
+    qjl_bits: []const u8,
+    gamma: f32,
+    q_sum: f32,
+) f32 {
+    const d = rotated_q.len;
+    if (d == 0) return 0;
+
+    var pos_vec: @Vector(LANE_COUNT, f32) = @splat(0);
+
+    var i: usize = 0;
+    while (i + LANE_COUNT <= d) : (i += LANE_COUNT) {
+        const q_v: @Vector(LANE_COUNT, f32) = rotated_q[i..][0..LANE_COUNT].*;
+        var mask: @Vector(LANE_COUNT, f32) = undefined;
+        inline for (0..LANE_COUNT) |b| {
+            mask[b] = @floatFromInt((@as(u32, qjl_bits[(i + b) / 8]) >> @intCast((i + b) % 8)) & 1);
+        }
+        pos_vec = @mulAdd(@Vector(LANE_COUNT, f32), q_v, mask, pos_vec);
+    }
+
+    var pos_sum = @reduce(.Add, pos_vec);
+
+    while (i < d) : (i += 1) {
+        const bit: u32 = (@as(u32, qjl_bits[i / 8]) >> @intCast(i % 8)) & 1;
+        if (bit == 1) pos_sum += rotated_q[i];
+    }
+
+    const dot_sum = 2.0 * pos_sum - q_sum;
     const scale_val = SQRT_PI_OVER_2 / @as(f32, @floatFromInt(d)) * gamma;
     return dot_sum * scale_val;
 }

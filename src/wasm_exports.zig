@@ -119,6 +119,11 @@ export fn tq_dot_batch(
     const polar_off = turboquant.format.HEADER_SIZE;
     const qjl_off = polar_off + polar_len;
 
+    // Precompute sum of all rotated_q values (same for all vectors).
+    // QJL dot = 2 * sum_positive - sum_all, avoiding per-element sign conversion.
+    var q_sum: f32 = 0;
+    for (rotated_q) |v| q_sum += v;
+
     for (0..num_vectors) |i| {
         const base = i * bytes_per_vector;
         const blob = compressed_ptr[base .. base + bytes_per_vector];
@@ -131,7 +136,7 @@ export fn tq_dot_batch(
         const qjl_data = blob[qjl_off .. qjl_off + qjl_len];
 
         const polar_sum = turboquant.polar.dotProduct(rotated_q, polar_data, max_r);
-        const qjl_sum = turboquant.qjl.estimateDotWithWorkspace(rotated_q, qjl_data, gamma, &engine_ptr.qjl_workspace);
+        const qjl_sum = turboquant.qjl.estimateDotFast(rotated_q, qjl_data, gamma, q_sum);
 
         out_scores[i] = polar_sum + qjl_sum;
     }
