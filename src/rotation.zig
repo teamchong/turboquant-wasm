@@ -29,7 +29,16 @@ fn gaussianCoeff(seed: u64, row: usize, col: usize) f32 {
 }
 
 pub fn signToVector(sign_bits: []const u8, dim: usize, output: []f32) void {
-    for (0..dim) |i| {
+    // Process 8 bits (1 byte) at a time — unpack to 8 floats
+    var i: usize = 0;
+    while (i + 8 <= dim) : (i += 8) {
+        const byte = sign_bits[i / 8];
+        inline for (0..8) |b| {
+            output[i + b] = if ((byte >> b) & 1 == 1) 1.0 else -1.0;
+        }
+    }
+    // Remainder
+    while (i < dim) : (i += 1) {
         const bit = (sign_bits[i / 8] >> @intCast(i % 8)) & 1;
         output[i] = if (bit == 1) 1.0 else -1.0;
     }
