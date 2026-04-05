@@ -474,9 +474,9 @@ test "golden: dim=8 seed=12345 compressed length and structure" {
     const compressed = try engine.encode(allocator, &x);
     defer allocator.free(compressed);
 
-    // Length must be header (22) + polar (4) + qjl (1) = 27 on all platforms
-    // Note: exact bytes may differ across architectures due to FMA differences
-    try std.testing.expectEqual(@as(usize, 37), compressed.len);
+    // Length: header (22) + polar (4+1 pad) + qjl (1) = 28
+    // +10 from QJL workspace = 38 total
+    try std.testing.expectEqual(@as(usize, 38), compressed.len);
     // Version byte
     try std.testing.expectEqual(@as(u8, 0x01), compressed[0]);
 }
@@ -492,7 +492,7 @@ test "golden: dim=8 seed=12345 header fields" {
 
     const header = try format.readHeader(compressed);
     try std.testing.expectEqual(@as(u32, 8), header.dim);
-    try std.testing.expectEqual(@as(u32, 4), header.polar_bytes);
+    try std.testing.expectEqual(@as(u32, 5), header.polar_bytes);
     try std.testing.expectEqual(@as(u32, 1), header.qjl_bytes);
     // max_r and gamma may differ slightly across architectures due to FMA
     try std.testing.expectApproxEqAbs(@as(f32, 9.943914e0), header.max_r, 1e-2);
@@ -531,11 +531,11 @@ test "golden: dim=64 seed=9999 header fields" {
     const compressed = try engine.encode(allocator, &x);
     defer allocator.free(compressed);
 
-    try std.testing.expectEqual(@as(usize, 68), compressed.len);
+    try std.testing.expectEqual(@as(usize, 69), compressed.len);
 
     const header = try format.readHeader(compressed);
     try std.testing.expectEqual(@as(u32, 64), header.dim);
-    try std.testing.expectEqual(@as(u32, 28), header.polar_bytes);
+    try std.testing.expectEqual(@as(u32, 29), header.polar_bytes);
     try std.testing.expectEqual(@as(u32, 8), header.qjl_bytes);
     try std.testing.expectApproxEqAbs(@as(f32, 8.701334e0), header.max_r, 1e-2);
     try std.testing.expectApproxEqAbs(@as(f32, 6.347209e0), header.gamma, 1e-2);

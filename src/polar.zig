@@ -50,11 +50,9 @@ pub fn sinTable() *const [8]f32 {
 inline fn unpackOne(compressed: []const u8, bit_pos: usize) struct { r: f32, bucket: u3 } {
     const byte_idx = bit_pos / 8;
     const bit_off: u4 = @intCast(bit_pos % 8);
-    const lo = @as(u16, compressed[byte_idx]);
-    const hi: u16 = if (byte_idx + 1 < compressed.len) compressed[byte_idx + 1] else 0;
-    // Encode writes MSB-first, so reverse the 7 bits after extraction
-    const raw: u7 = @intCast(((lo | (hi << 8)) >> bit_off) & 0x7F);
-    const combined = @bitReverse(raw);
+    // Buffer has 1 byte padding so byte_idx+1 is always safe
+    const window = @as(u16, compressed[byte_idx]) | (@as(u16, compressed[byte_idx + 1]) << 8);
+    const combined: u7 = @intCast((window >> bit_off) & 0x7F);
     const r = @as(f32, @floatFromInt((combined >> THETA_BITS) & 0xF)) / R_LEVELS;
     const bucket = @as(u3, @intCast(combined & 0x7));
     return .{ .r = r, .bucket = bucket };
@@ -82,7 +80,8 @@ pub fn encode(
     const polar_bits = num_pairs * BITS_PER_PAIR;
     const polar_bytes = (polar_bits + 7) / 8;
 
-    const result = try allocator.alloc(u8, polar_bytes);
+    // +1 byte padding so 16-bit window reads in unpackOne never go out of bounds
+    const result = try allocator.alloc(u8, polar_bytes + 1);
     @memset(result, 0);
 
     var bit_pos: usize = 0;
@@ -95,8 +94,9 @@ pub fn encode(
         const theta_bucket = findNearestAngleBucket(x, y);
         const combined: u7 = (@as(u7, r_quant) << THETA_BITS) | theta_bucket;
 
+        // Write LSB-first so 16-bit window extraction works without @bitReverse
         for (0..BITS_PER_PAIR) |j| {
-            const bit = (combined >> @intCast(BITS_PER_PAIR - 1 - j)) & 1;
+            const bit = (combined >> @intCast(j)) & 1;
             if (bit == 1) {
                 result[bit_pos / 8] |= @as(u8, 1) << @intCast(bit_pos % 8);
             }
