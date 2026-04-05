@@ -129,6 +129,10 @@ export class TurboQuant {
   readonly dim: number;
   #handle: number;
   #ex: TurboQuantExports;
+  #cachedRef: Uint8Array | null = null;
+  #cachedPtr: number = 0;
+  #cachedLen: number = 0;
+  #cachedBpv: number = 0;
 
   private constructor(ex: TurboQuantExports, handle: number, dim: number) {
     this.#ex = ex;
@@ -249,24 +253,31 @@ export class TurboQuant {
     const numVectors = Math.floor(compressedConcat.length / bytesPerVector);
     const ex = this.#ex;
 
+    // Cache index in WASM — skip copy if same buffer
+    if (compressedConcat !== this.#cachedRef || bytesPerVector !== this.#cachedBpv) {
+      if (this.#cachedPtr) ex.tq_free(this.#cachedPtr, this.#cachedLen);
+      this.#cachedPtr = wasmWriteU8(ex, compressedConcat);
+      this.#cachedLen = compressedConcat.length;
+      this.#cachedRef = compressedConcat;
+      this.#cachedBpv = bytesPerVector;
+    }
+
+    // Only copy query each call (1.5KB for dim=384)
     const qPtr = wasmWriteF32(ex, query);
-    const compPtr = wasmWriteU8(ex, compressedConcat);
     const scoresPtr = ex.tq_alloc_f32(numVectors);
     if (!scoresPtr) {
       ex.tq_free(qPtr, query.byteLength);
-      ex.tq_free(compPtr, compressedConcat.length);
       throw new Error("TurboQuant: WASM alloc failed for scores");
     }
 
     ex.tq_dot_batch(
       this.#handle, qPtr, this.dim,
-      compPtr, bytesPerVector, numVectors, scoresPtr,
+      this.#cachedPtr, bytesPerVector, numVectors, scoresPtr,
     );
 
     const scores = new Float32Array(ex.memory.buffer, scoresPtr, numVectors).slice();
 
     ex.tq_free(qPtr, query.byteLength);
-    ex.tq_free(compPtr, compressedConcat.length);
     ex.tq_free_f32(scoresPtr, numVectors);
 
     return scores;
@@ -274,6 +285,11 @@ export class TurboQuant {
 
   /** Release engine resources. Call when done. */
   destroy(): void {
+    if (this.#cachedPtr) {
+      this.#ex.tq_free(this.#cachedPtr, this.#cachedLen);
+      this.#cachedPtr = 0;
+      this.#cachedRef = null;
+    }
     this.#ex.tq_engine_destroy(this.#handle);
   }
 }
