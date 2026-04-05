@@ -96,6 +96,20 @@ Encoding preserves inner products — verified by golden-value tests and distort
 - **Dot product preservation** — mean absolute error < 1.0 for unit vectors at dim=128
 - **Bit-identical** output with [botirk38/turboquant](https://github.com/botirk38/turboquant) for same input + seed
 
+## When to use TurboQuant (and when not to)
+
+| | TurboQuant | PQ/OPQ (FAISS, ScaNN) |
+|---|---|---|
+| Compression | ~4.5 bits/dim (6x) | ~1-2 bits/dim (16-32x) |
+| Query speed | Slower (float decode per pair) | Faster (integer codebook lookup) |
+| Training | None — encode any vector immediately | Required — must train codebook on dataset |
+| Streaming data | Yes — each vector is self-contained | Degrades if data distribution shifts |
+| Setup | `npm install` + 3 lines of code | Dataset-dependent configuration |
+
+**Use TurboQuant when:** vectors arrive continuously (LLM KV cache, real-time indexing), you can't pause to train, you need simple deployment (browser, edge), or you want a single npm package with no dependencies.
+
+**Use PQ/OPQ when:** you have a static dataset, can afford a training step, and need maximum compression + fastest query speed. PQ is the better tool for traditional batch vector search.
+
 ## Credits
 
 - [botirk38/turboquant](https://github.com/botirk38/turboquant) — original Zig implementation
