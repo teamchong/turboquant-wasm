@@ -14,7 +14,7 @@
     "@huggingface/transformers": "^4.0.1",
     "@mkkellogg/gaussian-splats-3d": "^0.4.7",
     "three": "^0.170.0",
-    "turboquant-wasm": "^0.2.8"
+    "turboquant-wasm": "^0.2.10"
   },
   "devDependencies": {
     "@types/three": "^0.170.0",
