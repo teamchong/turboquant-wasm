@@ -133,6 +133,11 @@ export class TurboQuant {
   #cachedPtr: number = 0;
   #cachedLen: number = 0;
   #cachedBpv: number = 0;
+  #scoresPtr: number = 0;
+  #scoresCount: number = 0;
+  #scoresOut: Float32Array | null = null;
+  #queryPtr: number = 0;
+  #queryLen: number = 0;
 
   private constructor(ex: TurboQuantExports, handle: number, dim: number) {
     this.#ex = ex;
@@ -244,7 +249,8 @@ export class TurboQuant {
    * @param query - Float32Array of length `dim`
    * @param compressedConcat - All compressed vectors concatenated into one Uint8Array
    * @param bytesPerVector - Size of each compressed vector (from encode().length)
-   * @returns Float32Array of scores, one per vector
+   * @returns Float32Array of scores, one per vector.
+   *   The returned array is reused across calls — copy with .slice() if you need to retain it.
    */
   dotBatch(query: Float32Array, compressedConcat: Uint8Array, bytesPerVector: number): Float32Array {
     if (query.length !== this.dim) {
@@ -262,35 +268,55 @@ export class TurboQuant {
       this.#cachedBpv = bytesPerVector;
     }
 
-    // Only copy query each call (1.5KB for dim=384)
-    const qPtr = wasmWriteF32(ex, query);
-    const scoresPtr = ex.tq_alloc_f32(numVectors);
-    if (!scoresPtr) {
-      ex.tq_free(qPtr, query.byteLength);
-      throw new Error("TurboQuant: WASM alloc failed for scores");
+    // Cache scores buffer in WASM — reuse across calls
+    if (this.#scoresCount !== numVectors) {
+      if (this.#scoresPtr) ex.tq_free_f32(this.#scoresPtr, this.#scoresCount);
+      this.#scoresPtr = ex.tq_alloc_f32(numVectors);
+      if (!this.#scoresPtr) throw new Error("TurboQuant: WASM alloc failed for scores");
+      this.#scoresCount = numVectors;
+      this.#scoresOut = new Float32Array(numVectors);
     }
 
+    // Cache query buffer in WASM — reuse across calls with same dim
+    if (this.#queryLen !== query.byteLength) {
+      if (this.#queryPtr) ex.tq_free(this.#queryPtr, this.#queryLen);
+      this.#queryPtr = ex.tq_alloc(query.byteLength);
+      if (!this.#queryPtr) throw new Error("TurboQuant: WASM alloc failed for query");
+      this.#queryLen = query.byteLength;
+    }
+    new Float32Array(ex.memory.buffer, this.#queryPtr, query.length).set(query);
+
     ex.tq_dot_batch(
-      this.#handle, qPtr, this.dim,
-      this.#cachedPtr, bytesPerVector, numVectors, scoresPtr,
+      this.#handle, this.#queryPtr, this.dim,
+      this.#cachedPtr, bytesPerVector, numVectors, this.#scoresPtr,
     );
 
-    const scores = new Float32Array(ex.memory.buffer, scoresPtr, numVectors).slice();
+    // Read scores from WASM into reusable JS buffer
+    // Safe: tq_dot_batch doesn't allocate, so memory.buffer isn't detached
+    this.#scoresOut!.set(new Float32Array(ex.memory.buffer, this.#scoresPtr, numVectors));
 
-    ex.tq_free(qPtr, query.byteLength);
-    ex.tq_free_f32(scoresPtr, numVectors);
-
-    return scores;
+    return this.#scoresOut!;
   }
 
-  /** Release engine resources. Call when done. */
+  /** Release engine resources. Call when done. Safe to call multiple times. */
   destroy(): void {
+    if (!this.#handle && this.#handle !== 0) return;
     if (this.#cachedPtr) {
       this.#ex.tq_free(this.#cachedPtr, this.#cachedLen);
       this.#cachedPtr = 0;
       this.#cachedRef = null;
     }
+    if (this.#scoresPtr) {
+      this.#ex.tq_free_f32(this.#scoresPtr, this.#scoresCount);
+      this.#scoresPtr = 0;
+      this.#scoresOut = null;
+    }
+    if (this.#queryPtr) {
+      this.#ex.tq_free(this.#queryPtr, this.#queryLen);
+      this.#queryPtr = 0;
+    }
     this.#ex.tq_engine_destroy(this.#handle);
+    this.#handle = -1;
   }
 }
 
