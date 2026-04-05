@@ -1,3 +1,18 @@
+/// Rotation operator for TurboQuant's decorrelation step.
+///
+/// Uses Gaussian QR (Gram-Schmidt on random Gaussian matrix) which produces a
+/// Haar-distributed random orthogonal rotation. This gives the best quantization
+/// quality (cosine sim ~0.965 at dim=384) because every entry is independently random.
+///
+/// We evaluated Walsh-Hadamard Transform (WHT) with random sign flips as a faster
+/// alternative (O(d log d) vs O(d²)). WHT achieves only ~0.878 cosine similarity
+/// because its structured butterfly pattern creates correlations between dimensions
+/// that degrade polar quantization quality. This tradeoff is acceptable for LLM KV
+/// cache compression (TurboQuant_plus uses WHT) where softmax suppresses small errors,
+/// but NOT for vector search where ranking precision matters.
+///
+/// Gaussian QR is O(d²) per rotation but only runs once per dotBatch call
+/// (pre-rotate query), so it's not a search bottleneck.
 const std = @import("std");
 
 const RNG_MULTIPLIER: u64 = 1103515245;
