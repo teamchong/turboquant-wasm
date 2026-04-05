@@ -135,21 +135,30 @@ pub fn estimateDotWithWorkspace(
     // For each bit: dot += q[i] * (bit ? 1.0 : -1.0)
     // Rewritten as: dot += q[i] * (2*bit - 1) = 2*bit*q[i] - q[i]
     // Accumulate: pos_sum += q[i] when bit=1, then dot = 2*pos_sum - total_sum
+    // Branchless bit-to-sign: 1.0 = 0x3F800000, -1.0 = 0xBF800000
+    // Only the sign bit (bit 31) differs. Flip it based on the QJL bit.
+    const one_bits: @Vector(LANE_COUNT, u32) = @splat(0x3F800000);
+    const sign_mask: @Vector(LANE_COUNT, u32) = @splat(1 << 31);
     var sum_vec: @Vector(LANE_COUNT, f32) = @splat(0);
+
     var i: usize = 0;
     while (i + LANE_COUNT <= d) : (i += LANE_COUNT) {
         const q_v: @Vector(LANE_COUNT, f32) = rotated_q[i..][0..LANE_COUNT].*;
-        var sign: @Vector(LANE_COUNT, f32) = undefined;
+        var bits: @Vector(LANE_COUNT, u32) = undefined;
         inline for (0..LANE_COUNT) |b| {
-            sign[b] = if (((qjl_bits[(i + b) / 8] >> @intCast((i + b) % 8)) & 1) == 1) 1.0 else -1.0;
+            bits[b] = (@as(u32, qjl_bits[(i + b) / 8]) >> @intCast((i + b) % 8)) & 1;
         }
+        // bit=1 → 0x3F800000 (1.0), bit=0 → 0x3F800000 | 0x80000000 = 0xBF800000 (-1.0)
+        const sign_bits = (@as(@Vector(LANE_COUNT, u32), @splat(1)) - bits) * sign_mask;
+        const sign: @Vector(LANE_COUNT, f32) = @bitCast(one_bits | sign_bits);
         sum_vec = @mulAdd(@Vector(LANE_COUNT, f32), q_v, sign, sum_vec);
     }
 
     var dot_sum = @reduce(.Add, sum_vec);
 
     while (i < d) : (i += 1) {
-        const sign: f32 = if (((qjl_bits[i / 8] >> @intCast(i % 8)) & 1) == 1) 1.0 else -1.0;
+        const bit: u32 = (@as(u32, qjl_bits[i / 8]) >> @intCast(i % 8)) & 1;
+        const sign: f32 = @bitCast(@as(u32, 0x3F800000) | ((1 - bit) << 31));
         dot_sum += rotated_q[i] * sign;
     }
 
