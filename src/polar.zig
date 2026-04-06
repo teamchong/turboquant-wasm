@@ -92,7 +92,7 @@ pub fn encode(
         const y = rotated[i * 2 + 1];
         const r = @sqrt(x * x + y * y);
 
-        const r_quant = @as(u4, @intFromFloat(r / max_r * R_LEVELS));
+        const r_quant = @as(u4, @intFromFloat(@min(r / max_r * R_LEVELS, R_LEVELS)));
         const theta_bucket = findNearestAngleBucket(x, y);
         const combined: u7 = (@as(u7, r_quant) << THETA_BITS) | theta_bucket;
 
@@ -271,6 +271,28 @@ test "dotProduct matches decoded dot" {
     const polar_dot = dotProduct(&q, encoded, max_r);
 
     try std.testing.expectEqual(decoded_dot, polar_dot);
+}
+
+test "encode does not panic when r exceeds max_r due to float rounding" {
+    // Regression: @intFromFloat overflow when r/max_r * 15 rounds above 15.0.
+    // In Engine.encode(), max_r is computed via math.norm() (SIMD/FMA path),
+    // but polar.encode() recomputes r as @sqrt(x*x + y*y) (scalar path).
+    // FMA differences can make r slightly > max_r, causing r/max_r > 1.0.
+    // Simulate this by passing a max_r slightly below the true radius.
+    const allocator = std.testing.allocator;
+    const rotated = [_]f32{ 3.0, 4.0 };
+    // True r = 5.0, use max_r = 4.6 so r/max_r * 15 ≈ 16.3 → u4 overflow
+    const max_r: f32 = 4.6;
+
+    const encoded = try encode(allocator, &rotated, max_r);
+    defer allocator.free(encoded);
+
+    var decoded: [2]f32 = undefined;
+    try decodeInto(&decoded, encoded, max_r);
+
+    for (decoded) |v| {
+        try std.testing.expect(std.math.isFinite(v));
+    }
 }
 
 test "all zero encodes safely" {
