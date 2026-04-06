@@ -19,6 +19,12 @@ fn findSlot() ?usize {
     return null;
 }
 
+/// Validate handle and return index. Returns null for negative or out-of-range handles.
+fn resolveHandle(handle: i32) ?usize {
+    if (handle < 0 or handle >= MAX_ENGINES) return null;
+    return @intCast(handle);
+}
+
 // ---------------------------------------------------------------------------
 // Exported C-ABI functions
 // ---------------------------------------------------------------------------
@@ -42,8 +48,7 @@ export fn tq_engine_create(dim: u32, seed: u32) i32 {
 
 /// Destroy an engine by handle.
 export fn tq_engine_destroy(handle: i32) void {
-    const idx: usize = @intCast(handle);
-    if (idx >= MAX_ENGINES) return;
+    const idx = resolveHandle(handle) orelse return;
     if (engine_slots[idx]) |engine_ptr| {
         engine_ptr.deinit(wasm_allocator);
         wasm_allocator.destroy(engine_ptr);
@@ -54,8 +59,7 @@ export fn tq_engine_destroy(handle: i32) void {
 /// Encode a vector. Returns pointer to compressed data, writes length to out_len.
 /// Caller must free the returned pointer with tq_free.
 export fn tq_encode(handle: i32, input_ptr: [*]const f32, dim: u32, out_len: *u32) ?[*]u8 {
-    const idx: usize = @intCast(handle);
-    if (idx >= MAX_ENGINES) return null;
+    const idx = resolveHandle(handle) orelse return null;
     const engine_ptr = engine_slots[idx] orelse return null;
 
     const input = input_ptr[0..dim];
@@ -67,8 +71,7 @@ export fn tq_encode(handle: i32, input_ptr: [*]const f32, dim: u32, out_len: *u3
 /// Decode compressed data back to floats. Returns pointer to f32 array.
 /// Caller must free the returned pointer with tq_free.
 export fn tq_decode(handle: i32, compressed_ptr: [*]const u8, compressed_len: u32, out_len: *u32) ?[*]f32 {
-    const idx: usize = @intCast(handle);
-    if (idx >= MAX_ENGINES) return null;
+    const idx = resolveHandle(handle) orelse return null;
     const engine_ptr = engine_slots[idx] orelse return null;
 
     const compressed = compressed_ptr[0..compressed_len];
@@ -79,8 +82,7 @@ export fn tq_decode(handle: i32, compressed_ptr: [*]const u8, compressed_len: u3
 
 /// Fast dot product between a query vector and compressed data.
 export fn tq_dot(handle: i32, query_ptr: [*]const f32, dim: u32, compressed_ptr: [*]const u8, compressed_len: u32) f32 {
-    const idx: usize = @intCast(handle);
-    if (idx >= MAX_ENGINES) return 0;
+    const idx = resolveHandle(handle) orelse return 0;
     const engine_ptr = engine_slots[idx] orelse return 0;
 
     const q = query_ptr[0..dim];
@@ -100,8 +102,7 @@ export fn tq_dot_batch(
     num_vectors: u32,
     out_scores: [*]f32,
 ) void {
-    const idx: usize = @intCast(handle);
-    if (idx >= MAX_ENGINES) return;
+    const idx = resolveHandle(handle) orelse return;
     const engine_ptr = engine_slots[idx] orelse return;
 
     const q = query_ptr[0..dim];
@@ -162,4 +163,21 @@ export fn tq_alloc_f32(count: u32) ?[*]f32 {
 /// Free an f32 pointer.
 export fn tq_free_f32(ptr: [*]f32, count: u32) void {
     wasm_allocator.free(ptr[0..count]);
+}
+
+test "resolveHandle rejects negative handles" {
+    try std.testing.expectEqual(null, resolveHandle(-1));
+    try std.testing.expectEqual(null, resolveHandle(-100));
+    try std.testing.expectEqual(null, resolveHandle(std.math.minInt(i32)));
+}
+
+test "resolveHandle rejects out-of-range handles" {
+    try std.testing.expectEqual(null, resolveHandle(MAX_ENGINES));
+    try std.testing.expectEqual(null, resolveHandle(MAX_ENGINES + 1));
+    try std.testing.expectEqual(null, resolveHandle(std.math.maxInt(i32)));
+}
+
+test "resolveHandle accepts valid handles" {
+    try std.testing.expectEqual(@as(usize, 0), resolveHandle(0));
+    try std.testing.expectEqual(@as(usize, 15), resolveHandle(MAX_ENGINES - 1));
 }
