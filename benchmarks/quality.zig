@@ -100,10 +100,6 @@ pub fn main() void {
         std.debug.print("error: alloc db_vecs\n", .{});
         return;
     };
-    const db_rotated = allocator.alloc([]f32, config.n) catch {
-        std.debug.print("error: alloc db_rotated\n", .{});
-        return;
-    };
     const db_compressed = allocator.alloc([]u8, config.n) catch {
         std.debug.print("error: alloc db_compressed\n", .{});
         return;
@@ -116,12 +112,6 @@ pub fn main() void {
             std.debug.print("error: generating vector {}\n", .{i});
             return;
         };
-
-        db_rotated[i] = allocator.alloc(f32, config.dim) catch {
-            std.debug.print("error: alloc rotated {}\n", .{i});
-            return;
-        };
-        engine.rot_op.rotate(db_vecs[i], db_rotated[i]);
 
         db_compressed[i] = engine.encode(allocator, db_vecs[i]) catch {
             std.debug.print("error: encoding vector {}\n", .{i});
@@ -159,9 +149,9 @@ pub fn main() void {
         };
         defer allocator.free(q);
 
-        // True dot products (q dot R*x)
+        // True dot products (q dot x in original space)
         for (0..config.n) |i| {
-            true_scores[i] = .{ .idx = i, .score = math_mod.dot(q, db_rotated[i]) };
+            true_scores[i] = .{ .idx = i, .score = math_mod.dot(q, db_vecs[i]) };
         }
 
         // Estimated dot products (full: polar + QJL)
@@ -171,11 +161,12 @@ pub fn main() void {
         }
         query_ns_total += query_timer.read();
 
-        // Polar-only dot products
+        // Polar-only dot products (rotate query into same space as polar data)
+        engine.rot_op.rotate(q, engine.scratch_rotated);
         for (0..config.n) |i| {
             const header = format.readHeader(db_compressed[i]) catch continue;
             const payload = format.slicePayload(db_compressed[i], header) catch continue;
-            polar_scores[i] = .{ .idx = i, .score = polar.dotProduct(q, payload.polar, header.max_r) };
+            polar_scores[i] = .{ .idx = i, .score = polar.dotProduct(engine.scratch_rotated, payload.polar, header.max_r) };
         }
 
         // Sort all by score descending
