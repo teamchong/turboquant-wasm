@@ -22,13 +22,13 @@
     "node": ">=20"
   },
   "scripts": {
-    "build:zig": "mkdir -p dist && zig build-exe -target wasm32-wasi -mcpu=generic+simd128+relaxed_simd -O ReleaseSmall src/wasm_exports.zig --name turboquant -fno-entry -rdynamic && mv turboquant.wasm dist/",
+    "build:zig": "mkdir -p dist && zig build-exe -target wasm32-freestanding -mcpu=generic+simd128+relaxed_simd -O ReleaseSmall src/wasm_exports.zig --name turboquant -fno-entry -rdynamic && mv turboquant.wasm dist/",
     "build:opt": "wasm-opt -Oz --strip-producers --strip-target-features dist/turboquant.wasm -o dist/turboquant.wasm --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals --enable-relaxed-simd",
     "build:embed": "node scripts/embed-wasm.mjs",
     "build:types": "bun x tsc --emitDeclarationOnly",
     "build:js": "bun build src/js/index.ts --outdir dist --target node --format esm --minify --sourcemap=external && bun run build:types",
     "build": "bun run build:zig && bun run build:opt && bun run build:embed && bun run build:js",
-    "test:zig": "zig test -target aarch64-macos src/turboquant.zig",
+    "test:zig": "zig test src/turboquant.zig",
     "prepublishOnly": "bun run build"
   },
   "keywords": [
