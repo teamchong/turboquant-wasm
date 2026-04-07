@@ -109,11 +109,58 @@ pub fn encode(
     return result;
 }
 
+/// Encode polar data directly into a pre-allocated output buffer.
+/// `out` must have length >= polarBytesNeeded(dim).
+/// Returns the number of bytes written.
+pub fn encodeInto(
+    out: []u8,
+    rotated: []const f32,
+    max_r: f32,
+) error{InvalidDimension}!usize {
+    const dim = rotated.len;
+    if (dim == 0 or dim % 2 != 0) return PolarError.InvalidDimension;
+
+    const num_pairs = dim / 2;
+    const polar_bits = num_pairs * BITS_PER_PAIR;
+    const polar_bytes = (polar_bits + 7) / 8;
+    const total = polar_bytes + 1; // +1 padding byte
+
+    @memset(out[0..total], 0);
+
+    var bit_pos: usize = 0;
+    for (0..num_pairs) |i| {
+        const x = rotated[i * 2];
+        const y = rotated[i * 2 + 1];
+        const r = @sqrt(x * x + y * y);
+
+        const r_quant = @as(u4, @intFromFloat(@min(r / max_r * R_LEVELS, R_LEVELS)));
+        const theta_bucket = findNearestAngleBucket(x, y);
+        const combined: u7 = (@as(u7, r_quant) << THETA_BITS) | theta_bucket;
+
+        for (0..BITS_PER_PAIR) |j| {
+            const bit = (combined >> @intCast(j)) & 1;
+            if (bit == 1) {
+                out[bit_pos / 8] |= @as(u8, 1) << @intCast(bit_pos % 8);
+            }
+            bit_pos += 1;
+        }
+    }
+
+    return total;
+}
+
+/// Returns the number of bytes needed for polar encoding of a given dimension.
+pub fn polarBytesNeeded(dim: usize) usize {
+    const num_pairs = dim / 2;
+    const polar_bits = num_pairs * BITS_PER_PAIR;
+    return (polar_bits + 7) / 8 + 1;
+}
+
 pub fn decodeInto(
     out: []f32,
     compressed: []const u8,
     max_r: f32,
-) PolarError!void {
+) error{InvalidDimension}!void {
     const dim = out.len;
     if (dim == 0 or dim % 2 != 0) return PolarError.InvalidDimension;
 
