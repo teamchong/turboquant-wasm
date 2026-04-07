@@ -1,5 +1,6 @@
 #ifndef _LIBCPP_THREAD
 #define _LIBCPP_THREAD
+#include <functional>
 namespace std {
   class thread {
   public:
@@ -18,5 +19,8 @@ namespace std {
     inline thread::id get_id() noexcept { return {}; }
     inline void yield() noexcept {}
   }
+  template<> struct hash<thread::id> {
+    size_t operator()(thread::id) const noexcept { return 0; }
+  };
 }
 #endif
