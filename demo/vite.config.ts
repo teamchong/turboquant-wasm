@@ -12,12 +12,14 @@ export default defineConfig(({ command }) => ({
         "3dgs": resolve(__dirname, "3dgs.html"),
         search: resolve(__dirname, "search.html"),
         images: resolve(__dirname, "images.html"),
+        llm: resolve(__dirname, "llm.html"),
       },
     },
   },
   server: {
     headers: {
       "Cross-Origin-Opener-Policy": "same-origin",
+      "Cross-Origin-Embedder-Policy": "require-corp",
     },
   },
   optimizeDeps: {

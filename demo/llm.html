@@ -1,0 +1,28 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>TurboQuant — Gemma 4 E2B in Browser</title>
+  <link rel="stylesheet" href="./src/llm/style.css">
+</head>
+<body>
+  <div id="app">
+    <div id="header">
+      <h1>Gemma 4 E2B <span class="dim">in your browser</span></h1>
+      <span class="status" id="status">Initializing...</span>
+    </div>
+    <div id="messages"></div>
+    <div id="input-bar">
+      <input type="text" id="input" aria-label="Message" disabled>
+      <button id="send" disabled>Send</button>
+    </div>
+    <div id="stats-bar">
+      <span id="stat-speed">--</span>
+      <span id="stat-ctx">--</span>
+      <span id="stat-model">Gemma 4 E2B q4 · WebGPU</span>
+    </div>
+  </div>
+  <script type="module" src="./src/llm/main.ts"></script>
+</body>
+</html>
