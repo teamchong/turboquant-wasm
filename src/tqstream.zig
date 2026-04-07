@@ -17,11 +17,9 @@ pub const TQStream = struct {
     bytes_per_vector: usize,
 
     compressed: []u8,
-    decompressed: []f32,
 
     length: usize,
     capacity: usize,
-    evict_start: usize,
 
     allocator: std.mem.Allocator,
 
@@ -30,45 +28,33 @@ pub const TQStream = struct {
         const bpv = engine.bytesPerVector();
 
         const compressed = try allocator.alloc(u8, max_positions * bpv);
-        errdefer allocator.free(compressed);
-        const decompressed = try allocator.alloc(f32, max_positions * dim);
-        errdefer allocator.free(decompressed);
 
         return .{
             .engine = engine,
             .dim = dim,
             .bytes_per_vector = bpv,
             .compressed = compressed,
-            .decompressed = decompressed,
             .length = 0,
             .capacity = max_positions,
-            .evict_start = 0,
             .allocator = allocator,
         };
     }
 
     pub fn deinit(s: *TQStream) void {
         s.allocator.free(s.compressed);
-        s.allocator.free(s.decompressed);
     }
 
+    /// Append a vector — compress and store. No decompression.
+    /// Use dotBatch on serialize() for scoring. Use decodeInto for individual vectors.
     pub fn append(s: *TQStream, vector: []const f32) TQStreamError!void {
         if (vector.len != s.dim) return TQStreamError.InvalidRange;
         if (s.length >= s.capacity) try s.grow();
 
         const pos = s.length;
         const comp_offset = pos * s.bytes_per_vector;
-        const decomp_offset = pos * s.dim;
 
-        // Encode directly into compressed store
         _ = s.engine.encodeInto(vector, s.compressed[comp_offset .. comp_offset + s.bytes_per_vector]) catch
             return TQStreamError.EncodeFailed;
-
-        // Decode directly into decompressed buffer
-        s.engine.decodeInto(
-            s.compressed[comp_offset .. comp_offset + s.bytes_per_vector],
-            s.decompressed[decomp_offset .. decomp_offset + s.dim],
-        ) catch return TQStreamError.DecodeFailed;
 
         s.length = pos + 1;
     }
@@ -80,34 +66,30 @@ pub const TQStream = struct {
         }
     }
 
-    pub fn getDecompressed(s: *const TQStream, start: usize, end: usize) TQStreamError![]const f32 {
-        if (start < s.evict_start) return TQStreamError.EvictedRange;
-        if (end > s.length or start > end) return TQStreamError.InvalidRange;
-        return s.decompressed[start * s.dim .. end * s.dim];
-    }
-
+    /// Get compressed bytes for a range of positions. Use with dotBatch for scoring.
     pub fn getCompressedSlice(s: *const TQStream, start: usize, end: usize) TQStreamError![]const u8 {
         if (end > s.length or start > end) return TQStreamError.InvalidRange;
         return s.compressed[start * s.bytes_per_vector .. end * s.bytes_per_vector];
     }
 
+    /// Get all compressed bytes. Contiguous, dotBatch-compatible.
     pub fn serialize(s: *const TQStream) []const u8 {
         return s.compressed[0 .. s.length * s.bytes_per_vector];
     }
 
-    /// Evict decompressed data for positions [0, up_to).
-    /// Compressed data is retained for all positions.
-    /// Evicted positions return EvictedRange from getDecompressed.
-    pub fn evictFront(s: *TQStream, up_to: usize) void {
-        if (up_to > s.evict_start and up_to <= s.length) {
-            s.evict_start = up_to;
-        }
+    /// Decode a single position into a provided output buffer.
+    pub fn decodePosition(s: *const TQStream, position: usize, out: []f32) TQStreamError!void {
+        if (position >= s.length) return TQStreamError.InvalidRange;
+        const comp_offset = position * s.bytes_per_vector;
+        s.engine.decodeInto(
+            s.compressed[comp_offset .. comp_offset + s.bytes_per_vector],
+            out,
+        ) catch return TQStreamError.DecodeFailed;
     }
 
     pub fn rewind(s: *TQStream, position: usize) void {
         if (position < s.length) {
             s.length = position;
-            if (s.evict_start > position) s.evict_start = position;
         }
     }
 
@@ -117,18 +99,10 @@ pub const TQStream = struct {
         const new_comp = s.allocator.alloc(u8, new_cap * s.bytes_per_vector) catch
             return TQStreamError.OutOfMemory;
 
-        const new_decomp = s.allocator.alloc(f32, new_cap * s.dim) catch {
-            s.allocator.free(new_comp);
-            return TQStreamError.OutOfMemory;
-        };
-
         @memcpy(new_comp[0 .. s.length * s.bytes_per_vector], s.compressed[0 .. s.length * s.bytes_per_vector]);
-        @memcpy(new_decomp[0 .. s.length * s.dim], s.decompressed[0 .. s.length * s.dim]);
 
         s.allocator.free(s.compressed);
-        s.allocator.free(s.decompressed);
         s.compressed = new_comp;
-        s.decompressed = new_decomp;
         s.capacity = new_cap;
     }
 };
@@ -156,7 +130,7 @@ fn makeRandomVector(comptime dim: usize, seed: u64) [dim]f32 {
     return v;
 }
 
-test "append single vector roundtrip" {
+test "append compresses and stores" {
     const allocator = testing.allocator;
     var engine = try makeTestEngine(allocator, 8);
     defer engine.deinit(allocator);
@@ -168,16 +142,10 @@ test "append single vector roundtrip" {
     try stream.append(&v);
     try testing.expectEqual(@as(usize, 1), stream.length);
 
-    // Verify decompressed matches standalone encode→decode
+    // Compressed bytes match standalone encode
     const encoded = try engine.encode(allocator, &v);
     defer allocator.free(encoded);
-    const decoded = try engine.decode(allocator, encoded);
-    defer allocator.free(decoded);
-
-    const stream_decoded = try stream.getDecompressed(0, 1);
-    for (0..8) |i| {
-        try testing.expectApproxEqAbs(decoded[i], stream_decoded[i], 1e-6);
-    }
+    try testing.expectEqualSlices(u8, encoded, stream.serialize());
 }
 
 test "append 100 vectors" {
@@ -195,11 +163,6 @@ test "append 100 vectors" {
 
     try testing.expectEqual(@as(usize, 100), stream.length);
     try testing.expectEqual(@as(usize, 100 * stream.bytes_per_vector), stream.serialize().len);
-
-    const all = try stream.getDecompressed(0, 100);
-    for (all) |val| {
-        try testing.expect(std.math.isFinite(val));
-    }
 }
 
 test "appendBatch matches sequential append" {
@@ -207,7 +170,6 @@ test "appendBatch matches sequential append" {
     var engine = try makeTestEngine(allocator, 8);
     defer engine.deinit(allocator);
 
-    // Sequential
     var seq = try TQStream.init(allocator, &engine, 16);
     defer seq.deinit();
     var vectors: [10 * 8]f32 = undefined;
@@ -217,16 +179,39 @@ test "appendBatch matches sequential append" {
         try seq.append(&v);
     }
 
-    // Batch
     var batch = try TQStream.init(allocator, &engine, 16);
     defer batch.deinit();
     try batch.appendBatch(&vectors, 10);
 
-    // Compressed bytes should be identical
     try testing.expectEqualSlices(u8, seq.serialize(), batch.serialize());
 }
 
-test "getDecompressed slice" {
+test "decodePosition roundtrip" {
+    const allocator = testing.allocator;
+    var engine = try makeTestEngine(allocator, 8);
+    defer engine.deinit(allocator);
+
+    var stream = try TQStream.init(allocator, &engine, 16);
+    defer stream.deinit();
+
+    const v = makeRandomVector(8, 1);
+    try stream.append(&v);
+
+    var decoded: [8]f32 = undefined;
+    try stream.decodePosition(0, &decoded);
+
+    // Should match standalone encode→decode
+    const encoded = try engine.encode(allocator, &v);
+    defer allocator.free(encoded);
+    const ref = try engine.decode(allocator, encoded);
+    defer allocator.free(ref);
+
+    for (0..8) |i| {
+        try testing.expectApproxEqAbs(ref[i], decoded[i], 1e-6);
+    }
+}
+
+test "getCompressedSlice" {
     const allocator = testing.allocator;
     var engine = try makeTestEngine(allocator, 8);
     defer engine.deinit(allocator);
@@ -239,39 +224,11 @@ test "getDecompressed slice" {
         try stream.append(&v);
     }
 
-    const slice = try stream.getDecompressed(50, 60);
-    try testing.expectEqual(@as(usize, 10 * 8), slice.len);
+    const slice = try stream.getCompressedSlice(50, 60);
+    try testing.expectEqual(@as(usize, 10 * stream.bytes_per_vector), slice.len);
 
-    const full = try stream.getDecompressed(0, 100);
-    try testing.expectEqualSlices(f32, full[50 * 8 .. 60 * 8], slice);
-}
-
-test "evict front" {
-    const allocator = testing.allocator;
-    var engine = try makeTestEngine(allocator, 8);
-    defer engine.deinit(allocator);
-
-    var stream = try TQStream.init(allocator, &engine, 128);
-    defer stream.deinit();
-
-    for (0..100) |i| {
-        const v = makeRandomVector(8, i + 400);
-        try stream.append(&v);
-    }
-
-    stream.evictFront(50);
-    try testing.expectEqual(@as(usize, 50), stream.evict_start);
-
-    // Compressed data still accessible for all 100
-    const comp = try stream.getCompressedSlice(0, 100);
-    try testing.expectEqual(@as(usize, 100 * stream.bytes_per_vector), comp.len);
-
-    // Decompressed access to evicted range returns error
-    try testing.expectError(TQStreamError.EvictedRange, stream.getDecompressed(0, 10));
-
-    // Non-evicted range still accessible
-    const valid = try stream.getDecompressed(50, 100);
-    try testing.expectEqual(@as(usize, 50 * 8), valid.len);
+    const full = stream.serialize();
+    try testing.expectEqualSlices(u8, full[50 * stream.bytes_per_vector .. 60 * stream.bytes_per_vector], slice);
 }
 
 test "rewind truncates" {
@@ -337,26 +294,7 @@ test "computeBytesPerVector matches encode" {
     }
 }
 
-test "evicted range returns error" {
-    const allocator = testing.allocator;
-    var engine = try makeTestEngine(allocator, 8);
-    defer engine.deinit(allocator);
-
-    var stream = try TQStream.init(allocator, &engine, 32);
-    defer stream.deinit();
-
-    for (0..20) |i| {
-        const v = makeRandomVector(8, i + 700);
-        try stream.append(&v);
-    }
-
-    stream.evictFront(10);
-    try testing.expectError(TQStreamError.EvictedRange, stream.getDecompressed(0, 5));
-    try testing.expectError(TQStreamError.EvictedRange, stream.getDecompressed(5, 15));
-    _ = try stream.getDecompressed(10, 20); // should succeed
-}
-
-test "append performance vs allocating encode+decode" {
+test "append performance vs allocating encode" {
     const allocator = testing.allocator;
     var engine = try makeTestEngine(allocator, 256);
     defer engine.deinit(allocator);
@@ -364,17 +302,15 @@ test "append performance vs allocating encode+decode" {
     const v = makeRandomVector(256, 42);
     const n = 200;
 
-    // Old: allocating encode + decode
+    // Old: allocating encode
     var timer = try std.time.Timer.start();
     for (0..n) |_| {
         const encoded = try engine.encode(allocator, &v);
-        const decoded = try engine.decode(allocator, encoded);
-        allocator.free(decoded);
         allocator.free(encoded);
     }
     const old_ns = timer.read();
 
-    // New: TQStream append
+    // New: TQStream append (compress only)
     var stream = try TQStream.init(allocator, &engine, n + 16);
     defer stream.deinit();
 
@@ -389,7 +325,7 @@ test "append performance vs allocating encode+decode" {
 
     std.debug.print("\n  dim=256 n={}: old={d:.1}us/vec stream={d:.1}us/vec ratio={d:.2}x\n", .{ n, old_us, new_us, old_us / new_us });
 
-    // TQStream should not be more than 2x slower than allocating path
+    // TQStream compress-only should be faster than allocating encode
     try testing.expect(new_us < old_us * 2.0);
 }
 

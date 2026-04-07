@@ -52,9 +52,8 @@ interface TurboQuantExports {
   tq_stream_destroy(handle: number): void;
   tq_stream_append(handle: number, vectorPtr: number, dim: number): number;
   tq_stream_append_batch(handle: number, vectorsPtr: number, dim: number, count: number): number;
-  tq_stream_get_decompressed(handle: number, start: number, end: number, outLenPtr: number): number;
   tq_stream_get_compressed(handle: number, outLenPtr: number): number;
-  tq_stream_evict_front(handle: number, upTo: number): void;
+  tq_stream_decode_position(handle: number, position: number, outPtr: number, dim: number): number;
   tq_stream_rewind(handle: number, position: number): void;
   tq_stream_length(handle: number): number;
   tq_stream_bytes_per_vector(handle: number): number;
@@ -414,9 +413,9 @@ export class TurboQuant {
 }
 
 /**
- * Streaming compressed vector buffer.
- * Append vectors incrementally — compressed bytes are the source of truth,
- * decompressed buffer maintained for feeding back to consumers (e.g., ONNX Runtime).
+ * Streaming compressed vector buffer. Compress-only storage.
+ * Use dotBatch on getCompressed() for scoring — never decompress for search.
+ * Use decodePosition() only when you need individual float values.
  */
 export class TQStream {
   readonly dim: number;
@@ -434,14 +433,12 @@ export class TQStream {
     this.bytesPerVector = bpv;
   }
 
-  /** Append a single vector. Compresses and stores. */
+  /** Append a single vector. Compresses and stores. No decompression. */
   append(vector: Float32Array): void {
     if (vector.length !== this.dim) {
       throw new Error(`TQStream: expected ${this.dim} dims, got ${vector.length}`);
     }
     const ex = this.#ex;
-
-    // Reuse input buffer
     if (this.#inputLen !== vector.byteLength) {
       if (this.#inputPtr) ex.tq_free(this.#inputPtr, this.#inputLen);
       this.#inputPtr = ex.tq_alloc(vector.byteLength);
@@ -449,7 +446,6 @@ export class TQStream {
       this.#inputLen = vector.byteLength;
     }
     new Float32Array(ex.memory.buffer, this.#inputPtr, vector.length).set(vector);
-
     const rc = ex.tq_stream_append(this.#handle, this.#inputPtr, this.dim);
     if (rc < 0) throw new Error("TQStream: append failed");
   }
@@ -459,7 +455,6 @@ export class TQStream {
     const n = count ?? Math.floor(vectors.length / this.dim);
     const ex = this.#ex;
     const byteLen = n * this.dim * 4;
-
     if (this.#inputLen !== byteLen) {
       if (this.#inputPtr) ex.tq_free(this.#inputPtr, this.#inputLen);
       this.#inputPtr = ex.tq_alloc(byteLen);
@@ -469,28 +464,11 @@ export class TQStream {
     new Float32Array(ex.memory.buffer, this.#inputPtr, n * this.dim).set(
       vectors.subarray(0, n * this.dim),
     );
-
     const rc = ex.tq_stream_append_batch(this.#handle, this.#inputPtr, this.dim, n);
     if (rc < 0) throw new Error("TQStream: appendBatch failed");
   }
 
-  /**
-   * Get decompressed data for positions [start, end).
-   * Returns a view into WASM memory — copy with .slice() if retaining.
-   */
-  getDecompressed(start: number, end: number): Float32Array {
-    const ex = this.#ex;
-    const outLenPtr = wasmAllocU32(ex);
-    const ptr = ex.tq_stream_get_decompressed(this.#handle, start, end, outLenPtr);
-    const len = wasmReadU32(ex, outLenPtr);
-    ex.tq_free(outLenPtr, 4);
-    if (!ptr) throw new Error(`TQStream: getDecompressed(${start}, ${end}) failed`);
-    return new Float32Array(ex.memory.buffer, ptr, len);
-  }
-
-  /**
-   * Get full compressed store as a copy (safe to persist to OPFS).
-   */
+  /** Get full compressed store as a copy. Use with dotBatch for scoring. */
   getCompressed(): Uint8Array {
     const ex = this.#ex;
     const outLenPtr = wasmAllocU32(ex);
@@ -501,14 +479,24 @@ export class TQStream {
     return new Uint8Array(ex.memory.buffer, ptr, len).slice();
   }
 
+  /** Decode a single position. Only use when you need individual float values. */
+  decodePosition(position: number): Float32Array {
+    const ex = this.#ex;
+    const outPtr = ex.tq_alloc_f32(this.dim);
+    if (!outPtr) throw new Error("TQStream: WASM alloc failed");
+    const rc = ex.tq_stream_decode_position(this.#handle, position, outPtr, this.dim);
+    if (rc < 0) {
+      ex.tq_free_f32(outPtr, this.dim);
+      throw new Error(`TQStream: decodePosition(${position}) failed`);
+    }
+    const result = new Float32Array(ex.memory.buffer, outPtr, this.dim).slice();
+    ex.tq_free_f32(outPtr, this.dim);
+    return result;
+  }
+
   /** Number of vectors currently stored. */
   get length(): number {
     return this.#ex.tq_stream_length(this.#handle);
-  }
-
-  /** Evict decompressed data for positions [0, upTo). Compressed data retained. */
-  evictFront(upTo: number): void {
-    this.#ex.tq_stream_evict_front(this.#handle, upTo);
   }
 
   /** Truncate stream to given position. */

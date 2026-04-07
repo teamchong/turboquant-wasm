@@ -196,16 +196,6 @@ export fn tq_stream_append_batch(handle: i32, vectors_ptr: [*]const f32, dim: u3
     return 0;
 }
 
-/// Get pointer to decompressed data for range [start, end).
-/// Writes element count to out_len. Returns null on error.
-export fn tq_stream_get_decompressed(handle: i32, start: u32, end: u32, out_len: *u32) ?[*]const f32 {
-    const idx = resolveStreamHandle(handle) orelse return null;
-    const stream_ptr = stream_slots[idx] orelse return null;
-    const slice = stream_ptr.getDecompressed(start, end) catch return null;
-    out_len.* = @intCast(slice.len);
-    return slice.ptr;
-}
-
 /// Get pointer to full compressed store. Writes byte count to out_len.
 export fn tq_stream_get_compressed(handle: i32, out_len: *u32) ?[*]const u8 {
     const idx = resolveStreamHandle(handle) orelse return null;
@@ -215,11 +205,12 @@ export fn tq_stream_get_compressed(handle: i32, out_len: *u32) ?[*]const u8 {
     return slice.ptr;
 }
 
-/// Evict decompressed data for positions [0, up_to).
-export fn tq_stream_evict_front(handle: i32, up_to: u32) void {
-    const idx = resolveStreamHandle(handle) orelse return;
-    const stream_ptr = stream_slots[idx] orelse return;
-    stream_ptr.evictFront(up_to);
+/// Decode a single position into a provided output buffer.
+export fn tq_stream_decode_position(handle: i32, position: u32, out_ptr: [*]f32, dim: u32) i32 {
+    const idx = resolveStreamHandle(handle) orelse return -1;
+    const stream_ptr = stream_slots[idx] orelse return -1;
+    stream_ptr.decodePosition(position, out_ptr[0..dim]) catch return -1;
+    return 0;
 }
 
 /// Truncate stream to given position.
