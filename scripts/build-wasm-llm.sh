@@ -186,3 +186,137 @@ echo "  abseil: $AB_COMPILED compiled"
 echo ""
 echo "Total objects: ${#OBJECTS[@]}"
 echo "Build complete."
+
+# Compile ONNX operator definitions
+echo "Compiling ONNX defs..."
+ONNX_COMPILED=0
+for f in "$ORT/cmake/external/onnx/onnx/defs"/*.cc "$ORT/cmake/external/onnx/onnx/defs"/**/*.cc "$ORT/cmake/external/onnx/onnx"/*.cc "$ORT/cmake/external/onnx/onnx/shape_inference"/*.cc; do
+  [ -f "$f" ] || continue
+  echo "$f" | grep -qE "test|benchmark" && continue
+  base=$(basename "$f" .cc)
+  dir_part=$(basename $(dirname "$f"))
+  obj="$ROOT/.build-cache/obj/onnxdefs_${dir_part}_${base}.o"
+  if [ -f "$obj" ] && [ "$obj" -nt "$f" ]; then
+    OBJECTS+=("$obj")
+    ONNX_COMPILED=$((ONNX_COMPILED + 1))
+    continue
+  fi
+  if zig c++ $CXXFLAGS "${FORCE_INCLUDES[@]}" "${INCLUDES[@]}" "${DEFINES[@]}" -c "$f" -o "$obj" 2>/dev/null; then
+    OBJECTS+=("$obj")
+    ONNX_COMPILED=$((ONNX_COMPILED + 1))
+  fi
+done
+echo "  onnx defs: $ONNX_COMPILED compiled"
+
+# Compile ORT optimizer
+echo "Compiling optimizer..."
+OPT_COMPILED=0
+for f in "$ORT/onnxruntime/core/optimizer"/*.cc "$ORT/onnxruntime/core/optimizer"/**/*.cc; do
+  [ -f "$f" ] || continue
+  echo "$f" | grep -qE "test|benchmark" && continue
+  base=$(basename "$f" .cc)
+  dir_part=$(basename $(dirname "$f"))
+  obj="$ROOT/.build-cache/obj/opt_${dir_part}_${base}.o"
+  if [ -f "$obj" ] && [ "$obj" -nt "$f" ]; then
+    OBJECTS+=("$obj")
+    OPT_COMPILED=$((OPT_COMPILED + 1))
+    continue
+  fi
+  if zig c++ $CXXFLAGS "${FORCE_INCLUDES[@]}" "${INCLUDES[@]}" "${DEFINES[@]}" -c "$f" -o "$obj" 2>/dev/null; then
+    OBJECTS+=("$obj")
+    OPT_COMPILED=$((OPT_COMPILED + 1))
+  fi
+done
+echo "  optimizer: $OPT_COMPILED compiled"
+
+# Compile CPU provider (needed for fallback ops)
+echo "Compiling CPU provider..."
+CPU_COMPILED=0
+for f in "$ORT/onnxruntime/core/providers/cpu"/*.cc "$ORT/onnxruntime/core/providers/cpu"/**/*.cc; do
+  [ -f "$f" ] || continue
+  echo "$f" | grep -qE "test|benchmark" && continue
+  base=$(basename "$f" .cc)
+  dir_part=$(basename $(dirname "$f"))
+  obj="$ROOT/.build-cache/obj/cpu_${dir_part}_${base}.o"
+  if [ -f "$obj" ] && [ "$obj" -nt "$f" ]; then
+    OBJECTS+=("$obj")
+    CPU_COMPILED=$((CPU_COMPILED + 1))
+    continue
+  fi
+  if zig c++ $CXXFLAGS "${FORCE_INCLUDES[@]}" "${INCLUDES[@]}" "${DEFINES[@]}" -c "$f" -o "$obj" 2>/dev/null; then
+    OBJECTS+=("$obj")
+    CPU_COMPILED=$((CPU_COMPILED + 1))
+  fi
+done
+echo "  cpu provider: $CPU_COMPILED compiled"
+
+# Compile MLAS (WASM-compatible files only)
+echo "Compiling MLAS..."
+MLAS_COMPILED=0
+for f in "$ORT/onnxruntime/core/mlas/lib"/*.cpp; do
+  [ -f "$f" ] || continue
+  # Skip architecture-specific kernels
+  echo "$f" | grep -qiE "neon|avx|sse|amx|lsx|kai_|test|benchmark" && continue
+  base=$(basename "$f" .cpp)
+  obj="$ROOT/.build-cache/obj/mlas_${base}.o"
+  if [ -f "$obj" ] && [ "$obj" -nt "$f" ]; then
+    OBJECTS+=("$obj")
+    MLAS_COMPILED=$((MLAS_COMPILED + 1))
+    continue
+  fi
+  if zig c++ $CXXFLAGS "${FORCE_INCLUDES[@]}" "${INCLUDES[@]}" "${DEFINES[@]}" -msimd128 -mrelaxed-simd -c "$f" -o "$obj" 2>/dev/null; then
+    OBJECTS+=("$obj")
+    MLAS_COMPILED=$((MLAS_COMPILED + 1))
+  fi
+done
+# WASM-specific MLAS
+for f in "$ORT/onnxruntime/core/mlas/lib/wasm"/*.cpp; do
+  [ -f "$f" ] || continue
+  base=$(basename "$f" .cpp)
+  obj="$ROOT/.build-cache/obj/mlas_wasm_${base}.o"
+  if zig c++ $CXXFLAGS "${FORCE_INCLUDES[@]}" "${INCLUDES[@]}" "${DEFINES[@]}" -msimd128 -mrelaxed-simd -c "$f" -o "$obj" 2>/dev/null; then
+    OBJECTS+=("$obj")
+    MLAS_COMPILED=$((MLAS_COMPILED + 1))
+  fi
+done
+echo "  mlas: $MLAS_COMPILED compiled"
+
+# Compile ORT contrib ops (JSEP needs them)
+echo "Compiling contrib ops..."
+CONTRIB_COMPILED=0
+for f in "$ORT/onnxruntime/contrib_ops/js"/*.cc; do
+  [ -f "$f" ] || continue
+  base=$(basename "$f" .cc)
+  obj="$ROOT/.build-cache/obj/contrib_${base}.o"
+  if zig c++ $CXXFLAGS "${FORCE_INCLUDES[@]}" "${INCLUDES[@]}" "${DEFINES[@]}" -c "$f" -o "$obj" 2>/dev/null; then
+    OBJECTS+=("$obj")
+    CONTRIB_COMPILED=$((CONTRIB_COMPILED + 1))
+  fi
+done
+echo "  contrib ops: $CONTRIB_COMPILED compiled"
+
+echo ""
+echo "=== FINAL TOTALS ==="
+echo "Total objects: ${#OBJECTS[@]}"
+du -sh "$ROOT/.build-cache/obj/"
+
+# Compile CXA runtime
+echo "Compiling CXA runtime..."
+zig c++ -target wasm32-wasi -std=c++17 -O2 -c "$SHIMS/wasm_cxa.cc" -o "$ROOT/.build-cache/obj/wasm_cxa.o"
+OBJECTS+=("$ROOT/.build-cache/obj/wasm_cxa.o")
+echo "  cxa runtime compiled"
+
+# Link
+echo ""
+echo "=== Linking ==="
+zig c++ -target wasm32-wasi -O2 \
+  -Wl,--no-entry -Wl,--export-dynamic \
+  "${OBJECTS[@]}" \
+  -o "$OUT/turboquant-llm.wasm" \
+  -lc++ 2>&1 | grep "undefined symbol" | sed 's/.*undefined symbol: //' | sort -u | wc -l
+echo "undefined symbols remaining (see above)"
+
+if [ -f "$OUT/turboquant-llm.wasm" ]; then
+  echo ""
+  echo "SUCCESS: $(ls -lh "$OUT/turboquant-llm.wasm" | awk '{print $5}') WASM binary"
+fi
