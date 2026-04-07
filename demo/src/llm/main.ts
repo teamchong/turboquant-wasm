@@ -129,7 +129,7 @@ async function onSend() {
     }));
 
     await generator(messages, {
-      max_new_tokens: 512,
+      max_new_tokens: 2048,
       temperature: 0.7,
       do_sample: true,
       streamer,
