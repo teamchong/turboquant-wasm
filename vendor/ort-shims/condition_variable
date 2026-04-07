@@ -1,0 +1,11 @@
+#pragma once
+namespace std {
+  class condition_variable {
+  public:
+    void notify_one() {}
+    void notify_all() {}
+    template<class Lock> void wait(Lock&) {}
+    template<class Lock, class Pred> void wait(Lock&, Pred) {}
+  };
+  enum class cv_status { no_timeout, timeout };
+}
