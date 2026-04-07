@@ -127,4 +127,62 @@ fi
 
 echo "Build complete. ${#OBJECTS[@]} object files in .build-cache/obj/"
 echo ""
-echo "Next step: link into WASM (not yet implemented)"
+
+echo "Compiling protobuf..."
+PB_DIR="$ORT/cmake/external/protobuf/src/google/protobuf"
+PB_COMPILED=0
+PB_FILES=$(find "$PB_DIR" -name "*.cc" -not -name "*test*" -not -name "*mock*" -not -name "*compiler*" -not -path "*testing*" | sort)
+for f in $PB_FILES; do
+  [ -f "$f" ] || continue
+  dir_part=$(basename $(dirname "$f"))
+  base=$(basename "$f" .cc)
+  obj="$ROOT/.build-cache/obj/pb_${dir_part}_${base}.o"
+  if [ -f "$obj" ] && [ "$obj" -nt "$f" ]; then
+    OBJECTS+=("$obj")
+    PB_COMPILED=$((PB_COMPILED + 1))
+    continue
+  fi
+  if zig c++ $CXXFLAGS "${FORCE_INCLUDES[@]}" "${INCLUDES[@]}" "${DEFINES[@]}" -c "$f" -o "$obj" 2>/dev/null; then
+    OBJECTS+=("$obj")
+    PB_COMPILED=$((PB_COMPILED + 1))
+  fi
+done
+echo "  protobuf: $PB_COMPILED compiled"
+
+echo "Compiling ONNX protobuf..."
+ONNX_PB=0
+for f in "$ORT/cmake/external/onnx/onnx"/*.pb.cc; do
+  [ -f "$f" ] || continue
+  base=$(basename "$f" .cc)
+  obj="$ROOT/.build-cache/obj/onnx_${base}.o"
+  if zig c++ $CXXFLAGS "${FORCE_INCLUDES[@]}" "${INCLUDES[@]}" "${DEFINES[@]}" -c "$f" -o "$obj" 2>/dev/null; then
+    OBJECTS+=("$obj")
+    ONNX_PB=$((ONNX_PB + 1))
+  fi
+done
+echo "  onnx protobuf: $ONNX_PB compiled"
+
+echo "Compiling abseil..."
+AB_COMPILED=0
+for dir in base base/internal strings strings/internal hash hash/internal container container/internal numeric types status; do
+  for f in "$ORT/cmake/external/abseil-cpp/absl/$dir"/*.cc; do
+    [ -f "$f" ] || continue
+    echo "$f" | grep -qE "test|benchmark|_testing" && continue
+    base=$(basename "$f" .cc)
+    obj="$ROOT/.build-cache/obj/absl_${dir//\//_}_${base}.o"
+    if [ -f "$obj" ] && [ "$obj" -nt "$f" ]; then
+      OBJECTS+=("$obj")
+      AB_COMPILED=$((AB_COMPILED + 1))
+      continue
+    fi
+    if zig c++ $CXXFLAGS "${FORCE_INCLUDES[@]}" -I "$SHIMS" -I "$ORT/cmake/external/abseil-cpp" -D__wasm__ -DHAVE_PTHREAD=0 -c "$f" -o "$obj" 2>/dev/null; then
+      OBJECTS+=("$obj")
+      AB_COMPILED=$((AB_COMPILED + 1))
+    fi
+  done
+done
+echo "  abseil: $AB_COMPILED compiled"
+
+echo ""
+echo "Total objects: ${#OBJECTS[@]}"
+echo "Build complete."
