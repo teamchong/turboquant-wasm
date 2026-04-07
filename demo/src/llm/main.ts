@@ -1,4 +1,5 @@
 import { pipeline, TextStreamer, type TextGenerationPipeline } from "@huggingface/transformers";
+import { KVObserver } from "./kv-observer.ts";
 
 const $ = (s: string) => document.querySelector(s)!;
 
@@ -9,9 +10,10 @@ const inputEl = $("#input") as HTMLInputElement;
 const sendBtn = $("#send") as HTMLButtonElement;
 const statSpeed = $("#stat-speed") as HTMLElement;
 const statCtx = $("#stat-ctx") as HTMLElement;
+const statKV = $("#stat-kv") as HTMLElement;
 
 let generator: TextGenerationPipeline | null = null;
-let contextTokens = 0;
+let kvObserver: KVObserver | null = null;
 let generating = false;
 
 type ChatMessage = { role: "user" | "assistant"; content: string };
@@ -24,6 +26,21 @@ function addMsg(role: "user" | "assistant" | "system", text: string): HTMLElemen
   messagesEl.appendChild(div);
   messagesEl.scrollTop = messagesEl.scrollHeight;
   return div;
+}
+
+function formatBytes(b: number): string {
+  if (b < 1024) return `${b} B`;
+  if (b < 1e6) return `${(b / 1024).toFixed(1)} KB`;
+  return `${(b / 1e6).toFixed(1)} MB`;
+}
+
+function updateKVStats() {
+  if (!kvObserver) return;
+  const s = kvObserver.getStats();
+  if (s.compressedBytes > 0) {
+    statKV.textContent = `KV: ${formatBytes(s.compressedBytes)} TQ / ${formatBytes(s.uncompressedBytes)} f32 = ${s.ratio.toFixed(1)}x`;
+  }
+  statCtx.textContent = `ctx: ${s.contextLength}`;
 }
 
 async function initModel() {
@@ -46,6 +63,16 @@ async function initModel() {
         }
       },
     }) as TextGenerationPipeline;
+
+    // Install KV observer with TurboQuant compression
+    kvObserver = new KVObserver();
+    await kvObserver.waitForInit();
+    const installed = await kvObserver.install(generator);
+    if (installed) {
+      console.log("KV observer with TurboQuant compression active");
+    } else {
+      console.warn("KV observer: could not hook into model");
+    }
 
     statusEl.textContent = "Ready";
     statusEl.classList.add("ready");
@@ -91,6 +118,7 @@ async function onSend() {
       if (elapsed > 0) {
         statSpeed.textContent = `${(tokenCount / elapsed).toFixed(1)} tok/s`;
       }
+      updateKVStats();
     },
   });
 
@@ -108,8 +136,7 @@ async function onSend() {
     });
 
     history.push({ role: "assistant", content: response });
-    contextTokens += tokenCount;
-    statCtx.textContent = `~${contextTokens} tokens`;
+    updateKVStats();
   } catch (e) {
     assistantDiv.textContent = `Error: ${(e as Error).message}`;
     console.error("Generation error:", e);
