@@ -1,2 +1,57 @@
-#pragma once
-#include_next <mutex>
+#ifndef _LIBCPP_MUTEX
+#define _LIBCPP_MUTEX
+
+namespace std {
+  class mutex {
+  public:
+    constexpr mutex() noexcept = default;
+    void lock() {}
+    void unlock() {}
+    bool try_lock() { return true; }
+  };
+  class recursive_mutex {
+  public:
+    constexpr recursive_mutex() noexcept = default;
+    void lock() {}
+    void unlock() {}
+    bool try_lock() { return true; }
+  };
+  struct adopt_lock_t { explicit adopt_lock_t() = default; };
+  struct defer_lock_t { explicit defer_lock_t() = default; };
+  struct try_to_lock_t { explicit try_to_lock_t() = default; };
+  inline constexpr adopt_lock_t adopt_lock{};
+  inline constexpr defer_lock_t defer_lock{};
+  inline constexpr try_to_lock_t try_to_lock{};
+  template<class M> class lock_guard {
+    M& m_;
+  public:
+    explicit lock_guard(M& m) : m_(m) { m_.lock(); }
+    lock_guard(M& m, adopt_lock_t) : m_(m) {}
+    ~lock_guard() { m_.unlock(); }
+    lock_guard(const lock_guard&) = delete;
+    lock_guard& operator=(const lock_guard&) = delete;
+  };
+  template<class M> class unique_lock {
+    M* m_ = nullptr;
+    bool owns_ = false;
+  public:
+    unique_lock() noexcept = default;
+    explicit unique_lock(M& m) : m_(&m), owns_(true) { m_->lock(); }
+    unique_lock(M& m, defer_lock_t) noexcept : m_(&m) {}
+    unique_lock(M& m, adopt_lock_t) noexcept : m_(&m), owns_(true) {}
+    ~unique_lock() { if (owns_ && m_) m_->unlock(); }
+    void lock() { if (m_) { m_->lock(); owns_ = true; } }
+    void unlock() { if (m_) { m_->unlock(); owns_ = false; } }
+    bool owns_lock() const noexcept { return owns_; }
+    M* mutex() const noexcept { return m_; }
+    explicit operator bool() const noexcept { return owns_; }
+    unique_lock(unique_lock&& o) noexcept : m_(o.m_), owns_(o.owns_) { o.m_ = nullptr; o.owns_ = false; }
+    unique_lock& operator=(unique_lock&& o) noexcept {
+      if (owns_ && m_) m_->unlock();
+      m_ = o.m_; owns_ = o.owns_; o.m_ = nullptr; o.owns_ = false;
+      return *this;
+    }
+  };
+}
+
+#endif
