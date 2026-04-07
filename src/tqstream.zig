@@ -356,6 +356,43 @@ test "evicted range returns error" {
     _ = try stream.getDecompressed(10, 20); // should succeed
 }
 
+test "append performance vs allocating encode+decode" {
+    const allocator = testing.allocator;
+    var engine = try makeTestEngine(allocator, 256);
+    defer engine.deinit(allocator);
+
+    const v = makeRandomVector(256, 42);
+    const n = 200;
+
+    // Old: allocating encode + decode
+    var timer = try std.time.Timer.start();
+    for (0..n) |_| {
+        const encoded = try engine.encode(allocator, &v);
+        const decoded = try engine.decode(allocator, encoded);
+        allocator.free(decoded);
+        allocator.free(encoded);
+    }
+    const old_ns = timer.read();
+
+    // New: TQStream append
+    var stream = try TQStream.init(allocator, &engine, n + 16);
+    defer stream.deinit();
+
+    timer = try std.time.Timer.start();
+    for (0..n) |_| {
+        try stream.append(&v);
+    }
+    const new_ns = timer.read();
+
+    const old_us = @as(f64, @floatFromInt(old_ns)) / 1000.0 / @as(f64, @floatFromInt(n));
+    const new_us = @as(f64, @floatFromInt(new_ns)) / 1000.0 / @as(f64, @floatFromInt(n));
+
+    std.debug.print("\n  dim=256 n={}: old={d:.1}us/vec stream={d:.1}us/vec ratio={d:.2}x\n", .{ n, old_us, new_us, old_us / new_us });
+
+    // TQStream should not be more than 2x slower than allocating path
+    try testing.expect(new_us < old_us * 2.0);
+}
+
 test "encodeInto matches encode byte-for-byte" {
     const allocator = testing.allocator;
     var engine = try makeTestEngine(allocator, 64);

@@ -1,5 +1,5 @@
 import { pipeline, TextStreamer, type TextGenerationPipeline } from "@huggingface/transformers";
-import { KVObserver } from "./kv-observer.ts";
+import { KVCompressor } from "./kv-observer.ts";
 
 const $ = (s: string) => document.querySelector(s)!;
 
@@ -13,7 +13,7 @@ const statCtx = $("#stat-ctx") as HTMLElement;
 const statKV = $("#stat-kv") as HTMLElement;
 
 let generator: TextGenerationPipeline | null = null;
-let kvObserver: KVObserver | null = null;
+let kvCompressor: KVCompressor | null = null;
 let generating = false;
 
 type ChatMessage = { role: "user" | "assistant"; content: string };
@@ -35,8 +35,8 @@ function formatBytes(b: number): string {
 }
 
 function updateKVStats() {
-  if (!kvObserver) return;
-  const s = kvObserver.getStats();
+  if (!kvCompressor) return;
+  const s = kvCompressor.getStats();
   if (s.compressedBytes > 0) {
     statKV.textContent = `KV: ${formatBytes(s.compressedBytes)} TQ / ${formatBytes(s.uncompressedBytes)} f32 = ${s.ratio.toFixed(1)}x`;
   }
@@ -65,9 +65,9 @@ async function initModel() {
     }) as TextGenerationPipeline;
 
     // Install KV observer with TurboQuant compression
-    kvObserver = new KVObserver();
-    await kvObserver.waitForInit();
-    const installed = await kvObserver.install(generator);
+    kvCompressor = new KVCompressor();
+    await kvCompressor.waitForInit();
+    const installed = await kvCompressor.install(generator);
     if (installed) {
       console.log("KV observer with TurboQuant compression active");
     } else {
