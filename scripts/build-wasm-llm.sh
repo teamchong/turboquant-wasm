@@ -46,7 +46,7 @@ DEFINES=(
   -DUSE_JSEP -DMLAS_NO_ONNXRUNTIME_THREADPOOL
 )
 
-CXXFLAGS="-target wasm32-wasi -std=c++17 -O2 -Wno-deprecated-declarations"
+CXXFLAGS="-target wasm32-wasi -std=c++17 -O2 -fvisibility=default -Wno-deprecated-declarations"
 
 # Collect ORT source files
 echo "Collecting source files..."

@@ -2,7 +2,7 @@
 // EM_ASM macros replaced with extern function calls provided by JS at instantiation.
 #pragma once
 
-#define EMSCRIPTEN_KEEPALIVE __attribute__((used))
+#define EMSCRIPTEN_KEEPALIVE __attribute__((used, visibility("default")))
 
 // JS-provided functions (imported at WASM instantiation)
 #ifdef __cplusplus
