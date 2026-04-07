@@ -24,3 +24,4 @@ namespace std {
   };
 }
 #endif
+#include <ostream>
