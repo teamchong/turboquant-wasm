@@ -1,0 +1,28 @@
+// mutex stub for single-threaded WASM
+#pragma once
+namespace std {
+  class mutex {
+  public:
+    void lock() {}
+    void unlock() {}
+    bool try_lock() { return true; }
+  };
+  class recursive_mutex {
+  public:
+    void lock() {}
+    void unlock() {}
+    bool try_lock() { return true; }
+  };
+  template<class T> class lock_guard {
+  public:
+    explicit lock_guard(T&) {}
+    ~lock_guard() {}
+  };
+  template<class T> class unique_lock {
+  public:
+    explicit unique_lock(T&) {}
+    ~unique_lock() {}
+    void lock() {}
+    void unlock() {}
+  };
+}
