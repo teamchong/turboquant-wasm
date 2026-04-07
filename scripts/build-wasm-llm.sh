@@ -302,6 +302,12 @@ du -sh "$ROOT/.build-cache/obj/"
 
 # Compile CXA runtime
 echo "Compiling CXA runtime..."
+
+echo "Compiling TQ bridge..."
+zig build-obj -target wasm32-wasi -O ReleaseFast -fstrip src/tq_bridge.zig --name tq_bridge
+mv tq_bridge.o "$ROOT/.build-cache/obj/tq_bridge.o"
+OBJECTS+=("$ROOT/.build-cache/obj/tq_bridge.o")
+echo "  tq bridge compiled"
 zig c++ -target wasm32-wasi -std=c++17 -O2 -c "$SHIMS/wasm_cxa.cc" -o "$ROOT/.build-cache/obj/wasm_cxa.o"
 OBJECTS+=("$ROOT/.build-cache/obj/wasm_cxa.o")
 echo "  cxa runtime compiled"

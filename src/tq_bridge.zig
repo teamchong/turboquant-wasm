@@ -24,15 +24,15 @@ fn getOrCreateEngine(dim: usize) ?*Engine {
         if (e != null and d == dim) return e;
     }
     // Create new
-    for (&engines, &engine_dims) |slot, dim_slot| {
-        if (slot.* == null) {
+    for (0..MAX_ENGINES) |i| {
+        if (engines[i] == null) {
             const ptr = wasm_allocator.create(Engine) catch return null;
             ptr.* = Engine.init(wasm_allocator, .{ .dim = dim, .seed = 42 }) catch {
                 wasm_allocator.destroy(ptr);
                 return null;
             };
-            slot.* = ptr;
-            dim_slot.* = dim;
+            engines[i] = ptr;
+            engine_dims[i] = dim;
             return ptr;
         }
     }
@@ -42,14 +42,14 @@ fn getOrCreateEngine(dim: usize) ?*Engine {
 /// Create a TQStream for a KV cache layer. Returns stream ID or -1.
 export fn tq_kv_create(head_dim: u32, max_positions: u32) i32 {
     const engine = getOrCreateEngine(head_dim) orelse return -1;
-    for (streams, 0..) |*slot, i| {
-        if (slot.* == null) {
+    for (0..MAX_STREAMS) |i| {
+        if (streams[i] == null) {
             const ptr = wasm_allocator.create(TQStream) catch return -1;
             ptr.* = TQStream.init(wasm_allocator, engine, max_positions) catch {
                 wasm_allocator.destroy(ptr);
                 return -1;
             };
-            slot.* = ptr;
+            streams[i] = ptr;
             return @intCast(i);
         }
     }
