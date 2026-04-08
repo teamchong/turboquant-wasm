@@ -27,8 +27,6 @@ demo/data/*.npy
 demo/data/image_ids.json
 # Search + image demo data are small enough to commit (~11MB)
 # so GitHub Pages deployment works without external hosting.
-# Large wiki datasets (generated via prepare:wiki-50k)
-demo/public/data/wiki-*
 
 # OS
 .DS_Store
