@@ -1,3 +1,6 @@
 [submodule "vendor/onnxruntime"]
 	path = vendor/onnxruntime
 	url = https://github.com/microsoft/onnxruntime.git
+[submodule "vendor/litert-lm"]
+	path = vendor/litert-lm
+	url = https://github.com/google-ai-edge/LiteRT-LM.git

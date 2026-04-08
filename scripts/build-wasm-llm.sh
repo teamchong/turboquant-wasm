@@ -62,7 +62,7 @@ ORT_DEFINES=(
 )
 
 CXX="zig c++ -target wasm32-wasi -std=c++17 -O2 -fvisibility=default -Wno-deprecated-declarations"
-CC="zig cc -target wasm32-wasi -O2"
+CC="zig cc -target wasm32-wasi -O2 -fvisibility=default"
 
 # --------------------------------------------------------------------------
 # Compile function — path-based .o naming, no collisions
@@ -102,8 +102,12 @@ for dir in \
   "$ORT/onnxruntime/core/framework" \
   "$ORT/onnxruntime/core/graph" \
   "$ORT/onnxruntime/core/graph/contrib_ops" \
+  "$ORT/onnxruntime/core/graph/data_propagation" \
   "$ORT/onnxruntime/core/flatbuffers" \
   "$ORT/onnxruntime/core/session" \
+  "$ORT/onnxruntime/core/session/plugin_ep" \
+  "$ORT/onnxruntime/core/util" \
+  "$ORT/onnxruntime/core/providers" \
   "$ORT/onnxruntime/core/providers/js" \
   "$ORT/onnxruntime/core/providers/js/operators" \
   "$ORT/onnxruntime/core/optimizer" \
@@ -113,7 +117,7 @@ for dir in \
   "$ORT/onnxruntime/core/platform/posix"; do
   for f in "$dir"/*.cc; do
     [ -f "$f" ] || continue
-    echo "$f" | grep -qiE "test|benchmark|vitisai" && continue
+    echo "$f" | grep -qiE "test|benchmark|vitisai|lora_adapters|ep_factory_dml|ep_factory_webgpu" && continue
     ORT_SOURCES+=("$f")
   done
 done
@@ -145,11 +149,8 @@ for dir in \
   done
 done
 
-# CPU contrib ops
-for dir in \
-  "$ORT/onnxruntime/contrib_ops/cpu" \
-  "$ORT/onnxruntime/contrib_ops/cpu/bert" \
-  "$ORT/onnxruntime/contrib_ops/cpu/quantization"; do
+# CPU contrib ops (recursive — all subdirectories)
+for dir in $(find "$ORT/onnxruntime/contrib_ops/cpu" -type d 2>/dev/null); do
   for f in "$dir"/*.cc; do
     [ -f "$f" ] || continue
     echo "$f" | grep -qiE "test|benchmark" && continue
@@ -200,9 +201,13 @@ for dir in \
   "$ORT/cmake/external/onnx/onnx/defs/controlflow" \
   "$ORT/cmake/external/onnx/onnx/defs/experiments" \
   "$ORT/cmake/external/onnx/onnx/defs/rnn" \
+  "$ORT/cmake/external/onnx/onnx/defs/text" \
+  "$ORT/cmake/external/onnx/onnx/defs/image" \
+  "$ORT/cmake/external/onnx/onnx/defs/training" \
   "$ORT/cmake/external/onnx/onnx/shape_inference" \
   "$ORT/cmake/external/onnx/onnx/common" \
-  "$ORT/cmake/external/onnx/onnx/version_converter"; do
+  "$ORT/cmake/external/onnx/onnx/version_converter" \
+  "$ORT/cmake/external/onnx/onnx/inliner"; do
   for f in "$dir"/*.cc; do
     [ -f "$f" ] || continue
     echo "$f" | grep -qiE "test|benchmark" && continue
@@ -257,13 +262,18 @@ echo "  $compiled compiled"
 echo ""
 echo "=== Abseil ==="
 AB_SOURCES=()
-for dir in base base/internal strings strings/internal hash hash/internal \
-  container container/internal numeric types status synchronization \
-  synchronization/internal time time/internal debugging profiling/internal \
-  random random/internal; do
+for dir in base base/internal strings strings/internal strings/internal/str_format \
+  hash hash/internal container container/internal numeric types \
+  status status/internal synchronization synchronization/internal \
+  time time/internal time/internal/cctz/src \
+  crc crc/internal \
+  debugging profiling/internal random random/internal; do
   for f in "$ORT/cmake/external/abseil-cpp/absl/$dir"/*.cc; do
     [ -f "$f" ] || continue
-    echo "$f" | grep -qiE "test|benchmark|_testing|print_hash_of|gentables" && continue
+    # Skip test/benchmark files, but keep distribution_test_util (used by chi_square)
+    base=$(basename "$f")
+    [ "$base" = "distribution_test_util.cc" ] || \
+      { echo "$f" | grep -qiE "test|benchmark|_testing|print_hash_of|gentables" && continue; }
     AB_SOURCES+=("$f")
   done
 done
@@ -287,7 +297,7 @@ echo ""
 echo "=== MLAS ==="
 MLAS_OBJECTS=()
 compiled=0
-for f in "$ORT/onnxruntime/core/mlas/lib"/*.cpp "$ORT/onnxruntime/core/mlas/lib/wasm"/*.cpp; do
+for f in "$ORT/onnxruntime/core/mlas/lib"/*.cpp "$ORT/onnxruntime/core/mlas/lib/wasm"/*.cpp "$ORT/onnxruntime/core/mlas/lib/wasm_simd"/*.cpp; do
   [ -f "$f" ] || continue
   echo "$f" | grep -qiE "neon|avx|sse|amx|lsx|kai_|test|benchmark|q4_dq_cli" && continue
   if obj=$(compile_cc "$f" "$CACHE/ort" "$ORT" \
@@ -325,12 +335,21 @@ echo ""
 echo "=== Platform shims ==="
 SHIM_OBJECTS=()
 
-# C shims
+# C implementations
 $CC -c "$SHIMS/missing_syms.c" -o "$CACHE/extra/missing_syms.o"
 SHIM_OBJECTS+=("$CACHE/extra/missing_syms.o")
+$CC -c "$SHIMS/wasm_lora_api.c" -o "$CACHE/extra/wasm_lora_api.o"
+SHIM_OBJECTS+=("$CACHE/extra/wasm_lora_api.o")
+
+# Protobuf bytestream — ByteSink/ByteSource vtables
+PB_BSTREAM="$(find "$PB_SRC" -name bytestream.cc -print -quit)"
+PB_BS_OBJ="$CACHE/extra/bytestream.o"
+$CXX -include "$SHIMS/mutex" -I "$PB_SRC" -DONNX_ML -DONNX_NAMESPACE=onnx \
+  -c "$PB_BSTREAM" -o "$PB_BS_OBJ"
+SHIM_OBJECTS+=("$PB_BS_OBJ")
 
 # C++ shims (need ORT headers)
-for f in "$SHIMS/wasm_env.cc" "$SHIMS/wasm_data_transfer.cc" "$SHIMS/missing_kernels.cc" "$SHIMS/wasm_cxa.cc"; do
+for f in "$SHIMS/wasm_env.cc" "$SHIMS/wasm_data_transfer.cc" "$SHIMS/missing_kernels.cc" "$SHIMS/wasm_cxa.cc" "$SHIMS/wasm_checker.cc"; do
   [ -f "$f" ] || continue
   base=$(basename "$f" .cc)
   obj="$CACHE/extra/${base}.o"
@@ -376,16 +395,9 @@ jsep_capture_begin
 jsep_capture_end
 jsep_replay
 __cxa_thread_atexit
-pthread_self
-pthread_getspecific
 AbslInternalPerThreadSemPost_lts_20250814
 AbslInternalPerThreadSemWait_lts_20250814
 _ZN4absl12lts_2025081424synchronization_internal20CreateThreadIdentityEv
-_ZN7OrtApis17CreateLoraAdapterEPKcP12OrtAllocatorPP14OrtLoraAdapter
-_ZN7OrtApis26CreateLoraAdapterFromArrayEPKvmP12OrtAllocatorPP14OrtLoraAdapter
-_ZN7OrtApis18ReleaseLoraAdapterEP14OrtLoraAdapter
-_ZN11onnxruntime25IExecutionProviderFactory14CreateProviderERK17OrtSessionOptionsRK9OrtLogger
-_ZTIN11onnxruntime25IExecutionProviderFactoryE
 IMPORTS
 
 ALL_OBJECTS=(
@@ -402,6 +414,7 @@ ALL_OBJECTS=(
 echo "  ${#ALL_OBJECTS[@]} total objects"
 
 wasm-ld --no-entry --export-dynamic \
+  --export=wasm_malloc --export=wasm_free \
   --allow-undefined-file="$ALLOWED" \
   --error-limit=0 \
   "${ALL_OBJECTS[@]}" \
@@ -417,9 +430,17 @@ if [ -f "$OUT/turboquant-llm-raw.wasm" ]; then
   RAW_SIZE=$(ls -lh "$OUT/turboquant-llm-raw.wasm" | awk '{print $5}')
   echo "  Raw: $RAW_SIZE"
 
-  echo "  Optimizing..."
-  wasm-opt -O3 --strip-debug "$OUT/turboquant-llm-raw.wasm" -o "$OUT/turboquant-llm.wasm"
-  rm "$OUT/turboquant-llm-raw.wasm"
+  echo "  Stripping debug + optimizing..."
+  wasm-ld --no-entry --export-dynamic \
+    --export=wasm_malloc --export=wasm_free \
+    --allow-undefined-file="$ALLOWED" \
+    --strip-debug \
+    --error-limit=0 \
+    "${ALL_OBJECTS[@]}" \
+    $ZIGCXX_LIBS \
+    -o "$OUT/turboquant-llm-stripped.wasm" 2>/dev/null
+  wasm-opt -O3 --skip-pass=remove-unused-module-elements "$OUT/turboquant-llm-stripped.wasm" -o "$OUT/turboquant-llm.wasm"
+  rm "$OUT/turboquant-llm-stripped.wasm"
 
   OPT_SIZE=$(ls -lh "$OUT/turboquant-llm.wasm" | awk '{print $5}')
   IMPORTS=$(wasm-objdump -j Import -x "$OUT/turboquant-llm.wasm" 2>/dev/null | grep "func\[" | wc -l | tr -d ' ')

@@ -1,16 +1,15 @@
 /**
  * ORT + TurboQuant unified WASM glue.
  * Provides WASI, JSEP, and C++ runtime imports for the Zig-compiled ORT binary.
- * 34 imports total — all with correct signatures.
+ * 30 imports total — all with correct signatures.
  */
 
 const WASM_URL = "/dist/turboquant-llm.wasm";
 
 interface OrtExports {
   memory: WebAssembly.Memory;
-  _start(): void;
   OrtInit(num_threads: number, logging_level: number): number;
-  OrtCreateSessionFromBuffer(
+  OrtCreateSession(
     buffer_ptr: number, buffer_size: number,
     session_options_ptr: number, session_ptr_ptr: number,
   ): number;
@@ -29,8 +28,21 @@ interface OrtExports {
   ): number;
   OrtReleaseTensor(tensor_ptr: number): void;
   OrtReleaseSession(session_ptr: number): void;
-  malloc(size: number): number;
-  free(ptr: number): void;
+  OrtCreateSessionOptions(
+    graph_optimization_level: number,
+    enable_cpu_mem_arena: number,
+    enable_mem_pattern: number,
+    execution_mode: number,
+    enable_profiling: number,
+    log_id: number,
+    log_severity_level: number,
+    log_verbosity_level: number,
+    optimized_model_filepath: number,
+    options_ptr_ptr: number,
+  ): number;
+  OrtReleaseSessionOptions(options_ptr: number): void;
+  wasm_malloc(size: number): number;
+  wasm_free(ptr: number): void;
   tq_kv_create(head_dim: number, max_positions: number): number;
   tq_kv_destroy(stream_id: number): void;
   tq_kv_append(stream_id: number, data_ptr: number, dim: number): number;
@@ -54,8 +66,8 @@ export async function initOrt(): Promise<OrtExports> {
   const imports: WebAssembly.Imports = {
     env: {
       // JSEP — CPU execution, all ops run in WASM
-      jsep_alloc(size: number): number { return wasm!.malloc(size); },
-      jsep_free(ptr: number): number { wasm!.free(ptr); return 0; },
+      jsep_alloc(size: number): number { return wasm!.wasm_malloc(size); },
+      jsep_free(ptr: number): number { wasm!.wasm_free(ptr); return 0; },
       jsep_create_kernel: noop,
       jsep_release_kernel: noop,
       jsep_run: zero,
@@ -65,22 +77,13 @@ export async function initOrt(): Promise<OrtExports> {
 
       // C++ runtime — single-threaded WASM
       __cxa_thread_atexit: noop,
-      pthread_self: zero,
-      pthread_getspecific: zero,
 
       // Abseil threading — single-threaded, no contention
       AbslInternalPerThreadSemPost_lts_20250814: noop,
-      AbslInternalPerThreadSemWait_lts_20250814: noop,
+      AbslInternalPerThreadSemWait_lts_20250814(_timeout: bigint): number { return 0; },
       // CreateThreadIdentity — returns a pointer; 0 = no identity (single-threaded)
       _ZN4absl12lts_2025081424synchronization_internal20CreateThreadIdentityEv: zero,
 
-      // LoRA — not used for LLM inference, never called
-      _ZN7OrtApis17CreateLoraAdapterEPKcP12OrtAllocatorPP14OrtLoraAdapter: zero,
-      _ZN7OrtApis26CreateLoraAdapterFromArrayEPKvmP12OrtAllocatorPP14OrtLoraAdapter: zero,
-      _ZN7OrtApis18ReleaseLoraAdapterEP14OrtLoraAdapter: noop,
-
-      // IExecutionProviderFactory::CreateProvider — virtual, never called directly
-      _ZN11onnxruntime25IExecutionProviderFactory14CreateProviderERK17OrtSessionOptionsRK9OrtLogger: zero,
     },
 
     wasi_snapshot_preview1: {
@@ -117,6 +120,7 @@ export async function initOrt(): Promise<OrtExports> {
         v.setUint32(nwritten_ptr, written, true);
         return 0;
       },
+      path_open: zero,
       path_filestat_get(): number { return 8; },
       path_readlink(): number { return 8; },
       poll_oneoff: zero,
@@ -128,8 +132,6 @@ export async function initOrt(): Promise<OrtExports> {
   const response = await fetch(WASM_URL);
   const { instance } = await WebAssembly.instantiateStreaming(response, imports);
   wasm = instance.exports as unknown as OrtExports;
-
-  try { wasm._start(); } catch { /* proc_exit throws by design */ }
 
   const rc = wasm.OrtInit(1, 3);
   if (rc !== 0) throw new Error(`OrtInit failed: ${rc}`);
