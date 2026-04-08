@@ -106,41 +106,10 @@ export fn tq_dot_batch(
     const engine_ptr = engine_slots[idx] orelse return;
 
     const q = query_ptr[0..dim];
+    const compressed = compressed_ptr[0 .. num_vectors * bytes_per_vector];
+    const scores = out_scores[0..num_vectors];
 
-    // Pre-rotate query once (engine.dot rotates every call)
-    engine_ptr.rot_op.rotate(q, engine_ptr.scratch_rotated);
-    const rotated_q = engine_ptr.scratch_rotated;
-
-    // Parse first header to get fixed layout (polar_bytes, qjl_bytes offsets)
-    // All vectors share the same dim/structure — only max_r and gamma differ.
-    const first = compressed_ptr[0..bytes_per_vector];
-    const h0 = turboquant.format.readHeader(first) catch return;
-    const polar_len = h0.polar_bytes;
-    const qjl_len = h0.qjl_bytes;
-    const polar_off = turboquant.format.HEADER_SIZE;
-    const qjl_off = polar_off + polar_len;
-
-    // Precompute sum of all rotated_q values (same for all vectors).
-    // QJL dot = 2 * sum_positive - sum_all, avoiding per-element sign conversion.
-    var q_sum: f32 = 0;
-    for (rotated_q) |v| q_sum += v;
-
-    for (0..num_vectors) |i| {
-        const base = i * bytes_per_vector;
-        const blob = compressed_ptr[base .. base + bytes_per_vector];
-
-        // Read only max_r and gamma directly (bytes 14-21), skip full header parse
-        const max_r: f32 = @bitCast(std.mem.readInt(u32, blob[14..18], .little));
-        const gamma: f32 = @bitCast(std.mem.readInt(u32, blob[18..22], .little));
-
-        const polar_data = blob[polar_off .. polar_off + polar_len];
-        const qjl_data = blob[qjl_off .. qjl_off + qjl_len];
-
-        const polar_sum = turboquant.polar.dotProduct(rotated_q, polar_data, max_r);
-        const qjl_sum = turboquant.qjl.estimateDotFast(rotated_q, qjl_data, gamma, q_sum);
-
-        out_scores[i] = polar_sum + qjl_sum;
-    }
+    engine_ptr.dotBatch(q, compressed, bytes_per_vector, num_vectors, scores);
 }
 
 /// Allocate bytes in WASM linear memory (for JS to write into).
