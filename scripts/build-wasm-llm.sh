@@ -1,27 +1,42 @@
 #!/bin/bash
 # Build ORT + TurboQuant unified WASM binary.
-# Compiles all ORT C++ with zig c++, links with Zig TQ code.
+# All C++ compiled with zig c++. Zero Emscripten.
+#
+# Output: dist/turboquant-llm.wasm (~14 MB optimized)
+#
+# Usage:
+#   bash scripts/build-wasm-llm.sh          # full build
+#   bash scripts/build-wasm-llm.sh --clean  # wipe cache and rebuild
 set -e
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 ORT="$ROOT/vendor/onnxruntime"
 SHIMS="$ROOT/vendor/ort-shims"
+PB_SRC="$ORT/cmake/external/protobuf/src"
+ZIG_LIB="$(dirname $(which zig))/../lib"
 OUT="$ROOT/dist"
-mkdir -p "$OUT" "$ROOT/.build-cache/obj"
+CACHE="$ROOT/.build-cache"
 
+if [ "$1" = "--clean" ]; then
+  echo "Cleaning build cache..."
+  rm -rf "$CACHE"
+fi
+
+mkdir -p "$OUT" "$CACHE/ort" "$CACHE/pb" "$CACHE/extra"
+
+# --------------------------------------------------------------------------
 # Compiler flags
-INCLUDES=(
+# --------------------------------------------------------------------------
+ORT_INCLUDES=(
   -I "$SHIMS"
-  -I "$ORT/include/onnxruntime"
-  -I "$ORT/include"
-  -I "$ORT/onnxruntime"
+  -I "$ORT/include/onnxruntime" -I "$ORT/include" -I "$ORT/onnxruntime"
   -I "$ORT/include/onnxruntime/core/session"
   -I "$ORT/cmake/external/abseil-cpp"
   -I "$ORT/cmake/external/microsoft_gsl/include"
   -I "$ORT/cmake/external/flatbuffers/include"
   -I "$ORT/cmake/external/safeint"
   -I "$ORT/cmake/external/onnx"
-  -I "$ORT/cmake/external/protobuf/src"
+  -I "$PB_SRC"
   -I "$ORT/cmake/external/mp11/include"
   -I "$ORT/cmake/external/date/include"
   -I "$ORT/cmake/external/json/include"
@@ -30,7 +45,7 @@ INCLUDES=(
   -I "$ORT/onnxruntime/core/mlas/lib"
 )
 
-FORCE_INCLUDES=(
+ORT_FORCE_INCLUDES=(
   -include "$SHIMS/fstream"
   -include "$SHIMS/mutex"
   -include "$SHIMS/shared_mutex"
@@ -40,289 +55,383 @@ FORCE_INCLUDES=(
   -include "$SHIMS/thread_stream.h"
 )
 
-DEFINES=(
+ORT_DEFINES=(
   -DONNX_ML -DONNX_NAMESPACE=onnx
   -D__wasm__ -DORT_API_MANUAL_INIT -DDISABLE_FLOAT8_T
   -DUSE_JSEP -DMLAS_NO_ONNXRUNTIME_THREADPOOL
 )
 
-CXXFLAGS="-target wasm32-wasi -std=c++17 -O2 -fvisibility=default -Wno-deprecated-declarations"
+CXX="zig c++ -target wasm32-wasi -std=c++17 -O2 -fvisibility=default -Wno-deprecated-declarations"
+CC="zig cc -target wasm32-wasi -O2"
 
-# Collect ORT source files
-echo "Collecting source files..."
-ORT_SOURCES=()
+# --------------------------------------------------------------------------
+# Compile function — path-based .o naming, no collisions
+# --------------------------------------------------------------------------
+# Usage: compile_cc <source.cc> <output_dir> <base_path> [extra_flags...]
+# .o name = path relative to base_path with / replaced by __
+compile_cc() {
+  local src="$1" outdir="$2" base_path="$3"
+  shift 3
+  local rel="${src#$base_path/}"
+  local oname="${rel//\//__}"
+  oname="${oname%.cc}.o"
+  oname="${oname%.cpp}.o"
+  local obj="$outdir/$oname"
 
-# Core components
-for dir in common framework graph session; do
-  for f in "$ORT/onnxruntime/core/$dir"/*.cc; do
-    [ -f "$f" ] || continue
-    echo "$f" | grep -q "vitisai" && continue
-    echo "$f" | grep -qi "test" && continue
-    ORT_SOURCES+=("$f")
-  done
-done
-
-# JSEP provider
-for f in "$ORT/onnxruntime/core/providers/js"/*.cc; do
-  [ -f "$f" ] || continue
-  ORT_SOURCES+=("$f")
-done
-
-# JSEP operators
-for f in "$ORT/onnxruntime/core/providers/js/operators"/*.cc; do
-  [ -f "$f" ] || continue
-  ORT_SOURCES+=("$f")
-done
-
-# WASM API
-ORT_SOURCES+=("$ORT/onnxruntime/wasm/api.cc")
-
-echo "  ${#ORT_SOURCES[@]} ORT source files"
-
-# Compile ORT C++ to .o files (parallel)
-echo "Compiling ORT C++..."
-OBJECTS=()
-FAILED=0
-COMPILED=0
-
-compile_one() {
-  local src="$1"
-  local base=$(basename "$src" .cc)
-  base=$(basename "$base" .cpp)
-  local obj="$ROOT/.build-cache/obj/${base}.o"
-
-  # Skip if already compiled and newer than source
   if [ -f "$obj" ] && [ "$obj" -nt "$src" ]; then
     echo "$obj"
     return 0
   fi
 
-  if zig c++ $CXXFLAGS \
-    "${FORCE_INCLUDES[@]}" "${INCLUDES[@]}" "${DEFINES[@]}" \
-    -c "$src" -o "$obj" 2>/dev/null; then
-    echo "$obj"
-    return 0
-  else
-    return 1
-  fi
+  $CXX "$@" -c "$src" -o "$obj" 2>/dev/null || { rm -f "$obj"; return 1; }
+  echo "$obj"
+  return 0
 }
 
-for src in "${ORT_SOURCES[@]}"; do
-  obj=$(compile_one "$src")
-  if [ $? -eq 0 ]; then
-    OBJECTS+=("$obj")
-    COMPILED=$((COMPILED + 1))
-  else
-    echo "  FAILED: $(basename "$src")"
-    FAILED=$((FAILED + 1))
-  fi
-done
+# --------------------------------------------------------------------------
+# 1. ORT core C++ sources
+# --------------------------------------------------------------------------
+echo "=== ORT core ==="
+ORT_SOURCES=()
 
-echo "  Compiled: $COMPILED, Failed: $FAILED"
-
-if [ $FAILED -gt 0 ]; then
-  echo "ERROR: $FAILED files failed to compile"
-  exit 1
-fi
-
-echo "Build complete. ${#OBJECTS[@]} object files in .build-cache/obj/"
-echo ""
-
-echo "Compiling protobuf..."
-PB_DIR="$ORT/cmake/external/protobuf/src/google/protobuf"
-PB_COMPILED=0
-PB_FILES=$(find "$PB_DIR" -name "*.cc" -not -name "*test*" -not -name "*mock*" -not -name "*compiler*" -not -path "*testing*" | sort)
-for f in $PB_FILES; do
-  [ -f "$f" ] || continue
-  dir_part=$(basename $(dirname "$f"))
-  base=$(basename "$f" .cc)
-  obj="$ROOT/.build-cache/obj/pb_${dir_part}_${base}.o"
-  if [ -f "$obj" ] && [ "$obj" -nt "$f" ]; then
-    OBJECTS+=("$obj")
-    PB_COMPILED=$((PB_COMPILED + 1))
-    continue
-  fi
-  if zig c++ $CXXFLAGS "${FORCE_INCLUDES[@]}" "${INCLUDES[@]}" "${DEFINES[@]}" -c "$f" -o "$obj" 2>/dev/null; then
-    OBJECTS+=("$obj")
-    PB_COMPILED=$((PB_COMPILED + 1))
-  fi
-done
-echo "  protobuf: $PB_COMPILED compiled"
-
-echo "Compiling ONNX protobuf..."
-ONNX_PB=0
-for f in "$ORT/cmake/external/onnx/onnx"/*.pb.cc; do
-  [ -f "$f" ] || continue
-  base=$(basename "$f" .cc)
-  obj="$ROOT/.build-cache/obj/onnx_${base}.o"
-  if zig c++ $CXXFLAGS "${FORCE_INCLUDES[@]}" "${INCLUDES[@]}" "${DEFINES[@]}" -c "$f" -o "$obj" 2>/dev/null; then
-    OBJECTS+=("$obj")
-    ONNX_PB=$((ONNX_PB + 1))
-  fi
-done
-echo "  onnx protobuf: $ONNX_PB compiled"
-
-echo "Compiling abseil..."
-AB_COMPILED=0
-for dir in base base/internal strings strings/internal hash hash/internal container container/internal numeric types status; do
-  for f in "$ORT/cmake/external/abseil-cpp/absl/$dir"/*.cc; do
+# Collect source files
+for dir in \
+  "$ORT/onnxruntime/core/common" \
+  "$ORT/onnxruntime/core/common/logging" \
+  "$ORT/onnxruntime/core/common/logging/sinks" \
+  "$ORT/onnxruntime/core/framework" \
+  "$ORT/onnxruntime/core/graph" \
+  "$ORT/onnxruntime/core/graph/contrib_ops" \
+  "$ORT/onnxruntime/core/flatbuffers" \
+  "$ORT/onnxruntime/core/session" \
+  "$ORT/onnxruntime/core/providers/js" \
+  "$ORT/onnxruntime/core/providers/js/operators" \
+  "$ORT/onnxruntime/core/optimizer" \
+  "$ORT/onnxruntime/core/providers/cpu" \
+  "$ORT/onnxruntime/core/platform" \
+  "$ORT/onnxruntime/core/platform/logging" \
+  "$ORT/onnxruntime/core/platform/posix"; do
+  for f in "$dir"/*.cc; do
     [ -f "$f" ] || continue
-    echo "$f" | grep -qE "test|benchmark|_testing" && continue
-    base=$(basename "$f" .cc)
-    obj="$ROOT/.build-cache/obj/absl_${dir//\//_}_${base}.o"
-    if [ -f "$obj" ] && [ "$obj" -nt "$f" ]; then
-      OBJECTS+=("$obj")
-      AB_COMPILED=$((AB_COMPILED + 1))
-      continue
-    fi
-    if zig c++ $CXXFLAGS "${FORCE_INCLUDES[@]}" -I "$SHIMS" -I "$ORT/cmake/external/abseil-cpp" -D__wasm__ -DHAVE_PTHREAD=0 -c "$f" -o "$obj" 2>/dev/null; then
-      OBJECTS+=("$obj")
-      AB_COMPILED=$((AB_COMPILED + 1))
-    fi
+    echo "$f" | grep -qiE "test|benchmark|vitisai" && continue
+    ORT_SOURCES+=("$f")
   done
 done
-echo "  abseil: $AB_COMPILED compiled"
 
+# Subdirectories of optimizer and cpu provider
+for dir in $(find "$ORT/onnxruntime/core/optimizer" -mindepth 1 -type d 2>/dev/null); do
+  for f in "$dir"/*.cc; do
+    [ -f "$f" ] || continue
+    echo "$f" | grep -qiE "test|benchmark" && continue
+    ORT_SOURCES+=("$f")
+  done
+done
+for dir in $(find "$ORT/onnxruntime/core/providers/cpu" -mindepth 1 -type d 2>/dev/null); do
+  for f in "$dir"/*.cc; do
+    [ -f "$f" ] || continue
+    echo "$f" | grep -qiE "test|benchmark" && continue
+    ORT_SOURCES+=("$f")
+  done
+done
+
+# JS contrib ops
+for dir in \
+  "$ORT/onnxruntime/contrib_ops/js" \
+  "$ORT/onnxruntime/contrib_ops/js/bert" \
+  "$ORT/onnxruntime/contrib_ops/js/quantization"; do
+  for f in "$dir"/*.cc; do
+    [ -f "$f" ] || continue
+    ORT_SOURCES+=("$f")
+  done
+done
+
+# CPU contrib ops
+for dir in \
+  "$ORT/onnxruntime/contrib_ops/cpu" \
+  "$ORT/onnxruntime/contrib_ops/cpu/bert" \
+  "$ORT/onnxruntime/contrib_ops/cpu/quantization"; do
+  for f in "$dir"/*.cc; do
+    [ -f "$f" ] || continue
+    echo "$f" | grep -qiE "test|benchmark" && continue
+    ORT_SOURCES+=("$f")
+  done
+done
+
+# WASM API
+ORT_SOURCES+=("$ORT/onnxruntime/wasm/api.cc")
+
+echo "  ${#ORT_SOURCES[@]} source files"
+
+ORT_OBJECTS=()
+compiled=0
+failed=0
+for src in "${ORT_SOURCES[@]}"; do
+  if obj=$(compile_cc "$src" "$CACHE/ort" "$ORT" \
+    "${ORT_FORCE_INCLUDES[@]}" "${ORT_INCLUDES[@]}" "${ORT_DEFINES[@]}"); then
+    ORT_OBJECTS+=("$obj")
+    compiled=$((compiled + 1))
+  else
+    echo "  FAIL: ${src#$ORT/}"
+    failed=$((failed + 1))
+  fi
+done
+echo "  Compiled: $compiled, Failed: $failed"
+
+# --------------------------------------------------------------------------
+# 2. ONNX defs + shape inference + checker
+# --------------------------------------------------------------------------
 echo ""
-echo "Total objects: ${#OBJECTS[@]}"
-echo "Build complete."
+echo "=== ONNX ==="
+ONNX_SOURCES=()
+for dir in \
+  "$ORT/cmake/external/onnx/onnx" \
+  "$ORT/cmake/external/onnx/onnx/defs" \
+  "$ORT/cmake/external/onnx/onnx/defs/math" \
+  "$ORT/cmake/external/onnx/onnx/defs/tensor" \
+  "$ORT/cmake/external/onnx/onnx/defs/nn" \
+  "$ORT/cmake/external/onnx/onnx/defs/sequence" \
+  "$ORT/cmake/external/onnx/onnx/defs/logical" \
+  "$ORT/cmake/external/onnx/onnx/defs/reduction" \
+  "$ORT/cmake/external/onnx/onnx/defs/traditionalml" \
+  "$ORT/cmake/external/onnx/onnx/defs/object_detection" \
+  "$ORT/cmake/external/onnx/onnx/defs/quantization" \
+  "$ORT/cmake/external/onnx/onnx/defs/optional" \
+  "$ORT/cmake/external/onnx/onnx/defs/generator" \
+  "$ORT/cmake/external/onnx/onnx/defs/controlflow" \
+  "$ORT/cmake/external/onnx/onnx/defs/experiments" \
+  "$ORT/cmake/external/onnx/onnx/defs/rnn" \
+  "$ORT/cmake/external/onnx/onnx/shape_inference" \
+  "$ORT/cmake/external/onnx/onnx/common" \
+  "$ORT/cmake/external/onnx/onnx/version_converter"; do
+  for f in "$dir"/*.cc; do
+    [ -f "$f" ] || continue
+    echo "$f" | grep -qiE "test|benchmark" && continue
+    ONNX_SOURCES+=("$f")
+  done
+done
 
-# Compile ONNX operator definitions
-echo "Compiling ONNX defs..."
-ONNX_COMPILED=0
-for f in "$ORT/cmake/external/onnx/onnx/defs"/*.cc "$ORT/cmake/external/onnx/onnx/defs"/**/*.cc "$ORT/cmake/external/onnx/onnx"/*.cc "$ORT/cmake/external/onnx/onnx/shape_inference"/*.cc; do
-  [ -f "$f" ] || continue
-  echo "$f" | grep -qE "test|benchmark" && continue
-  base=$(basename "$f" .cc)
-  dir_part=$(basename $(dirname "$f"))
-  obj="$ROOT/.build-cache/obj/onnxdefs_${dir_part}_${base}.o"
-  if [ -f "$obj" ] && [ "$obj" -nt "$f" ]; then
-    OBJECTS+=("$obj")
-    ONNX_COMPILED=$((ONNX_COMPILED + 1))
-    continue
-  fi
-  if zig c++ $CXXFLAGS "${FORCE_INCLUDES[@]}" "${INCLUDES[@]}" "${DEFINES[@]}" -c "$f" -o "$obj" 2>/dev/null; then
-    OBJECTS+=("$obj")
-    ONNX_COMPILED=$((ONNX_COMPILED + 1))
+ONNX_OBJECTS=()
+compiled=0
+for src in "${ONNX_SOURCES[@]}"; do
+  # ONNX checker needs external data checks disabled (uses filesystem::is_symlink)
+  extra_flags=()
+  echo "$src" | grep -q "checker.cc" && extra_flags+=("-DONNX_DISABLE_EXTERNAL_DATA_CHECKS=1")
+
+  if obj=$(compile_cc "$src" "$CACHE/ort" "$ORT/cmake/external" \
+    "${ORT_FORCE_INCLUDES[@]}" "${ORT_INCLUDES[@]}" "${ORT_DEFINES[@]}" "${extra_flags[@]}"); then
+    ONNX_OBJECTS+=("$obj")
+    compiled=$((compiled + 1))
   fi
 done
-echo "  onnx defs: $ONNX_COMPILED compiled"
+echo "  $compiled compiled"
 
-# Compile ORT optimizer
-echo "Compiling optimizer..."
-OPT_COMPILED=0
-for f in "$ORT/onnxruntime/core/optimizer"/*.cc "$ORT/onnxruntime/core/optimizer"/**/*.cc; do
-  [ -f "$f" ] || continue
-  echo "$f" | grep -qE "test|benchmark" && continue
-  base=$(basename "$f" .cc)
-  dir_part=$(basename $(dirname "$f"))
-  obj="$ROOT/.build-cache/obj/opt_${dir_part}_${base}.o"
-  if [ -f "$obj" ] && [ "$obj" -nt "$f" ]; then
-    OBJECTS+=("$obj")
-    OPT_COMPILED=$((OPT_COMPILED + 1))
-    continue
-  fi
-  if zig c++ $CXXFLAGS "${FORCE_INCLUDES[@]}" "${INCLUDES[@]}" "${DEFINES[@]}" -c "$f" -o "$obj" 2>/dev/null; then
-    OBJECTS+=("$obj")
-    OPT_COMPILED=$((OPT_COMPILED + 1))
-  fi
-done
-echo "  optimizer: $OPT_COMPILED compiled"
-
-# Compile CPU provider (needed for fallback ops)
-echo "Compiling CPU provider..."
-CPU_COMPILED=0
-for f in "$ORT/onnxruntime/core/providers/cpu"/*.cc "$ORT/onnxruntime/core/providers/cpu"/**/*.cc; do
-  [ -f "$f" ] || continue
-  echo "$f" | grep -qE "test|benchmark" && continue
-  base=$(basename "$f" .cc)
-  dir_part=$(basename $(dirname "$f"))
-  obj="$ROOT/.build-cache/obj/cpu_${dir_part}_${base}.o"
-  if [ -f "$obj" ] && [ "$obj" -nt "$f" ]; then
-    OBJECTS+=("$obj")
-    CPU_COMPILED=$((CPU_COMPILED + 1))
-    continue
-  fi
-  if zig c++ $CXXFLAGS "${FORCE_INCLUDES[@]}" "${INCLUDES[@]}" "${DEFINES[@]}" -c "$f" -o "$obj" 2>/dev/null; then
-    OBJECTS+=("$obj")
-    CPU_COMPILED=$((CPU_COMPILED + 1))
-  fi
-done
-echo "  cpu provider: $CPU_COMPILED compiled"
-
-# Compile MLAS (WASM-compatible files only)
-echo "Compiling MLAS..."
-MLAS_COMPILED=0
-for f in "$ORT/onnxruntime/core/mlas/lib"/*.cpp; do
-  [ -f "$f" ] || continue
-  # Skip architecture-specific kernels
-  echo "$f" | grep -qiE "neon|avx|sse|amx|lsx|kai_|test|benchmark" && continue
-  base=$(basename "$f" .cpp)
-  obj="$ROOT/.build-cache/obj/mlas_${base}.o"
-  if [ -f "$obj" ] && [ "$obj" -nt "$f" ]; then
-    OBJECTS+=("$obj")
-    MLAS_COMPILED=$((MLAS_COMPILED + 1))
-    continue
-  fi
-  if zig c++ $CXXFLAGS "${FORCE_INCLUDES[@]}" "${INCLUDES[@]}" "${DEFINES[@]}" -msimd128 -mrelaxed-simd -c "$f" -o "$obj" 2>/dev/null; then
-    OBJECTS+=("$obj")
-    MLAS_COMPILED=$((MLAS_COMPILED + 1))
-  fi
-done
-# WASM-specific MLAS
-for f in "$ORT/onnxruntime/core/mlas/lib/wasm"/*.cpp; do
-  [ -f "$f" ] || continue
-  base=$(basename "$f" .cpp)
-  obj="$ROOT/.build-cache/obj/mlas_wasm_${base}.o"
-  if zig c++ $CXXFLAGS "${FORCE_INCLUDES[@]}" "${INCLUDES[@]}" "${DEFINES[@]}" -msimd128 -mrelaxed-simd -c "$f" -o "$obj" 2>/dev/null; then
-    OBJECTS+=("$obj")
-    MLAS_COMPILED=$((MLAS_COMPILED + 1))
-  fi
-done
-echo "  mlas: $MLAS_COMPILED compiled"
-
-# Compile ORT contrib ops (JSEP needs them)
-echo "Compiling contrib ops..."
-CONTRIB_COMPILED=0
-for f in "$ORT/onnxruntime/contrib_ops/js"/*.cc; do
-  [ -f "$f" ] || continue
-  base=$(basename "$f" .cc)
-  obj="$ROOT/.build-cache/obj/contrib_${base}.o"
-  if zig c++ $CXXFLAGS "${FORCE_INCLUDES[@]}" "${INCLUDES[@]}" "${DEFINES[@]}" -c "$f" -o "$obj" 2>/dev/null; then
-    OBJECTS+=("$obj")
-    CONTRIB_COMPILED=$((CONTRIB_COMPILED + 1))
-  fi
-done
-echo "  contrib ops: $CONTRIB_COMPILED compiled"
-
+# --------------------------------------------------------------------------
+# 3. Protobuf (runtime only, no compiler)
+# --------------------------------------------------------------------------
 echo ""
-echo "=== FINAL TOTALS ==="
-echo "Total objects: ${#OBJECTS[@]}"
-du -sh "$ROOT/.build-cache/obj/"
+echo "=== Protobuf ==="
+PB_SOURCES=()
+for dir in $(find "$PB_SRC/google/protobuf" -type d ! -path "*/compiler*" 2>/dev/null); do
+  for f in "$dir"/*.cc; do
+    [ -f "$f" ] || continue
+    echo "$f" | grep -qiE "test|mock|unittest|_testing|benchmark" && continue
+    PB_SOURCES+=("$f")
+  done
+done
 
-# Compile CXA runtime
-echo "Compiling CXA runtime..."
+PB_OBJECTS=()
+compiled=0
+for src in "${PB_SOURCES[@]}"; do
+  # Protobuf only needs the mutex shim, not all ORT force-includes
+  if obj=$(compile_cc "$src" "$CACHE/pb" "$PB_SRC" \
+    -include "$SHIMS/mutex" -I "$PB_SRC" -DONNX_ML -DONNX_NAMESPACE=onnx); then
+    PB_OBJECTS+=("$obj")
+    compiled=$((compiled + 1))
+  fi
+done
+echo "  $compiled compiled"
 
-echo "Compiling TQ bridge..."
-zig build-obj -target wasm32-wasi -O ReleaseFast -fstrip src/tq_bridge.zig --name tq_bridge
-mv tq_bridge.o "$ROOT/.build-cache/obj/tq_bridge.o"
-OBJECTS+=("$ROOT/.build-cache/obj/tq_bridge.o")
-echo "  tq bridge compiled"
-zig c++ -target wasm32-wasi -std=c++17 -O2 -c "$SHIMS/wasm_cxa.cc" -o "$ROOT/.build-cache/obj/wasm_cxa.o"
-OBJECTS+=("$ROOT/.build-cache/obj/wasm_cxa.o")
-echo "  cxa runtime compiled"
+# --------------------------------------------------------------------------
+# 4. Abseil
+# --------------------------------------------------------------------------
+echo ""
+echo "=== Abseil ==="
+AB_SOURCES=()
+for dir in base base/internal strings strings/internal hash hash/internal \
+  container container/internal numeric types status synchronization \
+  synchronization/internal time time/internal debugging profiling/internal \
+  random random/internal; do
+  for f in "$ORT/cmake/external/abseil-cpp/absl/$dir"/*.cc; do
+    [ -f "$f" ] || continue
+    echo "$f" | grep -qiE "test|benchmark|_testing|print_hash_of|gentables" && continue
+    AB_SOURCES+=("$f")
+  done
+done
 
-# Link
+AB_OBJECTS=()
+compiled=0
+for src in "${AB_SOURCES[@]}"; do
+  if obj=$(compile_cc "$src" "$CACHE/ort" "$ORT/cmake/external" \
+    "${ORT_FORCE_INCLUDES[@]}" -I "$SHIMS" -I "$ORT/cmake/external/abseil-cpp" \
+    -D__wasm__ -DHAVE_PTHREAD=0); then
+    AB_OBJECTS+=("$obj")
+    compiled=$((compiled + 1))
+  fi
+done
+echo "  $compiled compiled"
+
+# --------------------------------------------------------------------------
+# 5. MLAS (WASM-compatible only)
+# --------------------------------------------------------------------------
+echo ""
+echo "=== MLAS ==="
+MLAS_OBJECTS=()
+compiled=0
+for f in "$ORT/onnxruntime/core/mlas/lib"/*.cpp "$ORT/onnxruntime/core/mlas/lib/wasm"/*.cpp; do
+  [ -f "$f" ] || continue
+  echo "$f" | grep -qiE "neon|avx|sse|amx|lsx|kai_|test|benchmark|q4_dq_cli" && continue
+  if obj=$(compile_cc "$f" "$CACHE/ort" "$ORT" \
+    "${ORT_FORCE_INCLUDES[@]}" "${ORT_INCLUDES[@]}" "${ORT_DEFINES[@]}" \
+    -msimd128 -mrelaxed-simd); then
+    MLAS_OBJECTS+=("$obj")
+    compiled=$((compiled + 1))
+  fi
+done
+echo "  $compiled compiled"
+
+# --------------------------------------------------------------------------
+# 6. libc++ filesystem (path parsing for ORT model loading)
+# --------------------------------------------------------------------------
+echo ""
+echo "=== libc++ filesystem ==="
+FS_OBJECTS=()
+for f in path; do
+  src="$ZIG_LIB/libcxx/src/filesystem/${f}.cpp"
+  [ -f "$src" ] || continue
+  obj="$CACHE/extra/libcxx_fs_${f}.o"
+  if [ ! -f "$obj" ] || [ "$src" -nt "$obj" ]; then
+    $CXX -D_LIBCPP_HAS_FILESYSTEM=1 -D_LIBCPP_BUILDING_LIBRARY \
+      -I "$ZIG_LIB/libcxx/include" -I "$ZIG_LIB/libcxx/src" \
+      -c "$src" -o "$obj" 2>/dev/null
+  fi
+  [ -f "$obj" ] && FS_OBJECTS+=("$obj")
+done
+echo "  ${#FS_OBJECTS[@]} compiled"
+
+# --------------------------------------------------------------------------
+# 7. Platform shims (our implementations)
+# --------------------------------------------------------------------------
+echo ""
+echo "=== Platform shims ==="
+SHIM_OBJECTS=()
+
+# C shims
+$CC -c "$SHIMS/missing_syms.c" -o "$CACHE/extra/missing_syms.o"
+SHIM_OBJECTS+=("$CACHE/extra/missing_syms.o")
+
+# C++ shims (need ORT headers)
+for f in "$SHIMS/wasm_env.cc" "$SHIMS/wasm_data_transfer.cc" "$SHIMS/missing_kernels.cc" "$SHIMS/wasm_cxa.cc"; do
+  [ -f "$f" ] || continue
+  base=$(basename "$f" .cc)
+  obj="$CACHE/extra/${base}.o"
+  $CXX "${ORT_FORCE_INCLUDES[@]}" "${ORT_INCLUDES[@]}" "${ORT_DEFINES[@]}" \
+    -c "$f" -o "$obj" 2>/dev/null && SHIM_OBJECTS+=("$obj")
+done
+echo "  ${#SHIM_OBJECTS[@]} compiled"
+
+# --------------------------------------------------------------------------
+# 8. TQ bridge (Zig)
+# --------------------------------------------------------------------------
+echo ""
+echo "=== TQ bridge ==="
+TQ_OBJ="$CACHE/extra/tq_bridge.o"
+zig build-obj -target wasm32-wasi -O ReleaseFast -fstrip "$ROOT/src/tq_bridge.zig" --name tq_bridge
+mv tq_bridge.o "$TQ_OBJ"
+echo "  compiled"
+
+# --------------------------------------------------------------------------
+# 9. Link
+# --------------------------------------------------------------------------
 echo ""
 echo "=== Linking ==="
-zig c++ -target wasm32-wasi -O2 \
-  -Wl,--no-entry -Wl,--export-dynamic \
-  "${OBJECTS[@]}" \
-  -o "$OUT/turboquant-llm.wasm" \
-  -lc++ 2>&1 | grep "undefined symbol" | sed 's/.*undefined symbol: //' | sort -u | wc -l
-echo "undefined symbols remaining (see above)"
 
-if [ -f "$OUT/turboquant-llm.wasm" ]; then
+# System libraries from Zig's cache
+echo "int main(){return 0;}" > /tmp/_zig_probe.c
+ZIG_LIBS=$($CC /tmp/_zig_probe.c -o /tmp/_zig_probe.wasm -lc -v 2>&1 | grep -oE '/[^ ]+\.a' | tr '\n' ' ')
+rm -f /tmp/_zig_probe.c /tmp/_zig_probe.wasm
+
+echo "int main(){return 0;}" > /tmp/_zig_probe.cpp
+ZIGCXX_LIBS=$(zig c++ -target wasm32-wasi /tmp/_zig_probe.cpp -o /tmp/_zig_probe.wasm -lc++ -v 2>&1 | grep -oE '/[^ ]+\.a' | tr '\n' ' ')
+rm -f /tmp/_zig_probe.cpp /tmp/_zig_probe.wasm
+
+# Allowed JS imports (JSEP, WASI, threading)
+ALLOWED="$CACHE/allowed-imports.txt"
+cat > "$ALLOWED" << 'IMPORTS'
+jsep_alloc
+jsep_free
+jsep_create_kernel
+jsep_release_kernel
+jsep_run
+jsep_capture_begin
+jsep_capture_end
+jsep_replay
+__cxa_thread_atexit
+pthread_self
+pthread_getspecific
+AbslInternalPerThreadSemPost_lts_20250814
+AbslInternalPerThreadSemWait_lts_20250814
+_ZN4absl12lts_2025081424synchronization_internal20CreateThreadIdentityEv
+_ZN7OrtApis17CreateLoraAdapterEPKcP12OrtAllocatorPP14OrtLoraAdapter
+_ZN7OrtApis26CreateLoraAdapterFromArrayEPKvmP12OrtAllocatorPP14OrtLoraAdapter
+_ZN7OrtApis18ReleaseLoraAdapterEP14OrtLoraAdapter
+_ZN11onnxruntime25IExecutionProviderFactory14CreateProviderERK17OrtSessionOptionsRK9OrtLogger
+_ZTIN11onnxruntime25IExecutionProviderFactoryE
+IMPORTS
+
+ALL_OBJECTS=(
+  "${SHIM_OBJECTS[@]}"
+  "$TQ_OBJ"
+  "${FS_OBJECTS[@]}"
+  "${ORT_OBJECTS[@]}"
+  "${ONNX_OBJECTS[@]}"
+  "${PB_OBJECTS[@]}"
+  "${AB_OBJECTS[@]}"
+  "${MLAS_OBJECTS[@]}"
+)
+
+echo "  ${#ALL_OBJECTS[@]} total objects"
+
+wasm-ld --no-entry --export-dynamic \
+  --allow-undefined-file="$ALLOWED" \
+  --error-limit=0 \
+  "${ALL_OBJECTS[@]}" \
+  $ZIGCXX_LIBS \
+  -o "$OUT/turboquant-llm-raw.wasm" 2>&1 | tee /tmp/link-errors.txt | grep "error:" | head -5
+
+UNDEF=$(grep "undefined symbol" /tmp/link-errors.txt | sed 's/.*undefined symbol: //' | sort -u | wc -l | tr -d ' ')
+DUPS=$(grep "duplicate symbol" /tmp/link-errors.txt | wc -l | tr -d ' ')
+
+echo "  Undefined: $UNDEF, Duplicates: $DUPS"
+
+if [ -f "$OUT/turboquant-llm-raw.wasm" ]; then
+  RAW_SIZE=$(ls -lh "$OUT/turboquant-llm-raw.wasm" | awk '{print $5}')
+  echo "  Raw: $RAW_SIZE"
+
+  echo "  Optimizing..."
+  wasm-opt -O3 --strip-debug "$OUT/turboquant-llm-raw.wasm" -o "$OUT/turboquant-llm.wasm"
+  rm "$OUT/turboquant-llm-raw.wasm"
+
+  OPT_SIZE=$(ls -lh "$OUT/turboquant-llm.wasm" | awk '{print $5}')
+  IMPORTS=$(wasm-objdump -j Import -x "$OUT/turboquant-llm.wasm" 2>/dev/null | grep "func\[" | wc -l | tr -d ' ')
   echo ""
-  echo "SUCCESS: $(ls -lh "$OUT/turboquant-llm.wasm" | awk '{print $5}') WASM binary"
+  echo "=== SUCCESS ==="
+  echo "  $OUT/turboquant-llm.wasm"
+  echo "  Size: $OPT_SIZE (optimized)"
+  echo "  Imports: $IMPORTS"
+else
+  echo ""
+  echo "=== LINK FAILED ==="
+  echo "  $UNDEF undefined symbols, $DUPS duplicate symbols"
+  echo "  See /tmp/link-errors.txt"
+  exit 1
 fi

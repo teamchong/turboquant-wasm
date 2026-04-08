@@ -1,6 +1,7 @@
 /**
  * ORT + TurboQuant unified WASM glue.
- * Provides JSEP extern fn implementations and model loading.
+ * Provides WASI, JSEP, and C++ runtime imports for the Zig-compiled ORT binary.
+ * 34 imports total — all with correct signatures.
  */
 
 const WASM_URL = "/dist/turboquant-llm.wasm";
@@ -8,60 +9,37 @@ const WASM_URL = "/dist/turboquant-llm.wasm";
 interface OrtExports {
   memory: WebAssembly.Memory;
   _start(): void;
-
-  // ORT WASM API (from onnxruntime/wasm/api.cc)
   OrtInit(num_threads: number, logging_level: number): number;
   OrtCreateSessionFromBuffer(
-    buffer_ptr: number,
-    buffer_size: number,
-    session_options_ptr: number,
-    session_ptr_ptr: number,
+    buffer_ptr: number, buffer_size: number,
+    session_options_ptr: number, session_ptr_ptr: number,
   ): number;
   OrtRun(
-    session_ptr: number,
-    input_names_ptr: number,
-    input_tensors_ptr: number,
-    input_count: number,
-    output_names_ptr: number,
-    output_count: number,
+    session_ptr: number, input_names_ptr: number, input_tensors_ptr: number,
+    input_count: number, output_names_ptr: number, output_count: number,
     output_tensors_ptr: number,
   ): number;
   OrtCreateTensor(
-    data_type: number,
-    data_ptr: number,
-    data_size: number,
-    dims_ptr: number,
-    dims_count: number,
+    data_type: number, data_ptr: number, data_size: number,
+    dims_ptr: number, dims_count: number,
   ): number;
   OrtGetTensorData(
-    tensor_ptr: number,
-    data_ptr_ptr: number,
-    dims_ptr_ptr: number,
-    dims_count_ptr: number,
+    tensor_ptr: number, data_ptr_ptr: number,
+    dims_ptr_ptr: number, dims_count_ptr: number,
   ): number;
   OrtReleaseTensor(tensor_ptr: number): void;
   OrtReleaseSession(session_ptr: number): void;
-
-  // Memory management
   malloc(size: number): number;
   free(ptr: number): void;
-
-  // TQ bridge (from tq_bridge.zig)
   tq_kv_create(head_dim: number, max_positions: number): number;
   tq_kv_destroy(stream_id: number): void;
   tq_kv_append(stream_id: number, data_ptr: number, dim: number): number;
   tq_kv_dot_batch(
-    stream_id: number,
-    query_ptr: number,
-    dim: number,
-    out_scores: number,
-    max_scores: number,
+    stream_id: number, query_ptr: number, dim: number,
+    out_scores: number, max_scores: number,
   ): number;
   tq_kv_decode_position(
-    stream_id: number,
-    position: number,
-    out_ptr: number,
-    dim: number,
+    stream_id: number, position: number, out_ptr: number, dim: number,
   ): number;
   tq_kv_length(stream_id: number): number;
   tq_kv_compressed_size(stream_id: number): number;
@@ -69,109 +47,98 @@ interface OrtExports {
 
 let wasm: OrtExports | null = null;
 
-// JSEP (JavaScript Execution Provider) implementations.
-// These are called by ORT's C++ code via extern fn declarations.
-// CPU execution — all ops run in WASM. WebGPU matmul dispatch
-// will replace jsep_run when the WebGPU path is wired.
-const jsepImports = {
-  env: {
-    jsep_alloc(size: number): number {
-      return wasm!.malloc(size);
-    },
-    jsep_free(ptr: number): number {
-      wasm!.free(ptr);
-      return 0;
-    },
-    jsep_download(src: number, dst: number, bytes: number): void {
-      const mem = new Uint8Array(wasm!.memory.buffer);
-      mem.copyWithin(dst, src, src + bytes);
-    },
-    jsep_copy(src: number, dst: number, bytes: number, _gpu_to_cpu: number): void {
-      const mem = new Uint8Array(wasm!.memory.buffer);
-      mem.copyWithin(dst, src, src + bytes);
-    },
-    jsep_create_kernel(_optype: number, _ptr: number, _attr: number): void {},
-    jsep_release_kernel(_ptr: number): void {},
-    jsep_run(
-      _kernel: number,
-      _num_inputs: number,
-      _inputs: number,
-      _num_outputs: number,
-      _outputs: number,
-      _attrs: number,
-    ): number {
-      return 0; // CPU provider handles all ops
-    },
-    jsep_capture_begin(): void {},
-    jsep_capture_end(): void {},
-    jsep_replay(): void {},
-    emscripten_get_now(): number {
-      return performance.now();
-    },
-  },
-  wasi_snapshot_preview1: {
-    args_get(): number { return 0; },
-    args_sizes_get(argc_ptr: number, argv_buf_size_ptr: number): number {
-      const view = new DataView(wasm!.memory.buffer);
-      view.setUint32(argc_ptr, 0, true);
-      view.setUint32(argv_buf_size_ptr, 0, true);
-      return 0;
-    },
-    environ_get(): number { return 0; },
-    environ_sizes_get(count_ptr: number, size_ptr: number): number {
-      const view = new DataView(wasm!.memory.buffer);
-      view.setUint32(count_ptr, 0, true);
-      view.setUint32(size_ptr, 0, true);
-      return 0;
-    },
-    clock_time_get(_id: number, _precision: bigint, time_ptr: number): number {
-      const view = new DataView(wasm!.memory.buffer);
-      view.setBigUint64(time_ptr, BigInt(Math.floor(performance.now() * 1e6)), true);
-      return 0;
-    },
-    fd_close(): number { return 0; },
-    fd_fdstat_get(): number { return 0; },
-    fd_prestat_get(): number { return 8; }, // EBADF — no preopened dirs
-    fd_prestat_dir_name(): number { return 8; },
-    fd_read(): number { return 0; },
-    fd_seek(): number { return 0; },
-    fd_write(_fd: number, iovs_ptr: number, iovs_len: number, nwritten_ptr: number): number {
-      const view = new DataView(wasm!.memory.buffer);
-      const mem = new Uint8Array(wasm!.memory.buffer);
-      let written = 0;
-      for (let i = 0; i < iovs_len; i++) {
-        const ptr = view.getUint32(iovs_ptr + i * 8, true);
-        const len = view.getUint32(iovs_ptr + i * 8 + 4, true);
-        const text = new TextDecoder().decode(mem.subarray(ptr, ptr + len));
-        console.log(text);
-        written += len;
-      }
-      view.setUint32(nwritten_ptr, written, true);
-      return 0;
-    },
-    proc_exit(code: number): void {
-      throw new Error(`WASM exit: ${code}`);
-    },
-  },
-};
+function noop() {}
+function zero() { return 0; }
 
 export async function initOrt(): Promise<OrtExports> {
+  const imports: WebAssembly.Imports = {
+    env: {
+      // JSEP — CPU execution, all ops run in WASM
+      jsep_alloc(size: number): number { return wasm!.malloc(size); },
+      jsep_free(ptr: number): number { wasm!.free(ptr); return 0; },
+      jsep_create_kernel: noop,
+      jsep_release_kernel: noop,
+      jsep_run: zero,
+      jsep_capture_begin: noop,
+      jsep_capture_end: noop,
+      jsep_replay: noop,
+
+      // C++ runtime — single-threaded WASM
+      __cxa_thread_atexit: noop,
+      pthread_self: zero,
+      pthread_getspecific: zero,
+
+      // Abseil threading — single-threaded, no contention
+      AbslInternalPerThreadSemPost_lts_20250814: noop,
+      AbslInternalPerThreadSemWait_lts_20250814: noop,
+      // CreateThreadIdentity — returns a pointer; 0 = no identity (single-threaded)
+      _ZN4absl12lts_2025081424synchronization_internal20CreateThreadIdentityEv: zero,
+
+      // LoRA — not used for LLM inference, never called
+      _ZN7OrtApis17CreateLoraAdapterEPKcP12OrtAllocatorPP14OrtLoraAdapter: zero,
+      _ZN7OrtApis26CreateLoraAdapterFromArrayEPKvmP12OrtAllocatorPP14OrtLoraAdapter: zero,
+      _ZN7OrtApis18ReleaseLoraAdapterEP14OrtLoraAdapter: noop,
+
+      // IExecutionProviderFactory::CreateProvider — virtual, never called directly
+      _ZN11onnxruntime25IExecutionProviderFactory14CreateProviderERK17OrtSessionOptionsRK9OrtLogger: zero,
+    },
+
+    wasi_snapshot_preview1: {
+      clock_time_get(_id: number, _prec: bigint, time_ptr: number): number {
+        new DataView(wasm!.memory.buffer).setBigUint64(
+          time_ptr, BigInt(Math.floor(performance.now() * 1e6)), true,
+        );
+        return 0;
+      },
+      environ_get: zero,
+      environ_sizes_get(count_ptr: number, size_ptr: number): number {
+        const v = new DataView(wasm!.memory.buffer);
+        v.setUint32(count_ptr, 0, true);
+        v.setUint32(size_ptr, 0, true);
+        return 0;
+      },
+      fd_close: zero,
+      fd_fdstat_get: zero,
+      fd_fdstat_set_flags: zero,
+      fd_prestat_get(): number { return 8; },
+      fd_prestat_dir_name(): number { return 8; },
+      fd_read: zero,
+      fd_seek: zero,
+      fd_write(_fd: number, iovs_ptr: number, iovs_len: number, nwritten_ptr: number): number {
+        const v = new DataView(wasm!.memory.buffer);
+        const mem = new Uint8Array(wasm!.memory.buffer);
+        let written = 0;
+        for (let i = 0; i < iovs_len; i++) {
+          const ptr = v.getUint32(iovs_ptr + i * 8, true);
+          const len = v.getUint32(iovs_ptr + i * 8 + 4, true);
+          console.log(new TextDecoder().decode(mem.subarray(ptr, ptr + len)));
+          written += len;
+        }
+        v.setUint32(nwritten_ptr, written, true);
+        return 0;
+      },
+      path_filestat_get(): number { return 8; },
+      path_readlink(): number { return 8; },
+      poll_oneoff: zero,
+      proc_exit(code: number): void { throw new Error(`WASM exit: ${code}`); },
+      sched_yield: zero,
+    },
+  };
+
   const response = await fetch(WASM_URL);
-  const { instance } = await WebAssembly.instantiateStreaming(response, jsepImports);
+  const { instance } = await WebAssembly.instantiateStreaming(response, imports);
   wasm = instance.exports as unknown as OrtExports;
 
-  // Initialize WASI runtime
-  try { wasm._start(); } catch (_) { /* proc_exit throws by design */ }
+  try { wasm._start(); } catch { /* proc_exit throws by design */ }
 
-  // Initialize ORT runtime
-  const rc = wasm.OrtInit(1, 3); // 1 thread, warning level logging
-  if (rc !== 0) throw new Error(`OrtInit failed with code ${rc}`);
+  const rc = wasm.OrtInit(1, 3);
+  if (rc !== 0) throw new Error(`OrtInit failed: ${rc}`);
 
   return wasm;
 }
 
 export function getWasm(): OrtExports {
-  if (!wasm) throw new Error("ORT not initialized — call initOrt() first");
+  if (!wasm) throw new Error("ORT not initialized");
   return wasm;
 }
 

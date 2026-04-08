@@ -21,6 +21,17 @@ public:
   bool operator!() const { return true; }
 };
 
+class fstream : public stringstream {
+public:
+  fstream() = default;
+  explicit fstream(const char*, ios_base::openmode = ios_base::in | ios_base::out) {}
+  explicit fstream(const string&, ios_base::openmode = ios_base::in | ios_base::out) {}
+  template<class P> explicit fstream(const P&, ios_base::openmode m = ios_base::in | ios_base::out) {}
+  bool is_open() const { return false; }
+  template<class T> void open(const T&, ios_base::openmode = ios_base::in | ios_base::out) {}
+  void close() {}
+};
+
 class ifstream : public istringstream {
 public:
   ifstream() = default;

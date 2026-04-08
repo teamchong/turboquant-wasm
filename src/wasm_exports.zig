@@ -237,7 +237,6 @@ export fn tq_stream_bytes_per_vector(handle: i32) u32 {
 // ---------------------------------------------------------------------------
 // Memory allocation exports
 // ---------------------------------------------------------------------------
->>>>>>> cc115ab (feat: add TQStream WASM exports and JS wrapper)
 
 /// Allocate bytes in WASM linear memory (for JS to write into).
 export fn tq_alloc(len: u32) ?[*]u8 {

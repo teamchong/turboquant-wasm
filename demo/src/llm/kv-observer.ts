@@ -12,17 +12,18 @@ export interface KVStats {
 /**
  * TQ-compressed KV cache that replaces transformers.js DynamicCache.
  *
- * Uses a Proxy: when ONNX writes KV tensors, they're compressed into TQStream.
+ * Uses a Proxy: when ONNX writes CPU KV tensors, they're compressed into TQStream.
  * When ONNX reads KV tensors, they're decompressed on-demand from TQStream.
- * No full float tensors are stored persistently — only compressed bytes.
+ * GPU tensors pass through unmodified (compression happens on CPU data only).
  */
 function createCompressedCache(
   streams: Map<string, TQStream>,
   tqInstances: Map<number, TurboQuant>,
 ): Record<string, any> {
   const meta: Map<string, { batch: number; heads: number; headDim: number }> = new Map();
+  const target = Object.create(null);
 
-  return new Proxy(Object.create(null), {
+  return new Proxy(target, {
     set(_target, prop: string, value: any) {
       if (!prop.startsWith("past_key_values") || !(value instanceof Tensor)) {
         _target[prop] = value;
@@ -30,13 +31,10 @@ function createCompressedCache(
       }
 
       const tensor = value;
-      if (tensor.location !== "cpu") {
-        _target[prop] = value;
-        return true;
-      }
-
       const dims = tensor.dims as number[];
-      if (dims.length !== 4) {
+
+      // Only compress CPU f32 tensors with 4D shape [batch, heads, seq, headDim]
+      if (tensor.location !== "cpu" || dims.length !== 4) {
         _target[prop] = value;
         return true;
       }
@@ -44,28 +42,32 @@ function createCompressedCache(
       const [batch, heads, seqLen, headDim] = dims;
       const data = tensor.data as Float32Array;
 
+      // Check if TQ supports this headDim
+      const tq = tqInstances.get(headDim);
+      if (!tq) {
+        _target[prop] = value;
+        return true;
+      }
+
       let stream = streams.get(prop);
       if (!stream) {
-        const tq = tqInstances.get(headDim);
-        if (!tq) { _target[prop] = value; return true; }
         stream = tq.createStream(128);
         streams.set(prop, stream);
       }
 
-      // Streaming compress + decode — O(1) per new position
+      // Compress new positions only
       while (stream.length < seqLen) {
         const pos = stream.length;
         stream.append(data.subarray(pos * headDim, (pos + 1) * headDim));
       }
 
       meta.set(prop, { batch, heads, headDim });
-
-      // Don't store the tensor. Compressed data in TQStream is the store.
+      // Remove from _target if we now own this key in streams
+      delete _target[prop];
       return true;
     },
 
     get(_target, prop: string) {
-      // Non-KV properties (methods like get_seq_length, dispose, etc.)
       if (!prop.startsWith("past_key_values")) {
         if (prop === "get_seq_length") {
           return () => {
@@ -76,43 +78,46 @@ function createCompressedCache(
           };
         }
         if (prop === "dispose") {
-          return async () => {}; // Nothing to dispose — no GPU tensors
+          return async () => {};
         }
         return _target[prop];
       }
 
+      // Check streams first (compressed path)
       const stream = streams.get(prop);
-      if (!stream || stream.length === 0) return undefined;
+      if (stream && stream.length > 0) {
+        const m = meta.get(prop);
+        if (!m) return undefined;
+        const seqLen = stream.length;
+        const data = new Float32Array(seqLen * m.headDim);
+        for (let i = 0; i < seqLen; i++) {
+          data.set(stream.decodePosition(i), i * m.headDim);
+        }
+        return new Tensor("float32", data, [m.batch, m.heads, seqLen, m.headDim]);
+      }
 
-      const m = meta.get(prop);
-      if (!m) return undefined;
-
-      // TQStream's decompressed buffer IS the KV store — view directly, no copy
-      const seqLen = stream.length;
-      const view = stream.getDecompressed(0, seqLen);
-      return new Tensor("float32", view, [m.batch, m.heads, seqLen, m.headDim]);
+      // Fall back to raw tensor (GPU path or unsupported dim)
+      return _target[prop];
     },
 
     has(_target, prop: string) {
       if (prop.startsWith("past_key_values")) {
-        return streams.has(prop);
+        return streams.has(prop) || prop in _target;
       }
       return prop in _target;
     },
 
     ownKeys(_target) {
-      const keys = Object.keys(_target);
-      for (const name of streams.keys()) {
-        if (!keys.includes(name)) keys.push(name);
-      }
-      return keys;
+      const keys = new Set(Object.keys(_target));
+      for (const name of streams.keys()) keys.add(name);
+      return [...keys];
     },
 
     getOwnPropertyDescriptor(_target, prop: string) {
-      if (streams.has(prop)) {
+      if (streams.has(prop) || prop in _target) {
         return { configurable: true, enumerable: true, writable: true };
       }
-      return Object.getOwnPropertyDescriptor(_target, prop);
+      return undefined;
     },
   });
 }
@@ -129,43 +134,42 @@ export class KVCompressor {
     const originalGetPKV = model.getPastKeyValues.bind(model);
     const self = this;
 
+    let proxy: Record<string, any> | null = null;
+
     model.getPastKeyValues = function (decoderResults: any, pastKeyValues: any, disposeEncoderPKVs: boolean) {
-      // Let original extract present_* → past_key_values.* naming
       const cache = originalGetPKV(decoderResults, pastKeyValues, disposeEncoderPKVs);
 
-      // First call: create compressed cache and populate from ONNX's initial output
-      if (self.callCount === 0) {
-        const compressed = createCompressedCache(self.streams, self.tqInstances);
+      // New generation or first call — create fresh proxy
+      if (!pastKeyValues || pastKeyValues !== proxy) {
+        // Reset streams for new generation
+        for (const stream of self.streams.values()) stream.rewind(0);
+        self.streams.clear();
+
+        proxy = createCompressedCache(self.streams, self.tqInstances);
         for (const [name, tensor] of Object.entries(cache) as [string, any][]) {
-          compressed[name] = tensor;
+          proxy[name] = tensor;
         }
         self.callCount++;
-        return compressed;
+        return proxy;
       }
 
-      // Subsequent calls: cache IS already the proxy. Write new tensors into it.
-      // getPastKeyValues creates a new DynamicCache each time, but we need to
-      // write the new present_* tensors into our existing proxy.
+      // Continuing generation — write new KV into existing proxy
       for (const [name, tensor] of Object.entries(cache) as [string, any][]) {
         if (name.startsWith("past_key_values")) {
-          pastKeyValues[name] = tensor; // Write into the proxy (triggers compress)
+          proxy[name] = tensor;
         }
       }
 
       self.callCount++;
-      if (self.callCount % 10 === 0) {
-        const s = self.getStats();
-        console.log(`TQ KV step=${self.callCount}: ${s.compressedBytes} compressed, ${s.uncompressedBytes} uncompressed, ${s.ratio.toFixed(1)}x`);
-      }
-
-      return pastKeyValues; // Return the proxy, not the new DynamicCache
+      return proxy;
     };
 
     return true;
   }
 
   async waitForInit(): Promise<void> {
-    for (const dim of [256, 512]) {
+    // Common head dimensions for LLMs
+    for (const dim of [64, 128, 256, 512]) {
       if (!this.tqInstances.has(dim)) {
         const tq = await TurboQuant.init({ dim, seed: 42 });
         this.tqInstances.set(dim, tq);
