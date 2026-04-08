@@ -42,6 +42,7 @@ interface TurboQuantExports {
   tq_decode(handle: number, compPtr: number, compLen: number, outLenPtr: number): number;
   tq_dot(handle: number, queryPtr: number, dim: number, compPtr: number, compLen: number): number;
   tq_dot_batch(handle: number, queryPtr: number, dim: number, compPtr: number, bytesPerVector: number, numVectors: number, outScoresPtr: number): void;
+  tq_rotate_query(handle: number, queryPtr: number, dim: number, outPtr: number): void;
   tq_alloc(len: number): number;
   tq_free(ptr: number, len: number): void;
   tq_alloc_f32(count: number): number;
@@ -296,6 +297,38 @@ export class TurboQuant {
     this.#scoresOut!.set(new Float32Array(ex.memory.buffer, this.#scoresPtr, numVectors));
 
     return this.#scoresOut!;
+  }
+
+  /**
+   * Rotate a query vector into TQ's internal rotation space.
+   * Used by WebGPU path: the rotated query is uploaded as a GPU uniform,
+   * then the compute shader computes dot products directly on compressed data.
+   */
+  rotateQuery(query: Float32Array): Float32Array {
+    if (query.length !== this.dim) {
+      throw new Error(`TurboQuant: expected ${this.dim} dims, got ${query.length}`);
+    }
+    const ex = this.#ex;
+
+    // Reuse cached query buffer
+    if (this.#queryLen !== query.byteLength) {
+      if (this.#queryPtr) ex.tq_free(this.#queryPtr, this.#queryLen);
+      this.#queryPtr = ex.tq_alloc(query.byteLength);
+      if (!this.#queryPtr) throw new Error("TurboQuant: WASM alloc failed for query");
+      this.#queryLen = query.byteLength;
+    }
+    new Float32Array(ex.memory.buffer, this.#queryPtr, query.length).set(query);
+
+    const outPtr = ex.tq_alloc_f32(this.dim);
+    if (!outPtr) throw new Error("TurboQuant: WASM alloc failed for rotated query");
+
+    ex.tq_rotate_query(this.#handle, this.#queryPtr, this.dim, outPtr);
+
+    const rotated = new Float32Array(this.dim);
+    rotated.set(new Float32Array(ex.memory.buffer, outPtr, this.dim));
+    ex.tq_free_f32(outPtr, this.dim);
+
+    return rotated;
   }
 
   /** Release engine resources. Call when done. Safe to call multiple times. */

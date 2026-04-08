@@ -12,6 +12,11 @@
       "import": "./dist/index.js",
       "default": "./dist/index.js"
     },
+    "./gpu": {
+      "types": "./dist/gpu-index.d.ts",
+      "import": "./dist/gpu-index.js",
+      "default": "./dist/gpu-index.js"
+    },
     "./turboquant.wasm": "./dist/turboquant.wasm"
   },
   "files": [
@@ -26,7 +31,7 @@
     "build:opt": "wasm-opt -Oz --strip-producers --strip-target-features dist/turboquant.wasm -o dist/turboquant.wasm --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals --enable-relaxed-simd",
     "build:embed": "node scripts/embed-wasm.mjs",
     "build:types": "bun x tsc --emitDeclarationOnly",
-    "build:js": "bun build src/js/index.ts --outdir dist --target node --format esm --minify --sourcemap=external && bun run build:types",
+    "build:js": "bun build src/js/index.ts src/js/gpu-index.ts --outdir dist --target browser --format esm --minify --sourcemap=external && bun run build:types",
     "build": "bun run build:zig && bun run build:opt && bun run build:embed && bun run build:js",
     "test:zig": "zig test src/turboquant.zig",
     "prepublishOnly": "bun run build"
@@ -51,6 +56,7 @@
   "license": "MIT",
   "devDependencies": {
     "@types/node": "^22.0.0",
+    "@webgpu/types": "^0.1.69",
     "typescript": "^5.7.0"
   }
 }

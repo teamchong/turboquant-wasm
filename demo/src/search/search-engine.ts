@@ -1,9 +1,11 @@
 /**
  * Search engine: TQ compressed dot-product search vs brute-force comparison.
  * Pre-allocates reusable buffers to avoid GC pressure between searches.
+ * Optionally uses WebGPU for GPU-accelerated dot product scan.
  */
 
 import type { SearchData } from "./data-loader.js";
+import { TQGpuIndex } from "turboquant-wasm/gpu";
 
 export interface SearchResult {
   index: number;
@@ -14,9 +16,18 @@ export interface SearchResult {
 export interface SearchComparison {
   tqResults: SearchResult[];
   bruteResults: SearchResult[] | null;
+  gpuResults: SearchResult[] | null;
   tqTimeMs: number;
   bruteTimeMs: number | null;
+  gpuTimeMs: number | null;
   recallAtK: number | null;
+}
+
+let gpuIndex: TQGpuIndex | null = null;
+
+export async function initGpuSearch(data: SearchData): Promise<boolean> {
+  gpuIndex = await TQGpuIndex.create(data.tq, data.compressedConcat, data.bytesPerVector);
+  return gpuIndex !== null;
 }
 
 // Pre-allocated buffers (created once, reused across searches)
@@ -54,13 +65,14 @@ function topKFromScores(scores: Float32Array, k: number, n: number): number[] {
   return topK;
 }
 
-export function search(
+export async function search(
   query: Float32Array,
   data: SearchData,
   topK: number = 10,
-): SearchComparison {
+): Promise<SearchComparison> {
   ensureBuffers(data.numVectors);
 
+  // CPU TQ search
   const tqStart = performance.now();
   const tqScores = data.tq.dotBatch(query, data.compressedConcat, data.bytesPerVector);
   const tqTimeMs = performance.now() - tqStart;
@@ -72,6 +84,24 @@ export function search(
     score: tqScores[i],
   }));
 
+  // GPU TQ search
+  let gpuResults: SearchResult[] | null = null;
+  let gpuTimeMs: number | null = null;
+
+  if (gpuIndex) {
+    const gpuStart = performance.now();
+    const gpuScores = await gpuIndex.dotBatchGpu(query);
+    gpuTimeMs = performance.now() - gpuStart;
+
+    const gpuTopK = topKFromScores(gpuScores, topK, data.numVectors);
+    gpuResults = gpuTopK.map((i) => ({
+      index: i,
+      passage: data.passages[i],
+      score: gpuScores[i],
+    }));
+  }
+
+  // Brute-force baseline
   let bruteResults: SearchResult[] | null = null;
   let bruteTimeMs: number | null = null;
   let recallAtK: number | null = null;
@@ -101,5 +131,5 @@ export function search(
     recallAtK = matches / topK;
   }
 
-  return { tqResults, bruteResults, tqTimeMs, bruteTimeMs, recallAtK };
+  return { tqResults, bruteResults, gpuResults, tqTimeMs, bruteTimeMs, gpuTimeMs, recallAtK };
 }

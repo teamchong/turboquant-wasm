@@ -7,7 +7,7 @@
  */
 
 import { loadSearchData, type SearchData } from "./data-loader.js";
-import { search, type SearchComparison } from "./search-engine.js";
+import { search, initGpuSearch, type SearchComparison } from "./search-engine.js";
 import { initEmbedder, embedQuery } from "./embedder.js";
 
 const SUGGESTED_QUERIES = [
@@ -67,7 +67,10 @@ function renderIndexStats(data: SearchData) {
 function renderSearchInfo(comparison: SearchComparison, embedMs: number) {
   const parts: string[] = [];
   parts.push(`Embed: ${embedMs.toFixed(0)}ms`);
-  parts.push(`TQ search: <span class="fast">${comparison.tqTimeMs.toFixed(1)}ms</span>`);
+  parts.push(`TQ CPU: <span class="fast">${comparison.tqTimeMs.toFixed(1)}ms</span>`);
+  if (comparison.gpuTimeMs !== null) {
+    parts.push(`TQ GPU: <span class="fast">${comparison.gpuTimeMs.toFixed(1)}ms</span>`);
+  }
   if (comparison.bruteTimeMs !== null) {
     parts.push(`Brute: ${comparison.bruteTimeMs.toFixed(1)}ms`);
   }
@@ -171,6 +174,15 @@ async function main() {
   showLoading("Loading search index...");
   const data = await loadSearchData((msg) => showLoading(msg));
 
+  // Initialize WebGPU search (falls back gracefully)
+  showLoading("Initializing WebGPU...");
+  const gpuReady = await initGpuSearch(data);
+  if (gpuReady) {
+    console.log("WebGPU search initialized");
+  } else {
+    console.warn("WebGPU unavailable — CPU-only mode");
+  }
+
   // Load pre-computed query embeddings (tiny, always works)
   showLoading("Loading query embeddings...");
   try {
@@ -207,7 +219,7 @@ async function main() {
     }
     const embedMs = performance.now() - embedStart;
 
-    const comparison = search(queryVec, data, 10);
+    const comparison = await search(queryVec, data, 10);
     renderSearchInfo(comparison, embedMs);
     renderResults(comparison);
   }

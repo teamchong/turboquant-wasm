@@ -112,6 +112,17 @@ export fn tq_dot_batch(
     engine_ptr.dotBatch(q, compressed, bytes_per_vector, num_vectors, scores);
 }
 
+/// Rotate a query vector into TQ's internal rotation space.
+/// GPU needs this as a uniform for computing dot products on compressed data.
+/// out_ptr must have space for dim floats.
+export fn tq_rotate_query(handle: i32, query_ptr: [*]const f32, dim: u32, out_ptr: [*]f32) void {
+    const idx = resolveHandle(handle) orelse return;
+    const engine_ptr = engine_slots[idx] orelse return;
+    const q = query_ptr[0..dim];
+    const out = out_ptr[0..dim];
+    engine_ptr.rot_op.rotate(q, out);
+}
+
 /// Allocate bytes in WASM linear memory (for JS to write into).
 export fn tq_alloc(len: u32) ?[*]u8 {
     const slice = wasm_allocator.alloc(u8, len) catch return null;
