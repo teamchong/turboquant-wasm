@@ -52,8 +52,13 @@ body {
   position: relative;
 }
 
+.search-row {
+  display: flex;
+  gap: 8px;
+}
+
 #search-box input {
-  width: 100%;
+  flex: 1;
   padding: 14px 16px;
   font-size: 1rem;
   font-family: inherit;
@@ -66,6 +71,23 @@ body {
 }
 
 #search-box input:focus {
+  border-color: #4fc3f7;
+}
+
+#dataset-selector {
+  padding: 8px 12px;
+  font-size: 0.8rem;
+  font-family: inherit;
+  background: #1a1a1a;
+  color: #e0e0e0;
+  border: 1px solid #333;
+  border-radius: 8px;
+  outline: none;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+#dataset-selector:hover {
   border-color: #4fc3f7;
 }
 
@@ -284,4 +306,20 @@ body {
 
 .demo-nav a:hover {
   text-decoration: underline;
+}
+
+.brute-disabled {
+  color: #ff9800;
+  font-size: 0.7rem;
+}
+
+.brute-disabled-msg {
+  padding: 24px 16px;
+  text-align: center;
+  color: #888;
+  font-size: 0.85rem;
+  line-height: 1.6;
+  background: #111;
+  border: 1px dashed #333;
+  border-radius: 8px;
 }

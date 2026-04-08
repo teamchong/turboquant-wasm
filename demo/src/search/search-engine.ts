@@ -1,9 +1,11 @@
 /**
- * Search engine: TQ compressed dot-product search vs brute-force comparison.
- * Pre-allocates reusable buffers to avoid GC pressure between searches.
+ * Search engine: TQ vector search vs brute-force f32 baseline.
+ * Both paths use WebGPU when available — fair apple-to-apple comparison.
+ * Brute-force is disabled when raw vectors exceed GPU buffer limits.
  */
 
 import type { SearchData } from "./data-loader.js";
+import { BruteGpuIndex } from "turboquant-wasm/gpu";
 
 export interface SearchResult {
   index: number;
@@ -17,11 +19,13 @@ export interface SearchComparison {
   tqTimeMs: number;
   bruteTimeMs: number | null;
   recallAtK: number | null;
+  bruteDisabledReason: string | null;
 }
 
-// Pre-allocated buffers (created once, reused across searches)
+let bruteGpu: BruteGpuIndex | null = null;
 let bruteScoresBuffer: Float32Array | null = null;
 let usedBuffer: Uint8Array | null = null;
+let bruteDisabledReason: string | null = null;
 
 function ensureBuffers(n: number) {
   if (!bruteScoresBuffer || bruteScoresBuffer.length < n) {
@@ -32,7 +36,6 @@ function ensureBuffers(n: number) {
   }
 }
 
-// O(n*k) partial selection — avoids full O(n log n) sort for small k
 function topKFromScores(scores: Float32Array, k: number, n: number): number[] {
   const topK: number[] = [];
   usedBuffer!.fill(0, 0, n);
@@ -54,15 +57,31 @@ function topKFromScores(scores: Float32Array, k: number, n: number): number[] {
   return topK;
 }
 
-export function search(
+function formatBytes(bytes: number): string {
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(0)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+/** Reset GPU state. Call when switching datasets. */
+export function resetSearch(): void {
+  if (bruteGpu) {
+    bruteGpu.destroy();
+    bruteGpu = null;
+  }
+  bruteScoresBuffer = null;
+  usedBuffer = null;
+  bruteDisabledReason = null;
+}
+
+export async function search(
   query: Float32Array,
   data: SearchData,
   topK: number = 10,
-): SearchComparison {
+): Promise<SearchComparison> {
   ensureBuffers(data.numVectors);
 
   const tqStart = performance.now();
-  const tqScores = data.tq.dotBatch(query, data.compressedConcat, data.bytesPerVector);
+  const tqScores = await data.tq.dotBatch(query, data.compressedConcat, data.bytesPerVector);
   const tqTimeMs = performance.now() - tqStart;
 
   const tqTopK = topKFromScores(tqScores, topK, data.numVectors);
@@ -77,23 +96,53 @@ export function search(
   let recallAtK: number | null = null;
 
   if (data.rawVectors) {
-    const scores = bruteScoresBuffer!;
-    const bruteStart = performance.now();
-    for (let i = 0; i < data.numVectors; i++) {
-      let dot = 0;
-      const base = i * data.dim;
-      for (let d = 0; d < data.dim; d++) {
-        dot += query[d] * data.rawVectors[base + d];
+    // Init GPU brute-force on first call
+    if (!bruteGpu && !bruteDisabledReason && typeof navigator !== "undefined" && navigator.gpu) {
+      try {
+        const adapter = await navigator.gpu.requestAdapter();
+        if (adapter) {
+          const rawBytes = data.rawVectors.byteLength;
+          const maxSize = adapter.limits.maxStorageBufferBindingSize;
+          if (rawBytes > maxSize) {
+            bruteDisabledReason =
+              `Raw vectors (${formatBytes(rawBytes)}) exceed GPU buffer limit (${formatBytes(maxSize)}) — TQ compressed: ${formatBytes(data.compressedSizeBytes)}`;
+          } else {
+            const device = await adapter.requestDevice();
+            bruteGpu = await BruteGpuIndex.create(device, data.rawVectors, data.dim);
+          }
+        }
+      } catch {
+        /* fall back to JS */
       }
-      scores[i] = dot;
+    }
+
+    const bruteStart = performance.now();
+    let scores: Float32Array;
+
+    if (bruteGpu) {
+      scores = await bruteGpu.dotBatch(query);
+    } else if (!bruteDisabledReason) {
+      // CPU fallback
+      scores = bruteScoresBuffer!;
+      for (let i = 0; i < data.numVectors; i++) {
+        let dot = 0;
+        const base = i * data.dim;
+        for (let d = 0; d < data.dim; d++) {
+          dot += query[d] * data.rawVectors[base + d];
+        }
+        scores[i] = dot;
+      }
+    } else {
+      // Brute-force disabled — skip
+      return { tqResults, bruteResults: null, tqTimeMs, bruteTimeMs: null, recallAtK: null, bruteDisabledReason };
     }
     bruteTimeMs = performance.now() - bruteStart;
 
-    const bruteTopK = topKFromScores(scores, topK, data.numVectors);
+    const bruteTopK = topKFromScores(scores!, topK, data.numVectors);
     bruteResults = bruteTopK.map((i) => ({
       index: i,
       passage: data.passages[i],
-      score: scores[i],
+      score: scores![i],
     }));
 
     const bruteSet = new Set(bruteTopK);
@@ -101,5 +150,5 @@ export function search(
     recallAtK = matches / topK;
   }
 
-  return { tqResults, bruteResults, tqTimeMs, bruteTimeMs, recallAtK };
+  return { tqResults, bruteResults, tqTimeMs, bruteTimeMs, recallAtK, bruteDisabledReason };
 }

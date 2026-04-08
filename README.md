@@ -20,9 +20,11 @@ TurboQuant compresses them 6x (1.5GB → 240MB) and searches directly on compres
 ## What this adds
 
 - **npm package** with embedded WASM — `npm install turboquant-wasm`
+- **WebGPU acceleration** — `dotBatch()` auto-detects WebGPU and dispatches a compute shader that scans compressed vectors directly on GPU, no decompression
+- **CPU fallback** — transparent fallback to WASM relaxed SIMD when WebGPU is unavailable
 - **Relaxed SIMD** — `@mulAdd` FMA maps to `f32x4.relaxed_madd`
 - **SIMD-vectorized** QJL sign packing/unpacking and scaling
-- **TypeScript API** — `TurboQuant.init()` / `encode()` / `decode()` / `dot()`
+- **TypeScript API** — `TurboQuant.init()` / `encode()` / `decode()` / `dot()` / `dotBatch()`
 - **Golden-value tests** — byte-identical output with the reference Zig implementation
 
 ## Browser Requirements
@@ -52,9 +54,9 @@ const decoded = tq.decode(compressed);
 // Fast dot product without decoding
 const score = tq.dot(queryVector, compressed);
 
-// Batch search: one WASM call for all vectors (83x faster than looping dot())
+// Batch search: auto-uses WebGPU when available, falls back to WASM SIMD
 const allCompressed = new Uint8Array(/* concatenated compressed vectors */);
-const scores = tq.dotBatch(queryVector, allCompressed, bytesPerVector);
+const scores = await tq.dotBatch(queryVector, allCompressed, bytesPerVector);
 
 tq.destroy();
 ```
@@ -67,10 +69,13 @@ class TurboQuant {
   encode(vector: Float32Array): Uint8Array;
   decode(compressed: Uint8Array): Float32Array;
   dot(query: Float32Array, compressed: Uint8Array): number;
-  dotBatch(query: Float32Array, compressedConcat: Uint8Array, bytesPerVector: number): Float32Array;
+  dotBatch(query: Float32Array, compressedConcat: Uint8Array, bytesPerVector: number): Promise<Float32Array>;
+  rotateQuery(query: Float32Array): Float32Array;
   destroy(): void;
 }
 ```
+
+`dotBatch()` transparently uses WebGPU when available (Chrome 113+, Edge 113+). The GPU compute shader reads compressed data directly — no decompression step. Falls back to WASM SIMD on devices without WebGPU.
 
 ## Building
 

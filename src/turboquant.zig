@@ -158,6 +158,72 @@ pub const Engine = struct {
 
         return polar_sum + qjl_sum;
     }
+
+    /// Batch dot product: pre-rotates query once, then scans all compressed vectors.
+    /// compressed_concat is a flat buffer of num_vectors * bytes_per_vector bytes.
+    pub fn dotBatch(
+        e: *Engine,
+        q: []const f32,
+        compressed_concat: []const u8,
+        bytes_per_vector: usize,
+        num_vectors: usize,
+        out_scores: []f32,
+    ) void {
+        if (q.len != e.dim or num_vectors == 0) return;
+
+        // Pre-rotate query once
+        e.rot_op.rotate(q, e.scratch_rotated);
+        const rotated_q = e.scratch_rotated;
+
+        // Parse first header for fixed layout (all vectors share same structure)
+        const first = compressed_concat[0..bytes_per_vector];
+        const h0 = format.readHeader(first) catch return;
+        const polar_len = h0.polar_bytes;
+        const polar_off = format.HEADER_SIZE;
+        const qjl_off = polar_off + polar_len;
+        const qjl_len = h0.qjl_bytes;
+
+        // Precompute q_sum for QJL fast path (SIMD reduction)
+        var q_sum: f32 = 0;
+        const d = rotated_q.len;
+        const lane: usize = comptime if (is_aarch64) 4 else 4;
+        {
+            var sum_vec: @Vector(lane, f32) = @splat(0);
+            var si: usize = 0;
+            while (si + lane <= d) : (si += lane) {
+                sum_vec += rotated_q[si..][0..lane].*;
+            }
+            q_sum = @reduce(.Add, sum_vec);
+            while (si < d) : (si += 1) q_sum += rotated_q[si];
+        }
+
+        for (0..num_vectors) |i| {
+            const base = i * bytes_per_vector;
+            const blob = compressed_concat[base .. base + bytes_per_vector];
+
+            // Prefetch next vector's data while processing current one.
+            // On aarch64 this maps to PRFM; on other targets it's a hint that may be ignored.
+            if (i + 1 < num_vectors) {
+                const next_base = (i + 1) * bytes_per_vector;
+                @prefetch(compressed_concat.ptr + next_base + polar_off, .{ .rw = .read, .locality = 2, .cache = .data });
+            }
+
+            // Read max_r and gamma directly from header bytes 14-21
+            const max_r: f32 = @bitCast(std.mem.readInt(u32, blob[14..18], .little));
+            const gamma: f32 = @bitCast(std.mem.readInt(u32, blob[18..22], .little));
+
+            const polar_data = blob[polar_off .. polar_off + polar_len];
+            const qjl_data = blob[qjl_off .. qjl_off + qjl_len];
+
+            const polar_sum = polar.dotProduct(rotated_q, polar_data, max_r);
+            const qjl_sum = qjl.estimateDotFast(rotated_q, qjl_data, gamma, q_sum);
+
+            out_scores[i] = polar_sum + qjl_sum;
+        }
+    }
+
+    const builtin = @import("builtin");
+    const is_aarch64 = builtin.cpu.arch == .aarch64;
 };
 
 fn computeResidualFromPolar(polar_encoded: []const u8, rotated: []const f32, max_r: f32, residual: []f32) void {
@@ -666,4 +732,123 @@ test "distortion: dot product preservation" {
     // Mean absolute dot product error for unit vectors should be small
     // (well under 1.0 for dim=128)
     try std.testing.expect(mean_err < 1.0);
+}
+
+test "dotBatch matches individual dot calls" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 256;
+    const n: usize = 50;
+
+    var engine = try Engine.init(allocator, .{ .dim = dim, .seed = 42 });
+    defer engine.deinit(allocator);
+
+    var rng = std.Random.DefaultPrng.init(99);
+    const r = rng.random();
+
+    // Generate and encode vectors
+    var all_compressed = std.ArrayListUnmanaged(u8){};
+    defer all_compressed.deinit(allocator);
+    var individual_compressed: [n][]u8 = undefined;
+    var encoded_count: usize = 0;
+    var bpv: usize = 0;
+
+    for (0..n) |v| {
+        var vec: [dim]f32 = undefined;
+        var ns: f32 = 0;
+        for (0..dim) |d| {
+            vec[d] = r.float(f32) * 2 - 1;
+            ns += vec[d] * vec[d];
+        }
+        const inv = 1.0 / @sqrt(ns);
+        for (0..dim) |d| vec[d] *= inv;
+
+        const c = try engine.encode(allocator, &vec);
+        individual_compressed[v] = c;
+        try all_compressed.appendSlice(allocator, c);
+        bpv = c.len;
+        encoded_count += 1;
+    }
+    defer for (0..encoded_count) |v| allocator.free(individual_compressed[v]);
+
+    var query: [dim]f32 = undefined;
+    for (0..dim) |d| query[d] = r.float(f32) * 2 - 1;
+
+    // Individual dot calls
+    var individual_scores: [n]f32 = undefined;
+    for (0..n) |v| {
+        individual_scores[v] = engine.dot(&query, individual_compressed[v]);
+    }
+
+    // Batch dot call
+    var batch_scores: [n]f32 = undefined;
+    engine.dotBatch(&query, all_compressed.items, bpv, n, &batch_scores);
+
+    // Verify they match
+    for (0..n) |v| {
+        const diff = @abs(individual_scores[v] - batch_scores[v]);
+        try std.testing.expect(diff < 1e-5);
+    }
+}
+
+test "dotBatch benchmark vs dot" {
+    const allocator = std.testing.allocator;
+    const dim: usize = 256;
+    const n: usize = 1000;
+    const iters: usize = 100;
+
+    var engine = try Engine.init(allocator, .{ .dim = dim, .seed = 42 });
+    defer engine.deinit(allocator);
+
+    var rng = std.Random.DefaultPrng.init(42);
+    const r = rng.random();
+
+    var all = std.ArrayListUnmanaged(u8){};
+    defer all.deinit(allocator);
+    var singles: [n][]u8 = undefined;
+    var bpv: usize = 0;
+
+    for (0..n) |v| {
+        var vec: [dim]f32 = undefined;
+        var ns: f32 = 0;
+        for (0..dim) |d| {
+            vec[d] = r.float(f32) * 2 - 1;
+            ns += vec[d] * vec[d];
+        }
+        const inv = 1.0 / @sqrt(ns);
+        for (0..dim) |d| vec[d] *= inv;
+        const c = try engine.encode(allocator, &vec);
+        singles[v] = c;
+        try all.appendSlice(allocator, c);
+        bpv = c.len;
+    }
+    defer for (0..n) |v| allocator.free(singles[v]);
+
+    var query: [dim]f32 = undefined;
+    for (0..dim) |d| query[d] = r.float(f32) * 2 - 1;
+
+    const scores = try allocator.alloc(f32, n);
+    defer allocator.free(scores);
+
+    // Benchmark individual dot
+    var timer = try std.time.Timer.start();
+    for (0..iters) |_| {
+        for (0..n) |v| {
+            scores[v] = engine.dot(&query, singles[v]);
+        }
+    }
+    const dot_ns = timer.read();
+    const dot_us = @as(f64, @floatFromInt(dot_ns)) / 1000.0 / @as(f64, iters);
+
+    // Benchmark dotBatch
+    timer = try std.time.Timer.start();
+    for (0..iters) |_| {
+        engine.dotBatch(&query, all.items, bpv, n, scores);
+    }
+    const batch_ns = timer.read();
+    const batch_us = @as(f64, @floatFromInt(batch_ns)) / 1000.0 / @as(f64, iters);
+
+    std.debug.print("\n=== dot vs dotBatch (dim={}, N={}) ===\n", .{ dim, n });
+    std.debug.print("dot:      {d:.1} us ({d:.2} us/vec)\n", .{ dot_us, dot_us / @as(f64, n) });
+    std.debug.print("dotBatch: {d:.1} us ({d:.2} us/vec)\n", .{ batch_us, batch_us / @as(f64, n) });
+    std.debug.print("speedup:  {d:.1}x\n", .{dot_us / batch_us});
 }

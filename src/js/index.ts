@@ -19,6 +19,7 @@
  *   tq.destroy();
  */
 
+import type { TQGpuIndex } from "./gpu-index.js";
 import { wasmBase64 } from "./turboquant-wasm.generated.js";
 
 function decodeBase64(b64: string): Uint8Array {
@@ -42,6 +43,7 @@ interface TurboQuantExports {
   tq_decode(handle: number, compPtr: number, compLen: number, outLenPtr: number): number;
   tq_dot(handle: number, queryPtr: number, dim: number, compPtr: number, compLen: number): number;
   tq_dot_batch(handle: number, queryPtr: number, dim: number, compPtr: number, bytesPerVector: number, numVectors: number, outScoresPtr: number): void;
+  tq_rotate_query(handle: number, queryPtr: number, dim: number, outPtr: number): void;
   tq_alloc(len: number): number;
   tq_free(ptr: number, len: number): void;
   tq_alloc_f32(count: number): number;
@@ -100,6 +102,7 @@ function wasmWriteF32(ex: TurboQuantExports, data: Float32Array): number {
 function wasmWriteU8(ex: TurboQuantExports, data: Uint8Array): number {
   const ptr = ex.tq_alloc(data.length);
   if (!ptr) throw new Error("TurboQuant: WASM alloc failed");
+  // Re-read ex.memory.buffer AFTER alloc — it may have grown and detached the old buffer.
   new Uint8Array(ex.memory.buffer, ptr, data.length).set(data);
   return ptr;
 }
@@ -138,6 +141,10 @@ export class TurboQuant {
   #scoresOut: Float32Array | null = null;
   #queryPtr: number = 0;
   #queryLen: number = 0;
+  #rotOutPtr: number = 0;
+  #gpuIndex: TQGpuIndex | null = null;
+  #gpuChecked = false;
+  #gpuDataRef: Uint8Array | null = null;
 
   private constructor(ex: TurboQuantExports, handle: number, dim: number) {
     this.#ex = ex;
@@ -252,14 +259,28 @@ export class TurboQuant {
    * @returns Float32Array of scores, one per vector.
    *   The returned array is reused across calls — copy with .slice() if you need to retain it.
    */
-  dotBatch(query: Float32Array, compressedConcat: Uint8Array, bytesPerVector: number): Float32Array {
+  async dotBatch(query: Float32Array, compressedConcat: Uint8Array, bytesPerVector: number): Promise<Float32Array> {
+    // Auto-detect WebGPU on first call or when data changes
+    if (!this.#gpuChecked || compressedConcat !== this.#gpuDataRef) {
+      this.#gpuChecked = true;
+      if (this.#gpuIndex) { this.#gpuIndex.destroy(); this.#gpuIndex = null; }
+      if (typeof navigator !== "undefined" && navigator.gpu) {
+        return this.#initGpuAndSearch(query, compressedConcat, bytesPerVector);
+      }
+    }
+    if (this.#gpuIndex) {
+      return this.#gpuIndex.dotBatchGpu(query);
+    }
+    return this.#cpuDotBatch(query, compressedConcat, bytesPerVector);
+  }
+
+  #cpuDotBatch(query: Float32Array, compressedConcat: Uint8Array, bytesPerVector: number): Float32Array {
     if (query.length !== this.dim) {
       throw new Error(`TurboQuant: expected ${this.dim} dims, got ${query.length}`);
     }
     const numVectors = Math.floor(compressedConcat.length / bytesPerVector);
     const ex = this.#ex;
 
-    // Cache index in WASM — skip copy if same buffer
     if (compressedConcat !== this.#cachedRef || bytesPerVector !== this.#cachedBpv) {
       if (this.#cachedPtr) ex.tq_free(this.#cachedPtr, this.#cachedLen);
       this.#cachedPtr = wasmWriteU8(ex, compressedConcat);
@@ -268,7 +289,6 @@ export class TurboQuant {
       this.#cachedBpv = bytesPerVector;
     }
 
-    // Cache scores buffer in WASM — reuse across calls
     if (this.#scoresCount !== numVectors) {
       if (this.#scoresPtr) ex.tq_free_f32(this.#scoresPtr, this.#scoresCount);
       this.#scoresPtr = ex.tq_alloc_f32(numVectors);
@@ -277,7 +297,6 @@ export class TurboQuant {
       this.#scoresOut = new Float32Array(numVectors);
     }
 
-    // Cache query buffer in WASM — reuse across calls with same dim
     if (this.#queryLen !== query.byteLength) {
       if (this.#queryPtr) ex.tq_free(this.#queryPtr, this.#queryLen);
       this.#queryPtr = ex.tq_alloc(query.byteLength);
@@ -291,16 +310,63 @@ export class TurboQuant {
       this.#cachedPtr, bytesPerVector, numVectors, this.#scoresPtr,
     );
 
-    // Read scores from WASM into reusable JS buffer
-    // Safe: tq_dot_batch doesn't allocate, so memory.buffer isn't detached
     this.#scoresOut!.set(new Float32Array(ex.memory.buffer, this.#scoresPtr, numVectors));
-
     return this.#scoresOut!;
+  }
+
+  async #initGpuAndSearch(query: Float32Array, compressedConcat: Uint8Array, bytesPerVector: number): Promise<Float32Array> {
+    try {
+      const { TQGpuIndex } = await import("./gpu-index.js");
+      this.#gpuIndex = await TQGpuIndex.create(this, compressedConcat as Uint8Array, bytesPerVector);
+      this.#gpuDataRef = compressedConcat;
+    } catch (e) {
+      console.warn("TurboQuant: WebGPU init failed, using CPU SIMD", e);
+    }
+    if (this.#gpuIndex) {
+      return this.#gpuIndex.dotBatchGpu(query);
+    }
+    return this.#cpuDotBatch(query, compressedConcat, bytesPerVector);
+  }
+
+  /**
+   * Rotate a query vector into TQ's internal rotation space.
+   * Used by WebGPU path: the rotated query is uploaded as a GPU uniform,
+   * then the compute shader computes dot products directly on compressed data.
+   */
+  rotateQuery(query: Float32Array): Float32Array {
+    if (query.length !== this.dim) {
+      throw new Error(`TurboQuant: expected ${this.dim} dims, got ${query.length}`);
+    }
+    const ex = this.#ex;
+
+    // Reuse cached query buffer
+    if (this.#queryLen !== query.byteLength) {
+      if (this.#queryPtr) ex.tq_free(this.#queryPtr, this.#queryLen);
+      this.#queryPtr = ex.tq_alloc(query.byteLength);
+      if (!this.#queryPtr) throw new Error("TurboQuant: WASM alloc failed for query");
+      this.#queryLen = query.byteLength;
+    }
+    new Float32Array(ex.memory.buffer, this.#queryPtr, query.length).set(query);
+
+    if (!this.#rotOutPtr) {
+      this.#rotOutPtr = ex.tq_alloc_f32(this.dim);
+      if (!this.#rotOutPtr) throw new Error("TurboQuant: WASM alloc failed for rotated query");
+    }
+
+    ex.tq_rotate_query(this.#handle, this.#queryPtr, this.dim, this.#rotOutPtr);
+
+    const rotated = new Float32Array(this.dim);
+    rotated.set(new Float32Array(ex.memory.buffer, this.#rotOutPtr, this.dim));
+    return rotated;
   }
 
   /** Release engine resources. Call when done. Safe to call multiple times. */
   destroy(): void {
-    if (!this.#handle && this.#handle !== 0) return;
+    if (this.#handle < 0) return;
+    if (this.#gpuIndex) {
+      this.#gpuIndex.destroy();
+      this.#gpuIndex = null;
+    }
     if (this.#cachedPtr) {
       this.#ex.tq_free(this.#cachedPtr, this.#cachedLen);
       this.#cachedPtr = 0;
@@ -314,6 +380,10 @@ export class TurboQuant {
     if (this.#queryPtr) {
       this.#ex.tq_free(this.#queryPtr, this.#queryLen);
       this.#queryPtr = 0;
+    }
+    if (this.#rotOutPtr) {
+      this.#ex.tq_free_f32(this.#rotOutPtr, this.dim);
+      this.#rotOutPtr = 0;
     }
     this.#ex.tq_engine_destroy(this.#handle);
     this.#handle = -1;

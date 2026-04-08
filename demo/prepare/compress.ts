@@ -2,9 +2,12 @@
 /**
  * Compress raw float32 embeddings with TurboQuant.
  *
- * Usage: bun run prepare/compress.ts
- * Input:  data/embeddings.bin (flat float32 array)
- * Output: data/compressed.tqv (TQ-compressed vectors with header)
+ * Usage:
+ *   bun run prepare/compress.ts                                    # data/ → data/
+ *   bun run prepare/compress.ts --dir public/data/wiki-50k         # custom dir
+ *
+ * Input:  <dir>/embeddings.bin (flat float32 array)
+ * Output: <dir>/compressed.tqv (TQ-compressed vectors with header)
  *
  * .tqv format:
  *   Header (17 bytes):
@@ -23,13 +26,16 @@ import { TurboQuant } from "turboquant-wasm";
 const DIM = 384;
 const SEED = 42;
 
+const dirIdx = Bun.argv.indexOf("--dir");
+const DATA_DIR = dirIdx >= 0 && Bun.argv[dirIdx + 1] ? Bun.argv[dirIdx + 1] : "data";
+
 async function main() {
-  console.log("Reading embeddings.bin...");
-  const file = Bun.file("data/embeddings.bin");
+  console.log(`Reading ${DATA_DIR}/embeddings.bin...`);
+  const file = Bun.file(`${DATA_DIR}/embeddings.bin`);
   const buffer = await file.arrayBuffer();
   const raw = new Float32Array(buffer);
   const numVectors = raw.length / DIM;
-  console.log(`  ${numVectors} vectors, dim=${DIM}`);
+  console.log(`  ${numVectors.toLocaleString()} vectors, dim=${DIM}`);
 
   console.log("Initializing TurboQuant...");
   const tq = await TurboQuant.init({ dim: DIM, seed: SEED });
@@ -77,7 +83,7 @@ async function main() {
   output.set(hBytes, 0);
   output.set(body, 17);
 
-  await Bun.write("data/compressed.tqv", output);
+  await Bun.write(`${DATA_DIR}/compressed.tqv`, output);
 
   const originalMB = (numVectors * DIM * 4) / 1e6;
   const compressedMB = output.byteLength / 1e6;
@@ -86,7 +92,7 @@ async function main() {
   console.log(`  Original:     ${originalMB.toFixed(1)} MB`);
   console.log(`  Compressed:   ${compressedMB.toFixed(1)} MB`);
   console.log(`  Ratio:        ${(originalMB / compressedMB).toFixed(1)}x`);
-  console.log(`  Output:       data/compressed.tqv`);
+  console.log(`  Output:       ${DATA_DIR}/compressed.tqv`);
 }
 
 main().catch((err) => {
