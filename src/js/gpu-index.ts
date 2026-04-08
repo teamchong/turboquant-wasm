@@ -117,20 +117,20 @@ export class TQGpuIndex {
       let filled = 0;
       while (filled < 17) {
         const { done, value } = await reader.read();
-        if (done) return null;
+        if (done) { device.destroy(); return null; }
         const take = Math.min(17 - filled, value.length);
         headerBuf.set(value.subarray(0, take), filled);
         filled += take;
         if (value.length > take) leftover = new Uint8Array(value.subarray(take));
       }
       const hv = new DataView(headerBuf.buffer);
-      if (headerBuf[0] !== 0x54 || headerBuf[1] !== 0x51 || headerBuf[2] !== 0x56) return null;
+      if (headerBuf[0] !== 0x54 || headerBuf[1] !== 0x51 || headerBuf[2] !== 0x56) { device.destroy(); return null; }
       numVectors = hv.getUint32(5, true);
       dim = hv.getUint16(9, true);
       bpv = hv.getUint16(15, true);
     } else {
       // Uint8Array — raw compressed vectors, no TQV header
-      if (!bytesPerVector) return null;
+      if (!bytesPerVector) { device.destroy(); return null; }
       bpv = bytesPerVector;
       numVectors = Math.floor(source.length / bpv);
       dim = readU32(source, 1); // from first vector's format header
@@ -139,7 +139,7 @@ export class TQGpuIndex {
       }).getReader();
     }
 
-    if (numVectors === 0) return null;
+    if (numVectors === 0) { device.destroy(); return null; }
 
     const blobU32sPerVec = Math.ceil(bpv / 4);
     const alignedBpv = alignU32(bpv);
