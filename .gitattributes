@@ -6,4 +6,3 @@ demo/public/data/scene.ply filter=lfs diff=lfs merge=lfs -text
 demo/public/data/scene.tqply filter=lfs diff=lfs merge=lfs -text
 demo/public/data/lego.ply filter=lfs diff=lfs merge=lfs -text
 demo/public/data/lego.tqply filter=lfs diff=lfs merge=lfs -text
-demo/public/data/wiki-50k/embeddings.bin filter=lfs diff=lfs merge=lfs -text
