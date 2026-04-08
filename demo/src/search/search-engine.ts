@@ -1,7 +1,9 @@
 /**
- * Search engine: TQ compressed dot-product search vs brute-force comparison.
- * Pre-allocates reusable buffers to avoid GC pressure between searches.
- * Optionally uses WebGPU for GPU-accelerated dot product scan.
+ * Search engine: TQ vector search (GPU+SIMD) vs brute-force f32 baseline.
+ *
+ * Single code path: WebGPU compute shader scans compressed vectors,
+ * WASM SIMD handles query rotation. Brute-force runs on raw f32 vectors
+ * as an honest apple-to-apple comparison (same query, same top-k).
  */
 
 import type { SearchData } from "./data-loader.js";
@@ -16,10 +18,8 @@ export interface SearchResult {
 export interface SearchComparison {
   tqResults: SearchResult[];
   bruteResults: SearchResult[] | null;
-  gpuResults: SearchResult[] | null;
   tqTimeMs: number;
   bruteTimeMs: number | null;
-  gpuTimeMs: number | null;
   recallAtK: number | null;
 }
 
@@ -30,7 +30,7 @@ export async function initGpuSearch(data: SearchData): Promise<boolean> {
   return gpuIndex !== null;
 }
 
-// Pre-allocated buffers (created once, reused across searches)
+// Pre-allocated buffers (reused across searches)
 let bruteScoresBuffer: Float32Array | null = null;
 let usedBuffer: Uint8Array | null = null;
 
@@ -72,10 +72,14 @@ export async function search(
 ): Promise<SearchComparison> {
   ensureBuffers(data.numVectors);
 
-  // CPU TQ search
+  // TQ search: GPU compute shader on compressed data + WASM SIMD rotation
+  // rotateQuery() runs on CPU (WASM SIMD), dot product scan runs on GPU
   const tqStart = performance.now();
-  const tqScores = data.tq.dotBatch(query, data.compressedConcat, data.bytesPerVector);
+  const tqScores = gpuIndex
+    ? await gpuIndex.dotBatchGpu(query)
+    : data.tq.dotBatch(query, data.compressedConcat, data.bytesPerVector);
   const tqTimeMs = performance.now() - tqStart;
+
 
   const tqTopK = topKFromScores(tqScores, topK, data.numVectors);
   const tqResults: SearchResult[] = tqTopK.map((i) => ({
@@ -84,24 +88,7 @@ export async function search(
     score: tqScores[i],
   }));
 
-  // GPU TQ search
-  let gpuResults: SearchResult[] | null = null;
-  let gpuTimeMs: number | null = null;
-
-  if (gpuIndex) {
-    const gpuStart = performance.now();
-    const gpuScores = await gpuIndex.dotBatchGpu(query);
-    gpuTimeMs = performance.now() - gpuStart;
-
-    const gpuTopK = topKFromScores(gpuScores, topK, data.numVectors);
-    gpuResults = gpuTopK.map((i) => ({
-      index: i,
-      passage: data.passages[i],
-      score: gpuScores[i],
-    }));
-  }
-
-  // Brute-force baseline
+  // Brute-force baseline: plain JS loop over raw f32 vectors
   let bruteResults: SearchResult[] | null = null;
   let bruteTimeMs: number | null = null;
   let recallAtK: number | null = null;
@@ -131,5 +118,5 @@ export async function search(
     recallAtK = matches / topK;
   }
 
-  return { tqResults, bruteResults, gpuResults, tqTimeMs, bruteTimeMs, gpuTimeMs, recallAtK };
+  return { tqResults, bruteResults, tqTimeMs, bruteTimeMs, recallAtK };
 }

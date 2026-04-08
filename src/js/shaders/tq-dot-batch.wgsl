@@ -1,37 +1,27 @@
 // TurboQuant WebGPU compute shader — batch dot product on compressed vectors.
 //
-// One workgroup (64 threads) per compressed vector.
-// Each thread processes a subset of polar pairs and QJL bits,
-// then a tree reduction produces the final score.
-//
-// Polar: 7 bits per pair (4 radius + 3 angle), LSB-first.
-//   score_polar = Σ (q[2i]*dx + q[2i+1]*dy) where (dx,dy) = lut[bits] * max_r
-//
-// QJL: 1 bit per dimension, LSB-first.
-//   score_qjl = (2 * Σ q[i] where bit=1 - q_sum) * sqrt(π/2) / dim * gamma
+// Each vector is stored as a full blob: [32-byte header][polar][qjl][padding]
+// One workgroup (64 threads) per vector.
+// Polar: 7 bits per pair, LSB-first. QJL: 1 bit per dimension, LSB-first.
 
 struct Config {
   num_vectors: u32,
   dim: u32,
-  polar_u32s_per_vec: u32,
-  qjl_u32s_per_vec: u32,
+  blob_u32s_per_vec: u32,
+  polar_byte_offset: u32,
+  qjl_byte_offset: u32,
   q_sum: f32,
   _pad0: u32,
   _pad1: u32,
-  _pad2: u32,
 }
 
-// Database (uploaded once)
-@group(0) @binding(0) var<storage, read> polar_data: array<u32>;
-@group(0) @binding(1) var<storage, read> qjl_data: array<u32>;
-@group(0) @binding(2) var<storage, read> params: array<vec2<f32>>;  // (max_r, gamma) per vector
+@group(0) @binding(0) var<storage, read> blob_data: array<u32>;
+@group(0) @binding(1) var<storage, read> params: array<vec2<f32>>;
 
-// Per-query (updated each search)
-@group(1) @binding(0) var<storage, read> query: array<f32>;  // rotated query, dim floats
+@group(1) @binding(0) var<storage, read> query: array<f32>;
 @group(1) @binding(1) var<uniform> config: Config;
 @group(1) @binding(2) var<storage, read_write> scores: array<f32>;
 
-// Static LUT (128 entries of vec2<f32>)
 @group(2) @binding(0) var<storage, read> polar_lut: array<vec2<f32>, 128>;
 
 const WG_SIZE: u32 = 64u;
@@ -40,18 +30,19 @@ const SQRT_PI_OVER_2: f32 = 1.2533141;
 var<workgroup> polar_partial: array<f32, 64>;
 var<workgroup> qjl_partial: array<f32, 64>;
 
-// Extract 7 bits from the polar bitstream at the given bit position.
-// polar_data is u32-packed, LSB-first.
-fn extract7(polar_offset: u32, bit_pos: u32) -> u32 {
-  let word_idx = polar_offset + bit_pos / 32u;
-  let bit_off = bit_pos % 32u;
-  let w0 = polar_data[word_idx];
-  if (bit_off <= 25u) {
-    return (w0 >> bit_off) & 0x7Fu;
-  }
-  // 7 bits span two u32 words
-  let w1 = polar_data[word_idx + 1u];
-  return ((w0 >> bit_off) | (w1 << (32u - bit_off))) & 0x7Fu;
+fn read_byte(blob_offset: u32, byte_off: u32) -> u32 {
+  let word_idx = blob_offset + byte_off / 4u;
+  let shift = (byte_off % 4u) * 8u;
+  return (blob_data[word_idx] >> shift) & 0xFFu;
+}
+
+fn extract7(blob_offset: u32, polar_start_byte: u32, bit_pos: u32) -> u32 {
+  let byte_idx = polar_start_byte + bit_pos / 8u;
+  let bit_off = bit_pos % 8u;
+  let b0 = read_byte(blob_offset, byte_idx);
+  let b1 = read_byte(blob_offset, byte_idx + 1u);
+  let window = b0 | (b1 << 8u);
+  return (window >> bit_off) & 0x7Fu;
 }
 
 @compute @workgroup_size(64)
@@ -72,15 +63,15 @@ fn main(
   let gamma = p.y;
 
   let num_pairs = dim / 2u;
-  let polar_offset = vec_id * config.polar_u32s_per_vec;
-  let qjl_offset = vec_id * config.qjl_u32s_per_vec;
+  let blob_offset = vec_id * config.blob_u32s_per_vec;
+  let polar_start = config.polar_byte_offset;
+  let qjl_start = config.qjl_byte_offset;
 
-  // Each thread handles ceil(num_pairs / WG_SIZE) polar pairs
   var p_sum: f32 = 0.0;
   var pair_idx = tid;
   while (pair_idx < num_pairs) {
     let bit_pos = pair_idx * 7u;
-    let combined = extract7(polar_offset, bit_pos);
+    let combined = extract7(blob_offset, polar_start, bit_pos);
     let lut_val = polar_lut[combined];
     let dx = lut_val.x * max_r;
     let dy = lut_val.y * max_r;
@@ -91,25 +82,22 @@ fn main(
     pair_idx += WG_SIZE;
   }
 
-  // Each thread handles ceil(dim / WG_SIZE) QJL bits
-  // Fast path: accumulate q[i] where bit=1
   var pos_sum: f32 = 0.0;
   var d_idx = tid;
   while (d_idx < dim) {
-    let word_idx = qjl_offset + d_idx / 32u;
-    let bit_off = d_idx % 32u;
-    let bit = (qjl_data[word_idx] >> bit_off) & 1u;
+    let byte_off = qjl_start + d_idx / 8u;
+    let bit_off = d_idx % 8u;
+    let byte_val = read_byte(blob_offset, byte_off);
+    let bit = (byte_val >> bit_off) & 1u;
     pos_sum += query[d_idx] * f32(bit);
 
     d_idx += WG_SIZE;
   }
 
-  // Store partial sums for reduction
   polar_partial[tid] = p_sum;
   qjl_partial[tid] = pos_sum;
   workgroupBarrier();
 
-  // Tree reduction (log2(64) = 6 steps)
   for (var stride: u32 = 32u; stride > 0u; stride >>= 1u) {
     if (tid < stride) {
       polar_partial[tid] += polar_partial[tid + stride];
@@ -118,7 +106,6 @@ fn main(
     workgroupBarrier();
   }
 
-  // Thread 0 writes the final score
   if (tid == 0u) {
     let polar_total = polar_partial[0];
     let pos_total = qjl_partial[0];

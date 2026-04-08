@@ -101,6 +101,7 @@ function wasmWriteF32(ex: TurboQuantExports, data: Float32Array): number {
 function wasmWriteU8(ex: TurboQuantExports, data: Uint8Array): number {
   const ptr = ex.tq_alloc(data.length);
   if (!ptr) throw new Error("TurboQuant: WASM alloc failed");
+  // Re-read ex.memory.buffer AFTER alloc — it may have grown and detached the old buffer.
   new Uint8Array(ex.memory.buffer, ptr, data.length).set(data);
   return ptr;
 }

@@ -24,6 +24,7 @@ const SUGGESTED_QUERIES = [
 
 let precomputedEmbeddings: Record<string, number[]> | null = null;
 let embedderReady = false;
+let gpuReady = false;
 
 function showLoading(msg: string) {
   const overlay = document.getElementById("loading-overlay")!;
@@ -67,10 +68,8 @@ function renderIndexStats(data: SearchData) {
 function renderSearchInfo(comparison: SearchComparison, embedMs: number) {
   const parts: string[] = [];
   parts.push(`Embed: ${embedMs.toFixed(0)}ms`);
-  parts.push(`TQ CPU: <span class="fast">${comparison.tqTimeMs.toFixed(1)}ms</span>`);
-  if (comparison.gpuTimeMs !== null) {
-    parts.push(`TQ GPU: <span class="fast">${comparison.gpuTimeMs.toFixed(1)}ms</span>`);
-  }
+  const tqLabel = gpuReady ? "TQ (GPU+SIMD)" : "TQ (SIMD)";
+  parts.push(`${tqLabel}: <span class="fast">${comparison.tqTimeMs.toFixed(1)}ms</span>`);
   if (comparison.bruteTimeMs !== null) {
     parts.push(`Brute: ${comparison.bruteTimeMs.toFixed(1)}ms`);
   }
@@ -176,7 +175,7 @@ async function main() {
 
   // Initialize WebGPU search (falls back gracefully)
   showLoading("Initializing WebGPU...");
-  const gpuReady = await initGpuSearch(data);
+  gpuReady = await initGpuSearch(data);
   if (gpuReady) {
     console.log("WebGPU search initialized");
   } else {
