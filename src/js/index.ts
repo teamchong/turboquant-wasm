@@ -316,7 +316,7 @@ export class TurboQuant {
   async #initGpuAndSearch(query: Float32Array, compressedConcat: Uint8Array, bytesPerVector: number): Promise<Float32Array> {
     try {
       const { TQGpuIndex } = await import("./gpu-index.js");
-      this.#gpuIndex = await TQGpuIndex.create(this, compressedConcat, bytesPerVector);
+      this.#gpuIndex = await TQGpuIndex.create(this, compressedConcat as Uint8Array, bytesPerVector);
       this.#gpuDataRef = compressedConcat;
     } catch (e) {
       console.warn("TurboQuant: WebGPU init failed, using CPU SIMD", e);

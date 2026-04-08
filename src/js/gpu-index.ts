@@ -92,53 +92,62 @@ export class TQGpuIndex {
   get dim(): number { return this.#dim; }
 
   /**
-   * Stream compressed vectors from a .tqv fetch Response directly to GPU.
-   * Never loads the full dataset into JS memory — only one vector at a time.
+   * Stream compressed vectors to GPU. Accepts:
+   * - Response: streams .tqv from fetch (17-byte TQV header + vectors)
+   * - Uint8Array: raw concatenated compressed vectors (no TQV header, needs bytesPerVector)
+   *
+   * Never holds the full dataset in JS memory — one vector at a time.
    */
-  static async createFromStream(
+  static async create(
     tq: TurboQuant,
-    response: Response,
+    source: Response | Uint8Array,
+    bytesPerVector?: number,
   ): Promise<TQGpuIndex | null> {
     if (typeof navigator === "undefined" || !navigator.gpu) return null;
     const adapter = await navigator.gpu.requestAdapter();
     if (!adapter) return null;
     const device = await adapter.requestDevice();
 
-    const reader = response.body!.getReader();
-
-    // Accumulate the 17-byte TQV header
-    let headerBuf = new Uint8Array(17);
-    let headerFilled = 0;
+    let reader: ReadableStreamDefaultReader<Uint8Array>;
+    let numVectors: number;
+    let dim: number;
+    let bpv: number;
     let leftover = new Uint8Array(0);
 
-    while (headerFilled < 17) {
-      const { done, value } = await reader.read();
-      if (done) return null;
-      const needed = 17 - headerFilled;
-      const take = Math.min(needed, value.length);
-      headerBuf.set(value.subarray(0, take), headerFilled);
-      headerFilled += take;
-      if (value.length > take) {
-        leftover = value.subarray(take);
+    if (source instanceof Response) {
+      // Stream from fetch — parse 17-byte TQV header first
+      reader = source.body!.getReader();
+      const headerBuf = new Uint8Array(17);
+      let filled = 0;
+      while (filled < 17) {
+        const { done, value } = await reader.read();
+        if (done) return null;
+        const take = Math.min(17 - filled, value.length);
+        headerBuf.set(value.subarray(0, take), filled);
+        filled += take;
+        if (value.length > take) leftover = new Uint8Array(value.subarray(take));
       }
+      const hv = new DataView(headerBuf.buffer);
+      if (headerBuf[0] !== 0x54 || headerBuf[1] !== 0x51 || headerBuf[2] !== 0x56) return null;
+      numVectors = hv.getUint32(5, true);
+      dim = hv.getUint16(9, true);
+      bpv = hv.getUint16(15, true);
+    } else {
+      // Uint8Array — raw compressed vectors, no TQV header
+      if (!bytesPerVector) return null;
+      bpv = bytesPerVector;
+      numVectors = Math.floor(source.length / bpv);
+      dim = readU32(source, 1); // from first vector's format header
+      reader = new ReadableStream<Uint8Array>({
+        start(c) { c.enqueue(source); c.close(); },
+      }).getReader();
     }
 
-    // Parse TQV header
-    const hv = new DataView(headerBuf.buffer);
-    const magic = headerBuf.subarray(0, 4);
-    if (magic[0] !== 0x54 || magic[1] !== 0x51 || magic[2] !== 0x56 || magic[3] !== 0x00) {
-      return null;
-    }
-    const numVectors = hv.getUint32(5, true);
-    const dim = hv.getUint16(9, true);
-    const bytesPerVector = hv.getUint16(15, true);
     if (numVectors === 0) return null;
 
-    const polarBytes = 0; // read from first vector header below
-    const blobU32sPerVec = Math.ceil(bytesPerVector / 4);
-    const alignedBpv = alignU32(bytesPerVector);
+    const blobU32sPerVec = Math.ceil(bpv / 4);
+    const alignedBpv = alignU32(bpv);
 
-    // Create GPU buffers sized from header
     const blobBuf = device.createBuffer({
       size: numVectors * alignedBpv,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
@@ -148,18 +157,14 @@ export class TQGpuIndex {
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
 
-    // Reusable buffers — only one vector in JS memory at a time
     const vecBuf = new Uint8Array(alignedBpv);
     const paramBuf = new Float32Array(2);
-
-    // Feed loop: accumulate bytesPerVector, write to GPU, repeat
     let pending = leftover;
     let vecIdx = 0;
-    let actualPolarBytes = 0;
+    let polarBytes = 0;
 
     while (vecIdx < numVectors) {
-      // Accumulate until we have one full vector
-      while (pending.length < bytesPerVector) {
+      while (pending.length < bpv) {
         const { done, value } = await reader.read();
         if (done) break;
         const merged = new Uint8Array(pending.length + value.length);
@@ -167,23 +172,19 @@ export class TQGpuIndex {
         merged.set(value, pending.length);
         pending = merged;
       }
-      if (pending.length < bytesPerVector) break;
+      if (pending.length < bpv) break;
 
-      // Write this vector to GPU
       vecBuf.fill(0);
-      vecBuf.set(pending.subarray(0, bytesPerVector));
+      vecBuf.set(pending.subarray(0, bpv));
       device.queue.writeBuffer(blobBuf, vecIdx * alignedBpv, vecBuf);
 
       paramBuf[0] = new DataView(pending.buffer, pending.byteOffset + 14, 4).getFloat32(0, true);
       paramBuf[1] = new DataView(pending.buffer, pending.byteOffset + 18, 4).getFloat32(0, true);
       device.queue.writeBuffer(paramsBuf, vecIdx * 8, paramBuf.buffer);
 
-      // Read polarBytes from first vector
-      if (vecIdx === 0) {
-        actualPolarBytes = readU32(pending, 6);
-      }
+      if (vecIdx === 0) polarBytes = readU32(pending, 6);
 
-      pending = pending.subarray(bytesPerVector);
+      pending = pending.subarray(bpv);
       vecIdx++;
     }
 
@@ -192,62 +193,11 @@ export class TQGpuIndex {
 
     return TQGpuIndex.#finishCreate(
       device, tq, blobBuf, paramsBuf,
-      blobU32sPerVec, actualPolarBytes, bytesPerVector,
+      blobU32sPerVec, polarBytes, bpv,
       vecIdx, dim,
     );
   }
 
-  /**
-   * Create from a pre-loaded Uint8Array (legacy path).
-   * For streaming from fetch, use createFromStream().
-   */
-  static async create(
-    tq: TurboQuant, compressedConcat: Uint8Array, bytesPerVector: number,
-  ): Promise<TQGpuIndex | null> {
-    if (typeof navigator === "undefined" || !navigator.gpu) return null;
-    const adapter = await navigator.gpu.requestAdapter();
-    if (!adapter) return null;
-    const device = await adapter.requestDevice();
-
-    const numVectors = Math.floor(compressedConcat.length / bytesPerVector);
-    if (numVectors === 0) return null;
-
-    const dim = readU32(compressedConcat, 1);
-    const polarBytes = readU32(compressedConcat, 6);
-    const blobU32sPerVec = Math.ceil(bytesPerVector / 4);
-    const alignedBpv = alignU32(bytesPerVector);
-
-    // Stream vectors to GPU one at a time — never allocate the full dataset in JS.
-    // Only hold one vector's worth of aligned bytes + 2 floats for params.
-    const blobBuf = device.createBuffer({
-      size: numVectors * alignedBpv,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
-    const paramsBuf = device.createBuffer({
-      size: numVectors * 8,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
-
-    const vecBuf = new Uint8Array(alignedBpv); // reusable single-vector buffer
-    const paramBuf = new Float32Array(2);
-
-    for (let i = 0; i < numVectors; i++) {
-      const off = i * bytesPerVector;
-      vecBuf.fill(0);
-      vecBuf.set(compressedConcat.subarray(off, off + bytesPerVector));
-      device.queue.writeBuffer(blobBuf, i * alignedBpv, vecBuf);
-
-      paramBuf[0] = readF32(compressedConcat, off + 14);
-      paramBuf[1] = readF32(compressedConcat, off + 18);
-      device.queue.writeBuffer(paramsBuf, i * 8, paramBuf.buffer);
-    }
-
-    return TQGpuIndex.#finishCreate(
-      device, tq, blobBuf, paramsBuf,
-      blobU32sPerVec, polarBytes, bytesPerVector,
-      numVectors, dim,
-    );
-  }
 
   static #finishCreate(
     device: GPUDevice, tq: TurboQuant,
