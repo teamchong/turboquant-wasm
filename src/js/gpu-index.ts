@@ -91,6 +91,116 @@ export class TQGpuIndex {
   get numVectors(): number { return this.#numVectors; }
   get dim(): number { return this.#dim; }
 
+  /**
+   * Stream compressed vectors from a .tqv fetch Response directly to GPU.
+   * Never loads the full dataset into JS memory — only one vector at a time.
+   */
+  static async createFromStream(
+    tq: TurboQuant,
+    response: Response,
+  ): Promise<TQGpuIndex | null> {
+    if (typeof navigator === "undefined" || !navigator.gpu) return null;
+    const adapter = await navigator.gpu.requestAdapter();
+    if (!adapter) return null;
+    const device = await adapter.requestDevice();
+
+    const reader = response.body!.getReader();
+
+    // Accumulate the 17-byte TQV header
+    let headerBuf = new Uint8Array(17);
+    let headerFilled = 0;
+    let leftover = new Uint8Array(0);
+
+    while (headerFilled < 17) {
+      const { done, value } = await reader.read();
+      if (done) return null;
+      const needed = 17 - headerFilled;
+      const take = Math.min(needed, value.length);
+      headerBuf.set(value.subarray(0, take), headerFilled);
+      headerFilled += take;
+      if (value.length > take) {
+        leftover = value.subarray(take);
+      }
+    }
+
+    // Parse TQV header
+    const hv = new DataView(headerBuf.buffer);
+    const magic = headerBuf.subarray(0, 4);
+    if (magic[0] !== 0x54 || magic[1] !== 0x51 || magic[2] !== 0x56 || magic[3] !== 0x00) {
+      return null;
+    }
+    const numVectors = hv.getUint32(5, true);
+    const dim = hv.getUint16(9, true);
+    const bytesPerVector = hv.getUint16(15, true);
+    if (numVectors === 0) return null;
+
+    const polarBytes = 0; // read from first vector header below
+    const blobU32sPerVec = Math.ceil(bytesPerVector / 4);
+    const alignedBpv = alignU32(bytesPerVector);
+
+    // Create GPU buffers sized from header
+    const blobBuf = device.createBuffer({
+      size: numVectors * alignedBpv,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    const paramsBuf = device.createBuffer({
+      size: numVectors * 8,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+
+    // Reusable buffers — only one vector in JS memory at a time
+    const vecBuf = new Uint8Array(alignedBpv);
+    const paramBuf = new Float32Array(2);
+
+    // Feed loop: accumulate bytesPerVector, write to GPU, repeat
+    let pending = leftover;
+    let vecIdx = 0;
+    let actualPolarBytes = 0;
+
+    while (vecIdx < numVectors) {
+      // Accumulate until we have one full vector
+      while (pending.length < bytesPerVector) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const merged = new Uint8Array(pending.length + value.length);
+        merged.set(pending);
+        merged.set(value, pending.length);
+        pending = merged;
+      }
+      if (pending.length < bytesPerVector) break;
+
+      // Write this vector to GPU
+      vecBuf.fill(0);
+      vecBuf.set(pending.subarray(0, bytesPerVector));
+      device.queue.writeBuffer(blobBuf, vecIdx * alignedBpv, vecBuf);
+
+      paramBuf[0] = new DataView(pending.buffer, pending.byteOffset + 14, 4).getFloat32(0, true);
+      paramBuf[1] = new DataView(pending.buffer, pending.byteOffset + 18, 4).getFloat32(0, true);
+      device.queue.writeBuffer(paramsBuf, vecIdx * 8, paramBuf.buffer);
+
+      // Read polarBytes from first vector
+      if (vecIdx === 0) {
+        actualPolarBytes = readU32(pending, 6);
+      }
+
+      pending = pending.subarray(bytesPerVector);
+      vecIdx++;
+    }
+
+    reader.releaseLock();
+    if (vecIdx === 0) return null;
+
+    return TQGpuIndex.#finishCreate(
+      device, tq, blobBuf, paramsBuf,
+      blobU32sPerVec, actualPolarBytes, bytesPerVector,
+      vecIdx, dim,
+    );
+  }
+
+  /**
+   * Create from a pre-loaded Uint8Array (legacy path).
+   * For streaming from fetch, use createFromStream().
+   */
   static async create(
     tq: TurboQuant, compressedConcat: Uint8Array, bytesPerVector: number,
   ): Promise<TQGpuIndex | null> {
@@ -104,33 +214,47 @@ export class TQGpuIndex {
 
     const dim = readU32(compressedConcat, 1);
     const polarBytes = readU32(compressedConcat, 6);
-
     const blobU32sPerVec = Math.ceil(bytesPerVector / 4);
-    const blobPacked = new Uint8Array(numVectors * alignU32(bytesPerVector));
-    const paramsPacked = new Float32Array(numVectors * 2);
+    const alignedBpv = alignU32(bytesPerVector);
+
+    // Stream vectors to GPU one at a time — never allocate the full dataset in JS.
+    // Only hold one vector's worth of aligned bytes + 2 floats for params.
+    const blobBuf = device.createBuffer({
+      size: numVectors * alignedBpv,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    const paramsBuf = device.createBuffer({
+      size: numVectors * 8,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+
+    const vecBuf = new Uint8Array(alignedBpv); // reusable single-vector buffer
+    const paramBuf = new Float32Array(2);
 
     for (let i = 0; i < numVectors; i++) {
       const off = i * bytesPerVector;
-      blobPacked.set(
-        compressedConcat.subarray(off, off + bytesPerVector),
-        i * alignU32(bytesPerVector),
-      );
-      paramsPacked[i * 2] = readF32(compressedConcat, off + 14);
-      paramsPacked[i * 2 + 1] = readF32(compressedConcat, off + 18);
+      vecBuf.fill(0);
+      vecBuf.set(compressedConcat.subarray(off, off + bytesPerVector));
+      device.queue.writeBuffer(blobBuf, i * alignedBpv, vecBuf);
+
+      paramBuf[0] = readF32(compressedConcat, off + 14);
+      paramBuf[1] = readF32(compressedConcat, off + 18);
+      device.queue.writeBuffer(paramsBuf, i * 8, paramBuf.buffer);
     }
 
-    const blobBuf = device.createBuffer({
-      size: blobPacked.byteLength,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
-    device.queue.writeBuffer(blobBuf, 0, blobPacked);
+    return TQGpuIndex.#finishCreate(
+      device, tq, blobBuf, paramsBuf,
+      blobU32sPerVec, polarBytes, bytesPerVector,
+      numVectors, dim,
+    );
+  }
 
-    const paramsBuf = device.createBuffer({
-      size: paramsPacked.byteLength,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
-    });
-    device.queue.writeBuffer(paramsBuf, 0, paramsPacked.buffer);
-
+  static #finishCreate(
+    device: GPUDevice, tq: TurboQuant,
+    blobBuf: GPUBuffer, paramsBuf: GPUBuffer,
+    blobU32sPerVec: number, polarBytes: number, bytesPerVector: number,
+    numVectors: number, dim: number,
+  ): TQGpuIndex {
     const lutData = buildPolarLut();
     const lutBuf = device.createBuffer({
       size: lutData.byteLength,
@@ -157,55 +281,53 @@ export class TQGpuIndex {
 
     const shaderModule = device.createShaderModule({ code: SHADER_SRC });
 
-    const dbBindGroupLayout = device.createBindGroupLayout({
+    const dbBGL = device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
         { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
       ],
     });
-    const queryBindGroupLayout = device.createBindGroupLayout({
+    const queryBGL = device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
         { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
         { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
       ],
     });
-    const lutBindGroupLayout = device.createBindGroupLayout({
+    const lutBGL = device.createBindGroupLayout({
       entries: [
         { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
       ],
     });
 
     const pipeline = device.createComputePipeline({
-      layout: device.createPipelineLayout({
-        bindGroupLayouts: [dbBindGroupLayout, queryBindGroupLayout, lutBindGroupLayout],
-      }),
+      layout: device.createPipelineLayout({ bindGroupLayouts: [dbBGL, queryBGL, lutBGL] }),
       compute: { module: shaderModule, entryPoint: "main" },
     });
 
     const dbBindGroup = device.createBindGroup({
-      layout: dbBindGroupLayout,
+      layout: dbBGL,
       entries: [
         { binding: 0, resource: { buffer: blobBuf } },
         { binding: 1, resource: { buffer: paramsBuf } },
       ],
     });
     const lutBindGroup = device.createBindGroup({
-      layout: lutBindGroupLayout,
+      layout: lutBGL,
       entries: [{ binding: 0, resource: { buffer: lutBuf } }],
     });
 
     const configData = new ArrayBuffer(32);
-    const configView = new DataView(configData);
-    configView.setUint32(0, numVectors, true);
-    configView.setUint32(4, dim, true);
-    configView.setUint32(8, blobU32sPerVec, true);
-    configView.setUint32(12, HEADER_SIZE, true);
-    configView.setUint32(16, HEADER_SIZE + polarBytes, true);
+    const cv = new DataView(configData);
+    cv.setUint32(0, numVectors, true);
+    cv.setUint32(4, dim, true);
+    cv.setUint32(8, blobU32sPerVec, true);
+    cv.setUint32(12, HEADER_SIZE, true);
+    cv.setUint32(16, HEADER_SIZE + polarBytes, true);
     device.queue.writeBuffer(configBuf, 0, configData);
 
     const queryBindGroup = device.createBindGroup({
-      layout: queryBindGroupLayout,
+      layout: queryBGL,
       entries: [
         { binding: 0, resource: { buffer: queryBuf } },
         { binding: 1, resource: { buffer: configBuf } },
