@@ -7,7 +7,7 @@
  */
 
 import { loadSearchData, type SearchData } from "./data-loader.js";
-import { search, initGpuSearch, type SearchComparison } from "./search-engine.js";
+import { search, type SearchComparison } from "./search-engine.js";
 import { initEmbedder, embedQuery } from "./embedder.js";
 
 const SUGGESTED_QUERIES = [
@@ -24,7 +24,6 @@ const SUGGESTED_QUERIES = [
 
 let precomputedEmbeddings: Record<string, number[]> | null = null;
 let embedderReady = false;
-let gpuReady = false;
 
 function showLoading(msg: string) {
   const overlay = document.getElementById("loading-overlay")!;
@@ -68,8 +67,7 @@ function renderIndexStats(data: SearchData) {
 function renderSearchInfo(comparison: SearchComparison, embedMs: number) {
   const parts: string[] = [];
   parts.push(`Embed: ${embedMs.toFixed(0)}ms`);
-  const tqLabel = gpuReady ? "TQ (GPU+SIMD)" : "TQ (SIMD)";
-  parts.push(`${tqLabel}: <span class="fast">${comparison.tqTimeMs.toFixed(1)}ms</span>`);
+  parts.push(`TQ: <span class="fast">${comparison.tqTimeMs.toFixed(1)}ms</span>`);
   if (comparison.bruteTimeMs !== null) {
     parts.push(`Brute: ${comparison.bruteTimeMs.toFixed(1)}ms`);
   }
@@ -173,15 +171,6 @@ async function main() {
   showLoading("Loading search index...");
   const data = await loadSearchData((msg) => showLoading(msg));
 
-  // Initialize WebGPU search (falls back gracefully)
-  showLoading("Initializing WebGPU...");
-  gpuReady = await initGpuSearch(data);
-  if (gpuReady) {
-    console.log("WebGPU search initialized");
-  } else {
-    console.warn("WebGPU unavailable — CPU-only mode");
-  }
-
   // Load pre-computed query embeddings (tiny, always works)
   showLoading("Loading query embeddings...");
   try {
@@ -243,6 +232,12 @@ async function main() {
     input.value = query;
     doSearch(query);
   });
+
+  // Warm up: trigger GPU init for both TQ and brute-force
+  showLoading("Warming up GPU...");
+  const warmupQuery = new Float32Array(data.dim);
+  await search(warmupQuery, data, 1);
+  hideLoading();
 
   // Run initial search with default value
   if (input.value) {

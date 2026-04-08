@@ -140,6 +140,9 @@ export class TurboQuant {
   #scoresOut: Float32Array | null = null;
   #queryPtr: number = 0;
   #queryLen: number = 0;
+  #gpuIndex: any = null;
+  #gpuChecked = false;
+  #gpuDataRef: Uint8Array | null = null;
 
   private constructor(ex: TurboQuantExports, handle: number, dim: number) {
     this.#ex = ex;
@@ -254,14 +257,28 @@ export class TurboQuant {
    * @returns Float32Array of scores, one per vector.
    *   The returned array is reused across calls — copy with .slice() if you need to retain it.
    */
-  dotBatch(query: Float32Array, compressedConcat: Uint8Array, bytesPerVector: number): Float32Array {
+  async dotBatch(query: Float32Array, compressedConcat: Uint8Array, bytesPerVector: number): Promise<Float32Array> {
+    // Auto-detect WebGPU on first call or when data changes
+    if (!this.#gpuChecked || (this.#gpuIndex && compressedConcat !== this.#gpuDataRef)) {
+      this.#gpuChecked = true;
+      if (this.#gpuIndex) { this.#gpuIndex.destroy(); this.#gpuIndex = null; }
+      if (typeof navigator !== "undefined" && navigator.gpu) {
+        return this.#initGpuAndSearch(query, compressedConcat, bytesPerVector);
+      }
+    }
+    if (this.#gpuIndex) {
+      return this.#gpuIndex.dotBatchGpu(query);
+    }
+    return this.#cpuDotBatch(query, compressedConcat, bytesPerVector);
+  }
+
+  #cpuDotBatch(query: Float32Array, compressedConcat: Uint8Array, bytesPerVector: number): Float32Array {
     if (query.length !== this.dim) {
       throw new Error(`TurboQuant: expected ${this.dim} dims, got ${query.length}`);
     }
     const numVectors = Math.floor(compressedConcat.length / bytesPerVector);
     const ex = this.#ex;
 
-    // Cache index in WASM — skip copy if same buffer
     if (compressedConcat !== this.#cachedRef || bytesPerVector !== this.#cachedBpv) {
       if (this.#cachedPtr) ex.tq_free(this.#cachedPtr, this.#cachedLen);
       this.#cachedPtr = wasmWriteU8(ex, compressedConcat);
@@ -270,7 +287,6 @@ export class TurboQuant {
       this.#cachedBpv = bytesPerVector;
     }
 
-    // Cache scores buffer in WASM — reuse across calls
     if (this.#scoresCount !== numVectors) {
       if (this.#scoresPtr) ex.tq_free_f32(this.#scoresPtr, this.#scoresCount);
       this.#scoresPtr = ex.tq_alloc_f32(numVectors);
@@ -279,7 +295,6 @@ export class TurboQuant {
       this.#scoresOut = new Float32Array(numVectors);
     }
 
-    // Cache query buffer in WASM — reuse across calls with same dim
     if (this.#queryLen !== query.byteLength) {
       if (this.#queryPtr) ex.tq_free(this.#queryPtr, this.#queryLen);
       this.#queryPtr = ex.tq_alloc(query.byteLength);
@@ -293,11 +308,22 @@ export class TurboQuant {
       this.#cachedPtr, bytesPerVector, numVectors, this.#scoresPtr,
     );
 
-    // Read scores from WASM into reusable JS buffer
-    // Safe: tq_dot_batch doesn't allocate, so memory.buffer isn't detached
     this.#scoresOut!.set(new Float32Array(ex.memory.buffer, this.#scoresPtr, numVectors));
-
     return this.#scoresOut!;
+  }
+
+  async #initGpuAndSearch(query: Float32Array, compressedConcat: Uint8Array, bytesPerVector: number): Promise<Float32Array> {
+    try {
+      const { TQGpuIndex } = await import("./gpu-index.js");
+      this.#gpuIndex = await TQGpuIndex.create(this, compressedConcat, bytesPerVector);
+      this.#gpuDataRef = compressedConcat;
+    } catch (e) {
+      console.warn("TurboQuant: WebGPU init failed, using CPU SIMD", e);
+    }
+    if (this.#gpuIndex) {
+      return this.#gpuIndex.dotBatchGpu(query);
+    }
+    return this.#cpuDotBatch(query, compressedConcat, bytesPerVector);
   }
 
   /**

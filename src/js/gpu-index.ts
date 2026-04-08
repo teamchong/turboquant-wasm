@@ -8,6 +8,7 @@
 
 import type TurboQuant from "./index.js";
 import SHADER_SRC from "./shaders/tq-dot-batch.wgsl" with { type: "text" };
+import BRUTE_SHADER_SRC from "./shaders/brute-dot-batch.wgsl" with { type: "text" };
 
 // Zig's @sizeOf(packed Header) = 32 due to alignment padding.
 // The serialized header uses bytes 0-21, payload starts at byte 32.
@@ -53,15 +54,17 @@ export class TQGpuIndex {
   #configBuf: GPUBuffer;
   #scoresBuf: GPUBuffer;
   #stagingBuf: GPUBuffer;
-  #queryBindGroupLayout: GPUBindGroupLayout;
+  #queryBindGroup: GPUBindGroup;
   #numVectors: number;
   #dim: number;
   #tq: TurboQuant;
+  #qSumBuf: Float32Array;
+  #resultBuf: Float32Array;
 
   private constructor(
     device: GPUDevice, pipeline: GPUComputePipeline,
     dbBindGroup: GPUBindGroup, lutBindGroup: GPUBindGroup,
-    queryBindGroupLayout: GPUBindGroupLayout,
+    queryBindGroup: GPUBindGroup,
     queryBuf: GPUBuffer, configBuf: GPUBuffer,
     scoresBuf: GPUBuffer, stagingBuf: GPUBuffer,
     numVectors: number, dim: number, tq: TurboQuant,
@@ -70,7 +73,7 @@ export class TQGpuIndex {
     this.#pipeline = pipeline;
     this.#dbBindGroup = dbBindGroup;
     this.#lutBindGroup = lutBindGroup;
-    this.#queryBindGroupLayout = queryBindGroupLayout;
+    this.#queryBindGroup = queryBindGroup;
     this.#queryBuf = queryBuf;
     this.#configBuf = configBuf;
     this.#scoresBuf = scoresBuf;
@@ -78,6 +81,8 @@ export class TQGpuIndex {
     this.#numVectors = numVectors;
     this.#dim = dim;
     this.#tq = tq;
+    this.#qSumBuf = new Float32Array(1);
+    this.#resultBuf = new Float32Array(numVectors);
   }
 
   get numVectors(): number { return this.#numVectors; }
@@ -196,8 +201,17 @@ export class TQGpuIndex {
     configView.setUint32(16, HEADER_SIZE + polarBytes, true);
     device.queue.writeBuffer(configBuf, 0, configData);
 
+    const queryBindGroup = device.createBindGroup({
+      layout: queryBindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: queryBuf } },
+        { binding: 1, resource: { buffer: configBuf } },
+        { binding: 2, resource: { buffer: scoresBuf } },
+      ],
+    });
+
     return new TQGpuIndex(
-      device, pipeline, dbBindGroup, lutBindGroup, queryBindGroupLayout,
+      device, pipeline, dbBindGroup, lutBindGroup, queryBindGroup,
       queryBuf, configBuf, scoresBuf, stagingBuf,
       numVectors, dim, tq,
     );
@@ -210,34 +224,148 @@ export class TQGpuIndex {
     for (let i = 0; i < rotated.length; i++) qSum += rotated[i];
 
     this.#device.queue.writeBuffer(this.#queryBuf, 0, rotated.buffer);
-    this.#device.queue.writeBuffer(this.#configBuf, 20, new Float32Array([qSum]).buffer);
-
-    const queryBindGroup = this.#device.createBindGroup({
-      layout: this.#queryBindGroupLayout,
-      entries: [
-        { binding: 0, resource: { buffer: this.#queryBuf } },
-        { binding: 1, resource: { buffer: this.#configBuf } },
-        { binding: 2, resource: { buffer: this.#scoresBuf } },
-      ],
-    });
+    this.#qSumBuf[0] = qSum;
+    this.#device.queue.writeBuffer(this.#configBuf, 20, this.#qSumBuf.buffer);
 
     const encoder = this.#device.createCommandEncoder();
     const pass = encoder.beginComputePass();
     pass.setPipeline(this.#pipeline);
     pass.setBindGroup(0, this.#dbBindGroup);
-    pass.setBindGroup(1, queryBindGroup);
+    pass.setBindGroup(1, this.#queryBindGroup);
     pass.setBindGroup(2, this.#lutBindGroup);
-    pass.dispatchWorkgroups(this.#numVectors);
+    pass.dispatchWorkgroups(Math.ceil(this.#numVectors / 256));
     pass.end();
 
     encoder.copyBufferToBuffer(this.#scoresBuf, 0, this.#stagingBuf, 0, this.#numVectors * 4);
     this.#device.queue.submit([encoder.finish()]);
 
     await this.#stagingBuf.mapAsync(GPUMapMode.READ);
-    const result = new Float32Array(this.#stagingBuf.getMappedRange().slice(0));
+    this.#resultBuf.set(new Float32Array(this.#stagingBuf.getMappedRange()));
     this.#stagingBuf.unmap();
 
-    return result;
+    return this.#resultBuf;
+  }
+
+  destroy(): void {
+    this.#queryBuf.destroy();
+    this.#configBuf.destroy();
+    this.#scoresBuf.destroy();
+    this.#stagingBuf.destroy();
+  }
+}
+
+/**
+ * BruteGpuIndex — WebGPU brute-force dot product on raw f32 vectors.
+ * Fair baseline comparison: same GPU dispatch overhead as TQGpuIndex.
+ */
+export class BruteGpuIndex {
+  #device: GPUDevice;
+  #pipeline: GPUComputePipeline;
+  #bindGroup: GPUBindGroup;
+  #queryBuf: GPUBuffer;
+  #configBuf: GPUBuffer;
+  #scoresBuf: GPUBuffer;
+  #stagingBuf: GPUBuffer;
+  #numVectors: number;
+  #resultBuf: Float32Array;
+
+  private constructor(
+    device: GPUDevice, pipeline: GPUComputePipeline, bindGroup: GPUBindGroup,
+    queryBuf: GPUBuffer, configBuf: GPUBuffer,
+    scoresBuf: GPUBuffer, stagingBuf: GPUBuffer,
+    numVectors: number,
+  ) {
+    this.#device = device;
+    this.#pipeline = pipeline;
+    this.#bindGroup = bindGroup;
+    this.#queryBuf = queryBuf;
+    this.#configBuf = configBuf;
+    this.#scoresBuf = scoresBuf;
+    this.#stagingBuf = stagingBuf;
+    this.#numVectors = numVectors;
+    this.#resultBuf = new Float32Array(numVectors);
+  }
+
+  static async create(
+    device: GPUDevice, rawVectors: Float32Array, dim: number,
+  ): Promise<BruteGpuIndex> {
+    const numVectors = rawVectors.length / dim;
+
+    const vecBuf = device.createBuffer({
+      size: rawVectors.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(vecBuf, 0, rawVectors.buffer);
+
+    const queryBuf = device.createBuffer({
+      size: dim * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    const configBuf = device.createBuffer({
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    const scoresBuf = device.createBuffer({
+      size: numVectors * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+    });
+    const stagingBuf = device.createBuffer({
+      size: numVectors * 4,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+    });
+
+    const shaderModule = device.createShaderModule({ code: BRUTE_SHADER_SRC });
+
+    const bindGroupLayout = device.createBindGroupLayout({
+      entries: [
+        { binding: 0, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 1, visibility: GPUShaderStage.COMPUTE, buffer: { type: "read-only-storage" } },
+        { binding: 2, visibility: GPUShaderStage.COMPUTE, buffer: { type: "uniform" } },
+        { binding: 3, visibility: GPUShaderStage.COMPUTE, buffer: { type: "storage" } },
+      ],
+    });
+
+    const pipeline = device.createComputePipeline({
+      layout: device.createPipelineLayout({ bindGroupLayouts: [bindGroupLayout] }),
+      compute: { module: shaderModule, entryPoint: "main" },
+    });
+
+    const bindGroup = device.createBindGroup({
+      layout: bindGroupLayout,
+      entries: [
+        { binding: 0, resource: { buffer: vecBuf } },
+        { binding: 1, resource: { buffer: queryBuf } },
+        { binding: 2, resource: { buffer: configBuf } },
+        { binding: 3, resource: { buffer: scoresBuf } },
+      ],
+    });
+
+    const configData = new Uint32Array([numVectors, dim, 0, 0]);
+    device.queue.writeBuffer(configBuf, 0, configData.buffer);
+
+    return new BruteGpuIndex(
+      device, pipeline, bindGroup, queryBuf, configBuf, scoresBuf, stagingBuf, numVectors,
+    );
+  }
+
+  async dotBatch(query: Float32Array): Promise<Float32Array> {
+    this.#device.queue.writeBuffer(this.#queryBuf, 0, query.buffer);
+
+    const encoder = this.#device.createCommandEncoder();
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(this.#pipeline);
+    pass.setBindGroup(0, this.#bindGroup);
+    pass.dispatchWorkgroups(Math.ceil(this.#numVectors / 256));
+    pass.end();
+
+    encoder.copyBufferToBuffer(this.#scoresBuf, 0, this.#stagingBuf, 0, this.#numVectors * 4);
+    this.#device.queue.submit([encoder.finish()]);
+
+    await this.#stagingBuf.mapAsync(GPUMapMode.READ);
+    this.#resultBuf.set(new Float32Array(this.#stagingBuf.getMappedRange()));
+    this.#stagingBuf.unmap();
+
+    return this.#resultBuf;
   }
 
   destroy(): void {
