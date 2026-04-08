@@ -1,5 +1,6 @@
 /**
  * Load passages, raw embeddings, and TQ-compressed vectors.
+ * Supports multiple datasets via DatasetInfo config.
  */
 
 import { TurboQuant } from "turboquant-wasm";
@@ -15,6 +16,17 @@ export interface SearchData {
   rawSizeBytes: number;
   compressedSizeBytes: number;
 }
+
+export interface DatasetInfo {
+  name: string;
+  label: string;
+  basePath: string;
+}
+
+export const DATASETS: DatasetInfo[] = [
+  { name: "wiki-5k", label: "Wikipedia 5K", basePath: "data" },
+  { name: "wiki-50k", label: "Wikipedia 50K", basePath: "data/wiki-50k" },
+];
 
 interface TqvHeader {
   numVectors: number;
@@ -41,15 +53,18 @@ function parseTqvHeader(buffer: ArrayBuffer): TqvHeader {
 }
 
 export async function loadSearchData(
+  dataset: DatasetInfo,
   onProgress: (msg: string) => void,
 ): Promise<SearchData> {
+  const base = dataset.basePath;
+
   onProgress("Loading passages...");
-  const passages: string[] = await fetch("data/passages.json").then((r) =>
+  const passages: string[] = await fetch(`${base}/passages.json`).then((r) =>
     r.json(),
   );
 
   onProgress("Loading compressed vectors...");
-  const tqvBuffer = await fetch("data/compressed.tqv").then((r) =>
+  const tqvBuffer = await fetch(`${base}/compressed.tqv`).then((r) =>
     r.arrayBuffer(),
   );
   const header = parseTqvHeader(tqvBuffer);
@@ -64,15 +79,16 @@ export async function loadSearchData(
   onProgress("Initializing TurboQuant WASM...");
   const tq = await TurboQuant.init({ dim: header.dim, seed: header.seed });
 
-  onProgress("Loading uncompressed vectors for comparison...");
   let rawVectors: Float32Array | null = null;
+  onProgress("Loading uncompressed vectors for comparison...");
   try {
-    const rawBuffer = await fetch("data/embeddings.bin").then((r) =>
-      r.arrayBuffer(),
-    );
+    const rawBuffer = await fetch(`${base}/embeddings.bin`).then((r) => {
+      if (!r.ok) throw new Error(r.statusText);
+      return r.arrayBuffer();
+    });
     rawVectors = new Float32Array(rawBuffer);
   } catch {
-    // Compressed-only mode if embeddings.bin not available
+    // Compressed-only mode — brute-force comparison unavailable
   }
 
   const rawSizeBytes = header.numVectors * header.dim * 4;

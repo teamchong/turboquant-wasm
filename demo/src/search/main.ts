@@ -6,8 +6,8 @@
  * On mobile/fallback: uses pre-computed query embeddings for suggested queries.
  */
 
-import { loadSearchData, type SearchData } from "./data-loader.js";
-import { search, type SearchComparison } from "./search-engine.js";
+import { DATASETS, loadSearchData, type SearchData, type DatasetInfo } from "./data-loader.js";
+import { search, resetSearch, type SearchComparison } from "./search-engine.js";
 import { initEmbedder, embedQuery } from "./embedder.js";
 
 const SUGGESTED_QUERIES = [
@@ -24,6 +24,8 @@ const SUGGESTED_QUERIES = [
 
 let precomputedEmbeddings: Record<string, number[]> | null = null;
 let embedderReady = false;
+let currentData: SearchData | null = null;
+let currentDataset: DatasetInfo = DATASETS[0];
 
 function showLoading(msg: string) {
   const overlay = document.getElementById("loading-overlay")!;
@@ -64,6 +66,14 @@ function renderIndexStats(data: SearchData) {
   `;
 }
 
+function updateSubtitle(data: SearchData) {
+  const subtitle = document.querySelector("#header .subtitle") as HTMLElement;
+  const tqMB = formatBytes(data.compressedSizeBytes);
+  const rawMB = formatBytes(data.rawSizeBytes);
+  subtitle.textContent =
+    `Search ${data.numVectors.toLocaleString()} Wikipedia passages in your browser. TQ index: ${tqMB} — raw would be ${rawMB}.`;
+}
+
 function renderSearchInfo(comparison: SearchComparison, embedMs: number) {
   const parts: string[] = [];
   parts.push(`Embed: ${embedMs.toFixed(0)}ms`);
@@ -74,6 +84,9 @@ function renderSearchInfo(comparison: SearchComparison, embedMs: number) {
   if (comparison.recallAtK !== null) {
     const pct = (comparison.recallAtK * 100).toFixed(0);
     parts.push(`Recall@10: <span class="fast">${pct}%</span>`);
+  }
+  if (comparison.bruteDisabledReason) {
+    parts.push(`<span class="brute-disabled">${comparison.bruteDisabledReason}</span>`);
   }
   document.getElementById("search-info")!.innerHTML = parts.join(" &middot; ");
 }
@@ -125,6 +138,11 @@ function renderResults(comparison: SearchComparison) {
         </div>`;
     }
     html += "</div>";
+  } else if (comparison.bruteDisabledReason) {
+    html += '<div class="results-col">';
+    html += '<div class="col-header brute">Brute-force (uncompressed)</div>';
+    html += `<div class="brute-disabled-msg">Brute-force unavailable at this scale.<br>${escapeHtml(comparison.bruteDisabledReason)}</div>`;
+    html += "</div>";
   }
 
   html += "</div>";
@@ -153,23 +171,55 @@ function renderSuggestedQueries(onSelect: (query: string) => void) {
   });
 }
 
+function initDatasetSelector(onChange: (ds: DatasetInfo) => void): void {
+  const selector = document.getElementById("dataset-selector") as HTMLSelectElement;
+  DATASETS.forEach((ds) => {
+    const opt = document.createElement("option");
+    opt.value = ds.name;
+    opt.textContent = ds.label;
+    selector.appendChild(opt);
+  });
+  selector.addEventListener("change", () => {
+    const ds = DATASETS.find((d) => d.name === selector.value);
+    if (ds) onChange(ds);
+  });
+}
+
 async function getQueryVector(text: string): Promise<Float32Array | null> {
-  // Try pre-computed embeddings first
   if (precomputedEmbeddings && text in precomputedEmbeddings) {
     return new Float32Array(precomputedEmbeddings[text]);
   }
-
-  // Try the ONNX embedder
   if (embedderReady) {
     return await embedQuery(text);
   }
-
   return null;
 }
 
 async function main() {
-  showLoading("Loading search index...");
-  const data = await loadSearchData((msg) => showLoading(msg));
+  const input = document.getElementById("query-input") as HTMLInputElement;
+
+  async function loadDataset(dataset: DatasetInfo) {
+    showLoading(`Loading ${dataset.label}...`);
+    resetSearch();
+    if (currentData) currentData.tq.destroy();
+    currentData = await loadSearchData(dataset, showLoading);
+    currentDataset = dataset;
+    renderIndexStats(currentData);
+    updateSubtitle(currentData);
+  }
+
+  // Load default dataset
+  await loadDataset(currentDataset);
+
+  // Dataset selector
+  initDatasetSelector(async (ds) => {
+    await loadDataset(ds);
+    // Warm up GPU
+    showLoading("Warming up GPU...");
+    await search(new Float32Array(currentData!.dim), currentData!, 1);
+    hideLoading();
+    if (input.value) doSearch(input.value);
+  });
 
   // Load pre-computed query embeddings (tiny, always works)
   showLoading("Loading query embeddings...");
@@ -190,13 +240,10 @@ async function main() {
     embedderReady = false;
   }
 
-  renderIndexStats(data);
   hideLoading();
 
-  const input = document.getElementById("query-input") as HTMLInputElement;
-
   async function doSearch(queryText: string) {
-    if (!queryText.trim()) return;
+    if (!queryText.trim() || !currentData) return;
 
     const embedStart = performance.now();
     const queryVec = await getQueryVector(queryText);
@@ -207,7 +254,7 @@ async function main() {
     }
     const embedMs = performance.now() - embedStart;
 
-    const comparison = await search(queryVec, data, 10);
+    const comparison = await search(queryVec, currentData, 10);
     renderSearchInfo(comparison, embedMs);
     renderResults(comparison);
   }
@@ -233,10 +280,9 @@ async function main() {
     doSearch(query);
   });
 
-  // Warm up: trigger GPU init for both TQ and brute-force
+  // Warm up: trigger GPU init
   showLoading("Warming up GPU...");
-  const warmupQuery = new Float32Array(data.dim);
-  await search(warmupQuery, data, 1);
+  await search(new Float32Array(currentData!.dim), currentData!, 1);
   hideLoading();
 
   // Run initial search with default value
@@ -245,8 +291,9 @@ async function main() {
   }
 
   console.log("Vector search demo ready!", {
-    vectors: data.numVectors,
-    dim: data.dim,
+    vectors: currentData!.numVectors,
+    dim: currentData!.dim,
+    dataset: currentDataset.name,
     embedderReady,
     precomputedQueries: precomputedEmbeddings ? Object.keys(precomputedEmbeddings).length : 0,
   });

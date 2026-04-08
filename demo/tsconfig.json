@@ -9,7 +9,7 @@
     "outDir": "dist",
     "rootDir": ".",
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
-    "types": ["three"]
+    "types": ["three", "@webgpu/types"]
   },
   "include": ["src/**/*.ts", "src/**/*.d.ts"]
 }
