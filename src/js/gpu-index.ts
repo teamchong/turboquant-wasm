@@ -157,11 +157,24 @@ export class TQGpuIndex {
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
 
-    const vecBuf = new Uint8Array(alignedBpv);
-    const paramBuf = new Float32Array(2);
+    // Batch writes: accumulate up to BATCH vectors, write to GPU in one call.
+    // ~64KB batch = good balance between memory and writeBuffer overhead.
+    const BATCH = Math.max(1, Math.floor(65536 / alignedBpv));
+    const batchBlob = new Uint8Array(BATCH * alignedBpv);
+    const batchParams = new Float32Array(BATCH * 2);
     let pending = leftover;
     let vecIdx = 0;
+    let batchCount = 0;
     let polarBytes = 0;
+
+    function flushBatch() {
+      if (batchCount === 0) return;
+      const blobSlice = batchBlob.subarray(0, batchCount * alignedBpv);
+      device.queue.writeBuffer(blobBuf, (vecIdx - batchCount) * alignedBpv, blobSlice);
+      const paramSlice = batchParams.subarray(0, batchCount * 2);
+      device.queue.writeBuffer(paramsBuf, (vecIdx - batchCount) * 8, paramSlice.buffer, 0, batchCount * 8);
+      batchCount = 0;
+    }
 
     while (vecIdx < numVectors) {
       while (pending.length < bpv) {
@@ -174,19 +187,22 @@ export class TQGpuIndex {
       }
       if (pending.length < bpv) break;
 
-      vecBuf.fill(0);
-      vecBuf.set(pending.subarray(0, bpv));
-      device.queue.writeBuffer(blobBuf, vecIdx * alignedBpv, vecBuf);
-
-      paramBuf[0] = new DataView(pending.buffer, pending.byteOffset + 14, 4).getFloat32(0, true);
-      paramBuf[1] = new DataView(pending.buffer, pending.byteOffset + 18, 4).getFloat32(0, true);
-      device.queue.writeBuffer(paramsBuf, vecIdx * 8, paramBuf.buffer);
+      // Pack into batch buffer
+      const bOff = batchCount * alignedBpv;
+      batchBlob.fill(0, bOff, bOff + alignedBpv);
+      batchBlob.set(pending.subarray(0, bpv), bOff);
+      batchParams[batchCount * 2] = new DataView(pending.buffer, pending.byteOffset + 14, 4).getFloat32(0, true);
+      batchParams[batchCount * 2 + 1] = new DataView(pending.buffer, pending.byteOffset + 18, 4).getFloat32(0, true);
 
       if (vecIdx === 0) polarBytes = readU32(pending, 6);
 
       pending = pending.subarray(bpv);
       vecIdx++;
+      batchCount++;
+
+      if (batchCount >= BATCH) flushBatch();
     }
+    flushBatch();
 
     reader.releaseLock();
     if (vecIdx === 0) return null;
