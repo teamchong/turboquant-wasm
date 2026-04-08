@@ -850,5 +850,5 @@ test "dotBatch benchmark vs dot" {
     std.debug.print("\n=== dot vs dotBatch (dim={}, N={}) ===\n", .{ dim, n });
     std.debug.print("dot:      {d:.1} us ({d:.2} us/vec)\n", .{ dot_us, dot_us / @as(f64, n) });
     std.debug.print("dotBatch: {d:.1} us ({d:.2} us/vec)\n", .{ batch_us, batch_us / @as(f64, n) });
-    std.debug.print("speedup:  {d:.1}x\n", .{ dot_us / batch_us });
+    std.debug.print("speedup:  {d:.1}x\n", .{dot_us / batch_us});
 }
