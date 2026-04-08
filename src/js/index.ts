@@ -141,6 +141,7 @@ export class TurboQuant {
   #scoresOut: Float32Array | null = null;
   #queryPtr: number = 0;
   #queryLen: number = 0;
+  #rotOutPtr: number = 0;
   #gpuIndex: TQGpuIndex | null = null;
   #gpuChecked = false;
   #gpuDataRef: Uint8Array | null = null;
@@ -260,7 +261,7 @@ export class TurboQuant {
    */
   async dotBatch(query: Float32Array, compressedConcat: Uint8Array, bytesPerVector: number): Promise<Float32Array> {
     // Auto-detect WebGPU on first call or when data changes
-    if (!this.#gpuChecked || (this.#gpuIndex && compressedConcat !== this.#gpuDataRef)) {
+    if (!this.#gpuChecked || compressedConcat !== this.#gpuDataRef) {
       this.#gpuChecked = true;
       if (this.#gpuIndex) { this.#gpuIndex.destroy(); this.#gpuIndex = null; }
       if (typeof navigator !== "undefined" && navigator.gpu) {
@@ -347,15 +348,15 @@ export class TurboQuant {
     }
     new Float32Array(ex.memory.buffer, this.#queryPtr, query.length).set(query);
 
-    const outPtr = ex.tq_alloc_f32(this.dim);
-    if (!outPtr) throw new Error("TurboQuant: WASM alloc failed for rotated query");
+    if (!this.#rotOutPtr) {
+      this.#rotOutPtr = ex.tq_alloc_f32(this.dim);
+      if (!this.#rotOutPtr) throw new Error("TurboQuant: WASM alloc failed for rotated query");
+    }
 
-    ex.tq_rotate_query(this.#handle, this.#queryPtr, this.dim, outPtr);
+    ex.tq_rotate_query(this.#handle, this.#queryPtr, this.dim, this.#rotOutPtr);
 
     const rotated = new Float32Array(this.dim);
-    rotated.set(new Float32Array(ex.memory.buffer, outPtr, this.dim));
-    ex.tq_free_f32(outPtr, this.dim);
-
+    rotated.set(new Float32Array(ex.memory.buffer, this.#rotOutPtr, this.dim));
     return rotated;
   }
 
@@ -379,6 +380,10 @@ export class TurboQuant {
     if (this.#queryPtr) {
       this.#ex.tq_free(this.#queryPtr, this.#queryLen);
       this.#queryPtr = 0;
+    }
+    if (this.#rotOutPtr) {
+      this.#ex.tq_free_f32(this.#rotOutPtr, this.dim);
+      this.#rotOutPtr = 0;
     }
     this.#ex.tq_engine_destroy(this.#handle);
     this.#handle = -1;

@@ -30,11 +30,7 @@ function buildPolarLut(): Float32Array {
 }
 
 function readU32(buf: Uint8Array, off: number): number {
-  return buf[off] | (buf[off + 1] << 8) | (buf[off + 2] << 16) | (buf[off + 3] << 24);
-}
-
-function readF32(buf: Uint8Array, off: number): number {
-  return new DataView(buf.buffer, buf.byteOffset + off, 4).getFloat32(0, true);
+  return (buf[off] | (buf[off + 1] << 8) | (buf[off + 2] << 16) | (buf[off + 3] << 24)) >>> 0;
 }
 
 function alignU32(bytes: number): number {
@@ -205,7 +201,12 @@ export class TQGpuIndex {
     flushBatch();
 
     reader.releaseLock();
-    if (vecIdx === 0) return null;
+    if (vecIdx === 0) {
+      blobBuf.destroy();
+      paramsBuf.destroy();
+      device.destroy();
+      return null;
+    }
 
     return TQGpuIndex.#finishCreate(
       device, tq, blobBuf, paramsBuf,
@@ -346,6 +347,7 @@ export class TQGpuIndex {
     this.#blobBuf.destroy();
     this.#paramsBuf.destroy();
     this.#lutBuf.destroy();
+    this.#device.destroy();
   }
 }
 
@@ -387,6 +389,7 @@ export class BruteGpuIndex {
   static async create(
     device: GPUDevice, rawVectors: Float32Array, dim: number,
   ): Promise<BruteGpuIndex> {
+    if (dim > 1024) throw new Error(`BruteGpuIndex: dim ${dim} exceeds shader MAX_DIM (1024)`);
     const numVectors = rawVectors.length / dim;
 
     const vecBuf = device.createBuffer({
@@ -472,6 +475,7 @@ export class BruteGpuIndex {
     this.#scoresBuf.destroy();
     this.#stagingBuf.destroy();
     this.#vecBuf.destroy();
+    this.#device.destroy();
   }
 }
 

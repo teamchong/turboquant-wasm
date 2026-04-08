@@ -86,7 +86,7 @@ function renderSearchInfo(comparison: SearchComparison, embedMs: number) {
     parts.push(`Recall@10: <span class="fast">${pct}%</span>`);
   }
   if (comparison.bruteDisabledReason) {
-    parts.push(`<span class="brute-disabled">${comparison.bruteDisabledReason}</span>`);
+    parts.push(`<span class="brute-disabled">${escapeHtml(comparison.bruteDisabledReason)}</span>`);
   }
   document.getElementById("search-info")!.innerHTML = parts.join(" &middot; ");
 }
