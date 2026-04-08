@@ -31,3 +31,6 @@
 [submodule "vendor/farmhash"]
 	path = vendor/farmhash
 	url = https://github.com/google/farmhash.git
+[submodule "vendor/flatbuffers"]
+	path = vendor/flatbuffers
+	url = https://github.com/google/flatbuffers.git
