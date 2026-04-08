@@ -7,3 +7,27 @@
 [submodule "vendor/litert"]
 	path = vendor/litert
 	url = https://github.com/google-ai-edge/LiteRT.git
+[submodule "vendor/ruy"]
+	path = vendor/ruy
+	url = https://github.com/google/ruy.git
+[submodule "vendor/cpuinfo"]
+	path = vendor/cpuinfo
+	url = https://github.com/pytorch/cpuinfo.git
+[submodule "vendor/eigen"]
+	path = vendor/eigen
+	url = https://gitlab.com/libeigen/eigen.git
+[submodule "vendor/xnnpack"]
+	path = vendor/xnnpack
+	url = https://github.com/google/XNNPACK.git
+[submodule "vendor/fp16"]
+	path = vendor/fp16
+	url = https://github.com/Maratyszcza/FP16.git
+[submodule "vendor/pthreadpool"]
+	path = vendor/pthreadpool
+	url = https://github.com/google/pthreadpool.git
+[submodule "vendor/gemmlowp"]
+	path = vendor/gemmlowp
+	url = https://github.com/google/gemmlowp.git
+[submodule "vendor/farmhash"]
+	path = vendor/farmhash
+	url = https://github.com/google/farmhash.git
