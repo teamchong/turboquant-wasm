@@ -126,7 +126,7 @@ function renderGallery(
   });
 }
 
-function findSimilar(data: ImageData, queryIdx: number) {
+async function findSimilar(data: ImageData, queryIdx: number) {
   const querySection = document.getElementById("query-section")!;
   const queryImage = document.getElementById("query-image") as HTMLImageElement;
   const queryInfo = document.getElementById("query-info")!;
@@ -143,7 +143,7 @@ function findSimilar(data: ImageData, queryIdx: number) {
   const queryVec = data.tq.decode(queryBlob);
 
   const start = performance.now();
-  const scores = data.tq.dotBatch(queryVec, data.compressedConcat, data.bytesPerVector);
+  const scores = await data.tq.dotBatch(queryVec, data.compressedConcat, data.bytesPerVector);
   const tqMs = performance.now() - start;
 
   // Sort by score descending (skip self)
