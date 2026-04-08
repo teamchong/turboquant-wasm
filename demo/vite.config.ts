@@ -3,11 +3,6 @@ import { resolve } from "path";
 
 export default defineConfig(({ command }) => ({
   base: command === "serve" ? "/" : "/turboquant-wasm/",
-  resolve: {
-    alias: {
-      "turboquant-wasm": resolve(__dirname, "../src/js/index.ts"),
-    },
-  },
   build: {
     outDir: "dist",
     emptyOutDir: true,
