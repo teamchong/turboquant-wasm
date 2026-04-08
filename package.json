@@ -12,11 +12,6 @@
       "import": "./dist/index.js",
       "default": "./dist/index.js"
     },
-    "./gpu": {
-      "types": "./dist/gpu-index.d.ts",
-      "import": "./dist/gpu-index.js",
-      "default": "./dist/gpu-index.js"
-    },
     "./turboquant.wasm": "./dist/turboquant.wasm"
   },
   "files": [

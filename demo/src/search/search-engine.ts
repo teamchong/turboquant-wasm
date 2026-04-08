@@ -5,7 +5,7 @@
  */
 
 import type { SearchData } from "./data-loader.js";
-import { BruteGpuIndex } from "turboquant-wasm/gpu";
+import { BruteGpuIndex } from "./brute-gpu.js";
 
 export interface SearchResult {
   index: number;
