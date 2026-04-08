@@ -60,10 +60,20 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     polar_sum += query[d] * lv.x * max_r + query[d + 1u] * lv.y * max_r;
   }
 
+  // QJL bit scan: read one byte at a time, but reuse the u32 word for 4 consecutive bytes.
+  // This reduces storage reads by 4x compared to calling read_byte per dimension.
   var pos_sum: f32 = 0.0;
+  var prev_word_idx: u32 = 0xFFFFFFFFu;
+  var cached_word: u32 = 0u;
   for (var d: u32 = 0u; d < dim; d += 1u) {
-    let byte_val = read_byte(blob_offset, qjl_start + d / 8u);
-    let bit = (byte_val >> (d % 8u)) & 1u;
+    let byte_idx = qjl_start + d / 8u;
+    let word_idx = blob_offset + byte_idx / 4u;
+    if (word_idx != prev_word_idx) {
+      cached_word = blob_data[word_idx];
+      prev_word_idx = word_idx;
+    }
+    let shift = (byte_idx % 4u) * 8u + (d % 8u);
+    let bit = (cached_word >> shift) & 1u;
     pos_sum += query[d] * f32(bit);
   }
 

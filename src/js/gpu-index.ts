@@ -14,8 +14,6 @@ import BRUTE_SHADER_SRC from "./shaders/brute-dot-batch.wgsl" with { type: "text
 // The serialized header uses bytes 0-21, payload starts at byte 32.
 const HEADER_SIZE = 32;
 
-const SQRT_PI_OVER_2 = 1.2533141;
-
 /** Precompute the 128-entry polar decode LUT (matches Zig's pair_lut). */
 function buildPolarLut(): Float32Array {
   const lut = new Float32Array(256);
@@ -36,9 +34,7 @@ function readU32(buf: Uint8Array, off: number): number {
 }
 
 function readF32(buf: Uint8Array, off: number): number {
-  const tmp = new Uint8Array(4);
-  tmp[0] = buf[off]; tmp[1] = buf[off + 1]; tmp[2] = buf[off + 2]; tmp[3] = buf[off + 3];
-  return new Float32Array(tmp.buffer)[0];
+  return new DataView(buf.buffer, buf.byteOffset + off, 4).getFloat32(0, true);
 }
 
 function alignU32(bytes: number): number {
@@ -54,6 +50,9 @@ export class TQGpuIndex {
   #configBuf: GPUBuffer;
   #scoresBuf: GPUBuffer;
   #stagingBuf: GPUBuffer;
+  #blobBuf: GPUBuffer;
+  #paramsBuf: GPUBuffer;
+  #lutBuf: GPUBuffer;
   #queryBindGroup: GPUBindGroup;
   #numVectors: number;
   #dim: number;
@@ -67,6 +66,7 @@ export class TQGpuIndex {
     queryBindGroup: GPUBindGroup,
     queryBuf: GPUBuffer, configBuf: GPUBuffer,
     scoresBuf: GPUBuffer, stagingBuf: GPUBuffer,
+    blobBuf: GPUBuffer, paramsBuf: GPUBuffer, lutBuf: GPUBuffer,
     numVectors: number, dim: number, tq: TurboQuant,
   ) {
     this.#device = device;
@@ -78,6 +78,9 @@ export class TQGpuIndex {
     this.#configBuf = configBuf;
     this.#scoresBuf = scoresBuf;
     this.#stagingBuf = stagingBuf;
+    this.#blobBuf = blobBuf;
+    this.#paramsBuf = paramsBuf;
+    this.#lutBuf = lutBuf;
     this.#numVectors = numVectors;
     this.#dim = dim;
     this.#tq = tq;
@@ -213,6 +216,7 @@ export class TQGpuIndex {
     return new TQGpuIndex(
       device, pipeline, dbBindGroup, lutBindGroup, queryBindGroup,
       queryBuf, configBuf, scoresBuf, stagingBuf,
+      blobBuf, paramsBuf, lutBuf,
       numVectors, dim, tq,
     );
   }
@@ -251,6 +255,9 @@ export class TQGpuIndex {
     this.#configBuf.destroy();
     this.#scoresBuf.destroy();
     this.#stagingBuf.destroy();
+    this.#blobBuf.destroy();
+    this.#paramsBuf.destroy();
+    this.#lutBuf.destroy();
   }
 }
 
@@ -266,6 +273,7 @@ export class BruteGpuIndex {
   #configBuf: GPUBuffer;
   #scoresBuf: GPUBuffer;
   #stagingBuf: GPUBuffer;
+  #vecBuf: GPUBuffer;
   #numVectors: number;
   #resultBuf: Float32Array;
 
@@ -273,6 +281,7 @@ export class BruteGpuIndex {
     device: GPUDevice, pipeline: GPUComputePipeline, bindGroup: GPUBindGroup,
     queryBuf: GPUBuffer, configBuf: GPUBuffer,
     scoresBuf: GPUBuffer, stagingBuf: GPUBuffer,
+    vecBuf: GPUBuffer,
     numVectors: number,
   ) {
     this.#device = device;
@@ -282,6 +291,7 @@ export class BruteGpuIndex {
     this.#configBuf = configBuf;
     this.#scoresBuf = scoresBuf;
     this.#stagingBuf = stagingBuf;
+    this.#vecBuf = vecBuf;
     this.#numVectors = numVectors;
     this.#resultBuf = new Float32Array(numVectors);
   }
@@ -344,7 +354,7 @@ export class BruteGpuIndex {
     device.queue.writeBuffer(configBuf, 0, configData.buffer);
 
     return new BruteGpuIndex(
-      device, pipeline, bindGroup, queryBuf, configBuf, scoresBuf, stagingBuf, numVectors,
+      device, pipeline, bindGroup, queryBuf, configBuf, scoresBuf, stagingBuf, vecBuf, numVectors,
     );
   }
 
@@ -373,6 +383,7 @@ export class BruteGpuIndex {
     this.#configBuf.destroy();
     this.#scoresBuf.destroy();
     this.#stagingBuf.destroy();
+    this.#vecBuf.destroy();
   }
 }
 

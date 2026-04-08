@@ -19,6 +19,7 @@
  *   tq.destroy();
  */
 
+import type { TQGpuIndex } from "./gpu-index.js";
 import { wasmBase64 } from "./turboquant-wasm.generated.js";
 
 function decodeBase64(b64: string): Uint8Array {
@@ -140,7 +141,7 @@ export class TurboQuant {
   #scoresOut: Float32Array | null = null;
   #queryPtr: number = 0;
   #queryLen: number = 0;
-  #gpuIndex: any = null;
+  #gpuIndex: TQGpuIndex | null = null;
   #gpuChecked = false;
   #gpuDataRef: Uint8Array | null = null;
 
@@ -360,7 +361,11 @@ export class TurboQuant {
 
   /** Release engine resources. Call when done. Safe to call multiple times. */
   destroy(): void {
-    if (!this.#handle && this.#handle !== 0) return;
+    if (this.#handle < 0) return;
+    if (this.#gpuIndex) {
+      this.#gpuIndex.destroy();
+      this.#gpuIndex = null;
+    }
     if (this.#cachedPtr) {
       this.#ex.tq_free(this.#cachedPtr, this.#cachedLen);
       this.#cachedPtr = 0;
