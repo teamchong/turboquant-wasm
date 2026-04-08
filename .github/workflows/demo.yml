@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - 'demo/**'
+      - 'src/**'
       - '.github/workflows/demo.yml'
   workflow_dispatch:
 
@@ -25,10 +26,19 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          lfs: true
+
+      - uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
 
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
+
+      - name: Build WASM + JS package
+        run: bun run build
 
       - name: Install demo dependencies
         working-directory: demo
