@@ -18,6 +18,8 @@ namespace std {
   namespace this_thread {
     inline thread::id get_id() noexcept { return {}; }
     inline void yield() noexcept {}
+    template<class Rep, class Period>
+    inline void sleep_for(const chrono::duration<Rep, Period>&) noexcept {}
   }
   template<> struct hash<thread::id> {
     size_t operator()(thread::id) const noexcept { return 0; }
