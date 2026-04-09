@@ -34,3 +34,9 @@
 [submodule "vendor/flatbuffers"]
 	path = vendor/flatbuffers
 	url = https://github.com/google/flatbuffers.git
+[submodule "vendor/nlohmann-json"]
+	path = vendor/nlohmann-json
+	url = https://github.com/nlohmann/json.git
+[submodule "vendor/sentencepiece"]
+	path = vendor/sentencepiece
+	url = https://github.com/google/sentencepiece.git

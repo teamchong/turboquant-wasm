@@ -1,4 +1,15 @@
 #pragma once
+
+// POSIX functions not available in WASI but referenced by TFLite/XNNPack
+#ifdef __cplusplus
+extern "C" {
+#endif
+int dup(int fd);
+int getpagesize(void);
+#ifdef __cplusplus
+}
+#endif
+
 #include <filesystem>
 #include <system_error>
 

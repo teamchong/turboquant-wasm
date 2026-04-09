@@ -79,6 +79,60 @@ void* pthread_getspecific(unsigned int key) {
 /* Returns a non-zero "thread id" — single thread in WASM. */
 unsigned long pthread_self(void) { return 1; }
 
+/* pthread_create — cannot spawn threads in single-threaded WASM */
+int pthread_create(void* t, const void* attr, void* (*fn)(void*), void* arg) {
+  (void)t; (void)attr; (void)fn; (void)arg; return -1;
+}
+int pthread_join(void* t, void** retval) {
+  (void)t; (void)retval; return 0;
+}
+int pthread_cond_broadcast(void* c) { (void)c; return 0; }
+int pthread_cond_destroy(void* c) { (void)c; return 0; }
+int pthread_mutex_destroy(void* m) { (void)m; return 0; }
+
+/* dup — POSIX fd duplication, not available in WASI.
+   Weight caching file I/O won't be used in browser WASM. */
+int dup(int fd) { (void)fd; return -1; }
+
+/* getpagesize — not in WASI, return 64KB (WASM page size) */
+int getpagesize(void) { return 65536; }
+
+/* madvise — POSIX memory advisory, no-op on WASM (no virtual memory) */
+int madvise(void* addr, size_t len, int advice) {
+  (void)addr; (void)len; (void)advice; return 0;
+}
+
+/* pthreadpool_update_executor — defined in pthreads.c which requires real
+   pthread support. Single-threaded WASM always returns false (no executor). */
+int pthreadpool_update_executor(void* pool, void* executor, void* ctx) {
+  (void)pool; (void)executor; (void)ctx;
+  return 0;
+}
+
+/* XNNPack wasmsimd-magic vcvt kernels — the generated source files have a
+   codegen bug (include arm_neon.h instead of wasm_simd128.h). These specific
+   batch sizes are referenced by the unary-elementwise config but the runtime
+   will select the working WASM SIMD variants at dispatch time. */
+void xnn_f32_qs8_vcvt_ukernel__wasmsimd_magic_u32(
+    size_t batch, const float* input, void* output, const void* params) {
+  (void)batch; (void)input; (void)output; (void)params;
+}
+void xnn_f32_qu8_vcvt_ukernel__wasmsimd_magic_u32(
+    size_t batch, const float* input, void* output, const void* params) {
+  (void)batch; (void)input; (void)output; (void)params;
+}
+
+/* C++ exception allocation — WASM runs with exceptions disabled,
+   but some TFLite code has throw paths that the linker pulls in.
+   __cxa_throw traps immediately (exception = fatal in WASM). */
+void* __cxa_allocate_exception(size_t size) {
+  return malloc(size);
+}
+void __cxa_throw(void* obj, void* type, void (*dtor)(void*)) {
+  (void)obj; (void)type; (void)dtor;
+  __builtin_trap();
+}
+
 /* Arena initialization — returns a sentinel. The arena pointer is only
  * passed back to AllocWithArena which ignores it (above). */
 static int _sig_safe_arena;
