@@ -102,15 +102,7 @@ namespace string_util {
 }
 }
 
-// ============================================================================
-// Protobuf: network byte order conversion (model deserialization)
-// ============================================================================
-namespace google::protobuf {
-  uint32_t ghtonl(uint32_t x) {
-    return ((x & 0xFF) << 24) | ((x & 0xFF00) << 8) |
-           ((x & 0xFF0000) >> 8) | ((x & 0xFF000000) >> 24);
-  }
-}
+// ghtonl now compiled from protobuf sources.
 
 // ============================================================================
 // Abseil platform layer (sync/threading/debugging infrastructure)

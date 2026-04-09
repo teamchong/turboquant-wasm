@@ -66,11 +66,11 @@ TFLITE_DEFINES=(
 )
 
 TFLITE_FORCE_INCLUDES=(
-  -include "$SHIMS/fstream"
   -include "$SHIMS/mutex"
   -include "$SHIMS/shared_mutex"
   -include "$SHIMS/condition_variable"
   -include "$SHIMS/thread"
+  -include "$SHIMS/fstream"
   -include "$SHIMS/wasm_compat.h"
 )
 
@@ -318,42 +318,26 @@ done
 DEP_OBJECTS+=("${RUY_OBJECTS[@]}")
 echo "  ruy: ${#RUY_OBJECTS[@]} compiled"
 
-# Abseil (strings, status, hash, containers, synchronization, time, numeric)
+# Abseil — compile ALL non-test .cc files recursively
 echo "  Compiling abseil..."
 ABSL="$ORT_EXT/abseil-cpp"
 ABSL_OBJECTS=()
-for subdir in \
-  "absl/base" "absl/base/internal" \
-  "absl/container/internal" \
-  "absl/crc" "absl/crc/internal" \
-  "absl/debugging" "absl/debugging/internal" \
-  "absl/flags" "absl/flags/internal" \
-  "absl/hash/internal" \
-  "absl/log" "absl/log/internal" \
-  "absl/numeric" \
-  "absl/profiling/internal" \
-  "absl/random" "absl/random/internal" \
-  "absl/status" "absl/status/internal" \
-  "absl/strings" "absl/strings/internal" "absl/strings/internal/str_format" \
-  "absl/synchronization" "absl/synchronization/internal" \
-  "absl/time" "absl/time/internal/cctz/src" \
-  "absl/types/internal"; do
-  for f in "$ABSL/$subdir"/*.cc; do
-    [ -f "$f" ] || continue
-    echo "$f" | grep -qiE "test|benchmark|_testing|_mock|print_hash_of|gentables|/flags/" && continue
-    rel="${f#$ABSL/}"
-    oname="${rel//\//__}"
-    oname="${oname%.cc}.o"
-    obj="$CACHE/deps/absl__$oname"
-    if [ ! -f "$obj" ] || [ "$f" -nt "$obj" ]; then
-      $CXX "${TFLITE_FORCE_INCLUDES[@]}" \
-        -I "$ABSL" "${TFLITE_DEFINES[@]}" \
-        -c "$f" -o "$obj" 2>/dev/null && ABSL_OBJECTS+=("$obj") || true
-    else
-      ABSL_OBJECTS+=("$obj")
-    fi
-  done
+set +e
+for f in $(find "$ABSL/absl" -name "*.cc" -not -path "*/testutil/*" \
+  | grep -viE "test|benchmark|_testing|_mock|print_hash_of|gentables|/compiler/"); do
+  rel="${f#$ABSL/}"
+  oname="${rel//\//__}"
+  oname="${oname%.cc}.o"
+  obj="$CACHE/deps/absl__$oname"
+  if [ ! -f "$obj" ] || [ "$f" -nt "$obj" ]; then
+    $CXX "${TFLITE_FORCE_INCLUDES[@]}" \
+      -I "$ABSL" "${TFLITE_DEFINES[@]}" \
+      -c "$f" -o "$obj" 2>/dev/null && ABSL_OBJECTS+=("$obj") || true
+  else
+    ABSL_OBJECTS+=("$obj")
+  fi
 done
+set -e
 DEP_OBJECTS+=("${ABSL_OBJECTS[@]}")
 echo "  abseil: ${#ABSL_OBJECTS[@]} compiled"
 
@@ -519,23 +503,22 @@ PB_DEFINES=(
   -DABSL_MIN_LOG_LEVEL=4
 )
 
-# Core protobuf sources and subdirectories (non-compiler, non-test)
-for subdir in "" "/io"; do
-  for f in "$PROTOBUF/src/google/protobuf${subdir}"/*.cc; do
-    [ -f "$f" ] || continue
-    echo "$f" | grep -qiE "test|unittest|mock|compiler|_test\." && continue
-    rel="${f#$PROTOBUF/}"
-    oname="${rel//\//__}"
-    oname="${oname%.cc}.o"
-    obj="$CACHE/protobuf/$oname"
-    if [ ! -f "$obj" ] || [ "$f" -nt "$obj" ]; then
-      $CXX "${TFLITE_FORCE_INCLUDES[@]}" "${PB_INCLUDES[@]}" "${PB_DEFINES[@]}" "${TFLITE_DEFINES[@]}" \
-        -c "$f" -o "$obj" 2>/dev/null && PB_OBJECTS+=("$obj") || echo "  FAIL: ${f#$PROTOBUF/}"
-    else
-      PB_OBJECTS+=("$obj")
-    fi
-  done
+# Core protobuf sources — all subdirectories recursively (non-compiler, non-test)
+set +e
+for f in $(find "$PROTOBUF/src/google/protobuf" -name "*.cc" \
+  | grep -viE "test|unittest|mock|compiler|_test\.|/testing/"); do
+  rel="${f#$PROTOBUF/}"
+  oname="${rel//\//__}"
+  oname="${oname%.cc}.o"
+  obj="$CACHE/protobuf/$oname"
+  if [ ! -f "$obj" ] || [ "$f" -nt "$obj" ]; then
+    $CXX "${TFLITE_FORCE_INCLUDES[@]}" "${PB_INCLUDES[@]}" "${PB_DEFINES[@]}" "${TFLITE_DEFINES[@]}" \
+      -c "$f" -o "$obj" 2>/dev/null && PB_OBJECTS+=("$obj") || echo "  FAIL: ${f#$PROTOBUF/}"
+  else
+    PB_OBJECTS+=("$obj")
+  fi
 done
+set -e
 
 # UTF8 range library (required by protobuf v33+)
 for f in "$PROTOBUF/third_party/utf8_range"/*.c; do

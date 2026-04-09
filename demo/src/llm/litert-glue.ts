@@ -208,7 +208,16 @@ export async function initLiteRt(): Promise<LiteRtExports> {
   // If one IS reached, the console.warn helps debug which symbol was called.
   const envProxy = new Proxy({} as Record<string, Function>, {
     get(_target, prop: string) {
-      return (..._args: unknown[]) => 0;
+      const fn = (..._args: unknown[]) => 0;
+      // Track unique calls without flooding console
+      const called = new Set<string>();
+      return (..._args: unknown[]) => {
+        if (!called.has(prop)) {
+          called.add(prop);
+          console.warn(`[env] first call: ${prop}`);
+        }
+        return 0;
+      };
     },
   });
 
