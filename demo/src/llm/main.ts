@@ -118,7 +118,48 @@ async function main() {
       const config = (gen as any).model?.config;
       const headDim = config?.head_dim || 256;
       tqCache = await TQKVCache.create(gpuDevice, headDim, 8192);
-      console.log("[TQ] KV cache ready: head_dim=%d, compression=~%dx", headDim, 4.5);
+      console.log("[TQ] KV cache ready: head_dim=%d", headDim);
+
+      // Intercept KV cache between generation steps.
+      // After each forward pass, getPastKeyValues receives the model's
+      // present_key_values and returns a DynamicCache for the next step.
+      // We compress each layer's K/V tensors via TQ encode shader on GPU,
+      // building the compressed cache that tracks memory savings.
+      const model = (gen as any).model;
+      if (model?.getPastKeyValues) {
+        const originalGetPKV = model.getPastKeyValues.bind(model);
+        model.getPastKeyValues = function(
+          decoderResults: Record<string, any>,
+          pastKeyValues: any,
+          ...rest: any[]
+        ) {
+          const cache = originalGetPKV(decoderResults, pastKeyValues, ...rest);
+
+          // Compress new K/V tensors into TQ cache on GPU
+          if (tqCache) {
+            for (const name in decoderResults) {
+              if (!name.startsWith("present") || !name.endsWith(".value")) continue;
+              const vTensor = decoderResults[name];
+              const kName = name.replace(".value", ".key");
+              const kTensor = decoderResults[kName];
+              if (!vTensor?.ort_tensor || !kTensor?.ort_tensor) continue;
+              if (vTensor.ort_tensor.location !== "gpu-buffer") continue;
+
+              const match = name.match(/(\d+)\.value/);
+              if (!match) continue;
+              const layerIdx = parseInt(match[1]);
+              const seqLen = vTensor.dims[2];
+              const kBuf = kTensor.ort_tensor.gpuBuffer as GPUBuffer;
+              const vBuf = vTensor.ort_tensor.gpuBuffer as GPUBuffer;
+              tqCache.encodeAndAppend(layerIdx, kBuf, vBuf, seqLen);
+            }
+          }
+
+          return cache;
+        };
+        console.log("[TQ] getPastKeyValues intercepted — compression active");
+      }
+
       statusEl.textContent = "Gemma ready (WebGPU + TQ KV cache)";
     } else {
       statusEl.textContent = "Gemma ready (WebGPU)";
