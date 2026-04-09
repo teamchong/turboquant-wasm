@@ -461,12 +461,18 @@ wasm-ld --no-entry \
   --export=memory \
   --export=wasm_malloc --export=wasm_free \
   --export=LiteRtCreateModelFromBuffer --export=LiteRtDestroyModel \
-  --export=LiteRtCreateCompiledModel \
-  --export=LiteRtCompiledModelRun \
+  --export=LiteRtCreateCompiledModel --export=LiteRtDestroyCompiledModel \
+  --export=LiteRtRunCompiledModel \
+  --export=LiteRtGetCompiledModelInputBufferRequirements \
+  --export=LiteRtGetCompiledModelOutputBufferRequirements \
   --export=LiteRtCreateEnvironment --export=LiteRtDestroyEnvironment \
-  --export=LiteRtCreateTensorBuffer --export=LiteRtDestroyTensorBuffer \
+  --export=LiteRtCreateTensorBufferFromHostMemory \
+  --export=LiteRtDestroyTensorBuffer \
   --export=LiteRtLockTensorBuffer --export=LiteRtUnlockTensorBuffer \
   --export=LiteRtGetTensorBufferSize \
+  --export=LiteRtGetCompiledModelNumSignatures \
+  --export=LiteRtGetCompiledModelInputTensorLayout \
+  --export=LiteRtGetCompiledModelOutputTensorLayouts \
   --export=tq_kv_create --export=tq_kv_destroy \
   --export=tq_kv_append --export=tq_kv_dot_batch \
   --export=tq_kv_decode_position --export=tq_kv_length \
