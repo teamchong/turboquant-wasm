@@ -22,6 +22,7 @@ class SyncOPFS {
   private pathToHandle = new Map<string, FileSystemSyncAccessHandle>();
   private pathToSize = new Map<string, number>();
   private nextFd = 10;
+  private preadCount = 0;
 
   async registerFile(path: string): Promise<void> {
     const root = await navigator.storage.getDirectory();
@@ -39,15 +40,18 @@ class SyncOPFS {
     mem: DataView, memBytes: Uint8Array,
   ): number {
     const pathStr = new TextDecoder().decode(memBytes.subarray(pathPtr, pathPtr + pathLen));
+    console.log(`[VFS] path_open: "${pathStr}"`);
     const handle = this.pathToHandle.get(pathStr) ||
                    this.pathToHandle.get(pathStr.replace(/^\/+/, ""));
     if (!handle) {
-      console.warn(`[SyncOPFS] path_open: not found: "${pathStr}"`);
+      console.warn(`[VFS] path_open: NOT FOUND: "${pathStr}" (have: ${[...this.pathToHandle.keys()].join(', ')})`);
       return 44; // ENOENT
     }
     const fd = this.nextFd++;
+    const size = this.pathToSize.get(pathStr) || this.pathToSize.get(pathStr.replace(/^\/+/, "")) || 0;
+    console.log(`[VFS] path_open: OK fd=${fd} size=${size}`);
     this.handles.set(fd, handle);
-    this.sizes.set(fd, this.pathToSize.get(pathStr) || this.pathToSize.get(pathStr.replace(/^\/+/, "")) || 0);
+    this.sizes.set(fd, size);
     this.positions.set(fd, 0);
     mem.setUint32(fdPtr, fd, true);
     return 0;
@@ -67,7 +71,6 @@ class SyncOPFS {
       const bufLen = mem.getUint32(iovsPtr + i * 8 + 4, true);
       const available = Math.min(bufLen, fileSize - fileOffset);
       if (available > 0) {
-        // Read directly from OPFS into a temp buffer, then copy to WASM memory
         const chunk = new Uint8Array(available);
         const bytesRead = handle.read(chunk, { at: fileOffset });
         memBytes.set(chunk.subarray(0, bytesRead), bufPtr);
@@ -75,6 +78,10 @@ class SyncOPFS {
         totalRead += bytesRead;
       }
     }
+    if (this.preadCount < 5) {
+      console.log(`[VFS] fd_pread: fd=${fd} offset=${offset} read=${totalRead} fileSize=${fileSize}`);
+    }
+    this.preadCount++;
     mem.setUint32(nreadPtr, totalRead, true);
     return 0;
   }
@@ -191,9 +198,16 @@ async function init(modelFileName: string) {
   await vfs.registerFile(modelFileName);
   postMessage({ type: "status", text: "Model file opened. Loading WASM..." });
 
+  const envCalled = new Set<string>();
   const envProxy = new Proxy({} as Record<string, Function>, {
     get(_target, prop: string) {
-      return (..._args: unknown[]) => 0;
+      return (..._args: unknown[]) => {
+        if (!envCalled.has(prop)) {
+          envCalled.add(prop);
+          console.log(`[env] ${prop}`);
+        }
+        return 0;
+      };
     },
   });
 
@@ -220,8 +234,24 @@ async function init(modelFileName: string) {
       return vfs.fdPread(fd, iovs, iovsLen, offset, nread,
         new DataView(wasm.memory.buffer), new Uint8Array(wasm.memory.buffer));
     },
-    fd_prestat_get() { return 8; },
-    fd_prestat_dir_name() { return 8; },
+    fd_prestat_get(fd: number, bufPtr: number): number {
+      // Preopened directory fd=3 → "/" (root)
+      // prestat struct: { tag: u8, dir_name_len: u32 } at offset 0,4
+      if (fd === 3) {
+        const v = new DataView(wasm.memory.buffer);
+        v.setUint8(bufPtr, 0); // tag = __WASI_PREOPENTYPE_DIR
+        v.setUint32(bufPtr + 4, 1, true); // dir_name_len = 1 ("/" length)
+        return 0;
+      }
+      return 8; // EBADF for other fds
+    },
+    fd_prestat_dir_name(fd: number, pathPtr: number, pathLen: number): number {
+      if (fd === 3) {
+        new Uint8Array(wasm.memory.buffer)[pathPtr] = 47; // '/'
+        return 0;
+      }
+      return 8;
+    },
     fd_read(fd: number, iovs: number, iovsLen: number, nread: number) {
       return vfs.fdRead(fd, iovs, iovsLen, nread,
         new DataView(wasm.memory.buffer), new Uint8Array(wasm.memory.buffer));
@@ -269,17 +299,49 @@ async function init(modelFileName: string) {
 
   // Create engine
   const modelPath = `/${modelFileName}`;
+  console.log("[worker] Creating engine with model:", modelPath);
+
   const pathPtr = writeString(wasm, modelPath);
   const cpuPtr = writeString(wasm, "cpu");
+  console.log("[worker] engine_settings_create...");
   const settings = wasm.litert_lm_engine_settings_create(pathPtr, cpuPtr, 0, 0);
+  console.log("[worker] settings =", settings);
+  if (!settings) {
+    postMessage({ type: "error", text: "engine_settings_create returned null" });
+    return;
+  }
   wasm.litert_lm_engine_settings_set_max_num_tokens(settings, 2048);
   wasm.litert_lm_engine_settings_enable_benchmark(settings);
   wasm.wasm_free(pathPtr);
   wasm.wasm_free(cpuPtr);
 
+  // Capture C++ error messages during engine_create
+  let wasmErrors: string[] = [];
+  const origFdWrite = wasiImports.fd_write;
+  wasiImports.fd_write = (_fd: number, iovsPtr: number, iovsLen: number, nwrittenPtr: number): number => {
+    const v = new DataView(wasm.memory.buffer);
+    const mem = new Uint8Array(wasm.memory.buffer);
+    let written = 0;
+    for (let i = 0; i < iovsLen; i++) {
+      const ptr = v.getUint32(iovsPtr + i * 8, true);
+      const len = v.getUint32(iovsPtr + i * 8 + 4, true);
+      const text = new TextDecoder().decode(mem.subarray(ptr, ptr + len));
+      wasmErrors.push(text);
+      console.log("[wasm]", text);
+      written += len;
+    }
+    v.setUint32(nwrittenPtr, written, true);
+    return 0;
+  };
+
+  console.log("[worker] engine_create...");
   const engine = wasm.litert_lm_engine_create(settings);
+  console.log("[worker] engine =", engine);
+  wasiImports.fd_write = origFdWrite;
+
   if (!engine) {
-    postMessage({ type: "error", text: "Engine creation failed" });
+    const errMsg = wasmErrors.join("").trim() || "engine_create returned null (no error message from C++)";
+    postMessage({ type: "error", text: errMsg });
     return;
   }
 

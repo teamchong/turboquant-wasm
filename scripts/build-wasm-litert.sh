@@ -607,7 +607,7 @@ LM_EXTRA_FORCE_INCLUDES=(
 )
 
 # Skip list: files that need unavailable platform features
-LM_SKIP_PATTERNS="test|benchmark|_main\.|worker_thread_pthread|memory_mapped_file_win|audio_preprocessor_miniaudio|npu_compiled_model|huggingface_tokenizer|gemma_model_constraint_provider\.cc|llg_constraint|llguidance|tool_use/|parsers\.rs|stb_image_preprocessor|log_tensor_buffer|file_data_stream|lora_util|lora_data|metrics_util|logging_tensor_buffer|model_resources_task|engine_advanced_impl|session_advanced|litert_lm_lib\.cc|resource_manager|execution_manager|constraint_provider_factory"
+LM_SKIP_PATTERNS="test|benchmark|_main\.|worker_thread_pthread|memory_mapped_file_win|audio_preprocessor_miniaudio|npu_compiled_model|huggingface_tokenizer|gemma_model_constraint_provider\.cc|llg_constraint|llguidance|tool_use/|parsers\.rs|stb_image_preprocessor|log_tensor_buffer|file_data_stream|lora_util|lora_data|metrics_util|logging_tensor_buffer|model_resources_task|engine_advanced_impl|session_advanced|litert_lm_lib\.cc|resource_manager|execution_manager|constraint_provider_factory|shared_flags"
 
 LM_SOURCES=()
 # Minijinja C++ replacement (replaces Rust CXX bridge)
