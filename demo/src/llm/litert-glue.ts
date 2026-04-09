@@ -190,10 +190,23 @@ export function createEnvironment(e: LiteRtExports): number {
  * Compile a model for execution (applies XNNPack/WebGPU optimization).
  */
 export function compileModel(e: LiteRtExports, env: number, model: number): number {
+  // Create compilation options with CPU accelerator
+  const optsOut = e.wasm_malloc(4);
+  const optsStatus = (e as any).LiteRtCreateOptions(optsOut);
+  const opts = readU32(e, optsOut);
+  e.wasm_free(optsOut);
+  console.log("[compile] options status =", optsStatus, "opts =", opts);
+
+  if (opts) {
+    // Set CPU accelerator (kLiteRtHwAcceleratorCpu = 1)
+    (e as any).LiteRtSetOptionsHardwareAccelerators(opts, 1);
+  }
+
   const compiledOut = e.wasm_malloc(4);
-  const status = e.LiteRtCreateCompiledModel(env, model, 0, compiledOut);
+  const status = e.LiteRtCreateCompiledModel(env, model, opts || 0, compiledOut);
   const compiled = readU32(e, compiledOut);
   e.wasm_free(compiledOut);
+  console.log("[compile] status =", status, "compiled =", compiled);
   if (status !== 0 || !compiled) {
     throw new Error(`LiteRtCreateCompiledModel failed: status=${status}`);
   }

@@ -11,8 +11,8 @@ import {
   type LiteRtExports,
 } from "./litert-glue.js";
 
-// Gemma 4 E2B web model (.task format = tflite + metadata)
-const MODEL_URL = "https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/main/gemma-4-E2B-it-web.task";
+// MobileNet V1 quantized (4.1MB) to verify pipeline, then switch to Gemma 4 E2B
+const MODEL_URL = "/test-model.tflite";
 
 const $ = (s: string) => document.querySelector(s)!;
 const statusEl = $("#status") as HTMLElement;
@@ -50,7 +50,7 @@ function formatBytes(b: number): string {
 async function fetchAndLoadModel(): Promise<{ ptr: number; size: number }> {
   if (!lm) throw new Error("WASM not initialized");
   const root = await navigator.storage.getDirectory();
-  const fileName = "gemma-4-E2B-it-web.task";
+  const fileName = "test-model.tflite";
 
   // Check OPFS cache
   let fileSize = 0;
@@ -119,13 +119,17 @@ async function main() {
     return;
   }
 
-  // Step 2: Fetch model and stream into WASM heap (16MB chunks, no full JS copy)
+  // Step 2: Fetch model directly into WASM heap
   let modelPtr: number;
   let modelSize: number;
   try {
-    const result = await fetchAndLoadModel();
-    modelPtr = result.ptr;
-    modelSize = result.size;
+    statusEl.textContent = "Fetching model...";
+    const response = await fetch(MODEL_URL);
+    const modelData = new Uint8Array(await response.arrayBuffer());
+    modelSize = modelData.byteLength;
+    console.log("[model] fetched", modelSize, "bytes");
+    modelPtr = lm.wasm_malloc(modelSize);
+    new Uint8Array(lm.memory.buffer, modelPtr, modelSize).set(modelData);
   } catch (e) {
     statusEl.textContent = `Model load failed: ${(e as Error).message}`;
     statusEl.classList.add("error");
@@ -138,13 +142,7 @@ async function main() {
   try {
     const env = createEnvironment(lm);
 
-    // Check model magic bytes
-    const header = new Uint8Array(lm.memory.buffer, modelPtr, 8);
-    console.log("[model] first 8 bytes:", Array.from(header).map(b => b.toString(16).padStart(2, '0')).join(' '));
-    console.log("[model] as string:", new TextDecoder().decode(header));
-    console.log("[model] size:", modelSize, "bytes =", (modelSize / 1e9).toFixed(2), "GB");
-
-    // LiteRtCreateModelFromBuffer — parse the model from WASM heap
+    console.log("[model] ptr =", modelPtr, "size =", modelSize);
     console.log("[model] calling LiteRtCreateModelFromBuffer...");
     const modelOut = lm.wasm_malloc(4);
     let status: number;

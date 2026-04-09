@@ -462,6 +462,8 @@ wasm-ld --no-entry \
   --export=wasm_malloc --export=wasm_free \
   --export=LiteRtCreateModelFromBuffer --export=LiteRtDestroyModel \
   --export=LiteRtCreateCompiledModel --export=LiteRtDestroyCompiledModel \
+  --export=LiteRtCreateOptions --export=LiteRtDestroyOptions \
+  --export=LiteRtSetOptionsHardwareAccelerators \
   --export=LiteRtRunCompiledModel \
   --export=LiteRtGetCompiledModelInputBufferRequirements \
   --export=LiteRtGetCompiledModelOutputBufferRequirements \
