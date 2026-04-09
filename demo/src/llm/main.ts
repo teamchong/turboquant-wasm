@@ -45,34 +45,52 @@ function formatBytes(b: number): string {
   return `${(b / 1e9).toFixed(2)} GB`;
 }
 
-async function fetchWithProgress(url: string, label: string): Promise<ArrayBuffer> {
+/**
+ * Download model to OPFS (Origin Private File System), then read back.
+ * Streams directly to disk — never holds 2GB in JS memory.
+ * On subsequent visits, serves from OPFS cache (instant).
+ */
+async function downloadModelToOPFS(url: string, filename: string): Promise<ArrayBuffer> {
+  const root = await navigator.storage.getDirectory();
+
+  // Check cache first
+  try {
+    const existing = await root.getFileHandle(filename);
+    const file = await existing.getFile();
+    if (file.size > 100_000_000) { // >100MB = valid cached model
+      statusEl.textContent = `Loading cached model (${formatBytes(file.size)})...`;
+      return await file.arrayBuffer();
+    }
+  } catch { /* not cached */ }
+
+  // Download with streaming write to OPFS
   const response = await fetch(url);
   if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
   const total = Number(response.headers.get("content-length") || 0);
+
+  const fileHandle = await root.getFileHandle(filename, { create: true });
+  const writable = await fileHandle.createWritable();
   const reader = response.body!.getReader();
-  const chunks: Uint8Array[] = [];
   let loaded = 0;
 
   while (true) {
     const { done, value } = await reader.read();
     if (done) break;
-    chunks.push(value);
+    await writable.write(value);
     loaded += value.length;
     if (total > 0) {
       const pct = ((loaded / total) * 100).toFixed(0);
-      statusEl.textContent = `${label}: ${pct}% (${formatBytes(loaded)} / ${formatBytes(total)})`;
+      statusEl.textContent = `Downloading Gemma 4 E2B: ${pct}% (${formatBytes(loaded)} / ${formatBytes(total)})`;
     } else {
-      statusEl.textContent = `${label}: ${formatBytes(loaded)}`;
+      statusEl.textContent = `Downloading Gemma 4 E2B: ${formatBytes(loaded)}`;
     }
   }
+  await writable.close();
 
-  const result = new Uint8Array(loaded);
-  let offset = 0;
-  for (const chunk of chunks) {
-    result.set(chunk, offset);
-    offset += chunk.length;
-  }
-  return result.buffer;
+  // Read back from OPFS
+  statusEl.textContent = "Reading model from storage...";
+  const file = await (await root.getFileHandle(filename)).getFile();
+  return await file.arrayBuffer();
 }
 
 function sendMessage() {
@@ -140,10 +158,10 @@ async function main() {
     return;
   }
 
-  // Step 2: Download Gemma 4 E2B model
+  // Step 2: Download Gemma 4 E2B model (streams to OPFS, cached on disk)
   let modelBuffer: ArrayBuffer;
   try {
-    modelBuffer = await fetchWithProgress(MODEL_URL, "Downloading Gemma 4 E2B");
+    modelBuffer = await downloadModelToOPFS(MODEL_URL, MODEL_NAME);
   } catch (e) {
     statusEl.textContent = `Download failed: ${(e as Error).message}`;
     statusEl.classList.add("error");
