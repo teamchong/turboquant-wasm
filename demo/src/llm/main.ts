@@ -8,7 +8,7 @@
  * ~4.5x memory savings → 8K context becomes ~36K in same GPU memory.
  */
 
-import { pipeline, env, type TextGenerationPipeline } from "@huggingface/transformers";
+import { pipeline, env, TextStreamer, type TextGenerationPipeline } from "@huggingface/transformers";
 import { TQKVCache } from "./tq-kv-cache.js";
 
 env.backends.onnx.wasm!.numThreads = 1;
@@ -70,38 +70,37 @@ async function sendMessage() {
 
   try {
     const messages = [{ role: "user" as const, content: text }];
-    const output = await gen(messages, {
-      max_new_tokens: 256,
-      do_sample: false,
-      callback_function: (data: any) => {
+
+    const streamer = new TextStreamer((gen as any).tokenizer, {
+      skip_prompt: true,
+      skip_special_tokens: true,
+      callback_function: (chunk: string) => {
         tokenCount++;
-        if (data?.[0]?.generated_text) {
-          const lastMsg = data[0].generated_text.at(-1);
-          if (lastMsg?.role === "assistant") {
-            assistantDiv.textContent = lastMsg.content;
-            // Live stats update
-            const elapsed = (performance.now() - startTime) / 1000;
-            statSpeed.textContent = `${(tokenCount / elapsed).toFixed(1)} tok/s`;
-            if (tqCache) {
-              const stats = tqCache.getStats();
-              if (stats.compressedBytes > 0) {
-                const ratio = (stats.uncompressedBytes / stats.compressedBytes).toFixed(1);
-                statKV.textContent = `KV: ${formatBytes(stats.compressedBytes)} (${ratio}x)`;
-              }
-            }
+        assistantDiv.textContent += chunk;
+        messagesEl.scrollTop = messagesEl.scrollHeight;
+        const elapsed = (performance.now() - startTime) / 1000;
+        statSpeed.textContent = `${(tokenCount / elapsed).toFixed(1)} tok/s`;
+        if (tqCache && tqEnabled) {
+          const stats = tqCache.getStats();
+          if (stats.compressedBytes > 0) {
+            const ratio = (stats.uncompressedBytes / stats.compressedBytes).toFixed(1);
+            statKV.textContent = `KV: ${formatBytes(stats.compressedBytes)} (${ratio}x)`;
           }
         }
       },
     });
 
-    const response = output[0]?.generated_text?.at(-1)?.content || "[empty]";
-    assistantDiv.textContent = response;
+    const output = await gen(messages, {
+      max_new_tokens: 256,
+      do_sample: false,
+      streamer,
+    });
 
     const elapsed = (performance.now() - startTime) / 1000;
     statSpeed.textContent = `${(tokenCount / elapsed).toFixed(1)} tok/s`;
-    statCtx.textContent = `${elapsed.toFixed(1)}s · ${tokenCount} tokens`;
+    statCtx.textContent = `${elapsed.toFixed(1)}s · ${tokenCount} tok`;
 
-    if (tqCache) {
+    if (tqCache && tqEnabled) {
       const stats = tqCache.getStats();
       if (stats.compressedBytes > 0) {
         const ratio = (stats.uncompressedBytes / stats.compressedBytes).toFixed(1);
@@ -200,6 +199,24 @@ async function main() {
 sendBtn.addEventListener("click", sendMessage);
 inputEl.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && !e.shiftKey) sendMessage();
+});
+
+// Fill input with a long context to test KV cache limits
+const fillBtn = $("#fill-long") as HTMLButtonElement;
+fillBtn.addEventListener("click", () => {
+  const paragraphs = [
+    "The history of artificial intelligence began in antiquity, with myths, stories and rumors of artificial beings endowed with intelligence or consciousness by master craftsmen. The seeds of modern AI were planted by philosophers who attempted to describe the process of human thinking as the mechanical manipulation of symbols. This work culminated in the invention of the programmable digital computer in the 1940s, a machine based on the abstract essence of mathematical reasoning.",
+    "The field of AI research was founded at a workshop held on the campus of Dartmouth College during the summer of 1956. Those who attended would become the leaders of AI research for decades. Many of them predicted that a machine as intelligent as a human being would exist in no more than a generation, and they were given millions of dollars to make this vision come true. Eventually it became obvious that commercial developers and researchers had grossly underestimated the difficulty of the project.",
+    "In 1973, in response to the criticism from James Lighthill and ongoing pressure from the US Congress, both the US and British governments cut off exploratory research in AI. The next few years would later be called an AI winter, a period when obtaining funding for AI projects was difficult. In the early 1980s, AI research was revived by the commercial success of expert systems, a form of AI program that simulated the knowledge and analytical skills of human experts.",
+    "Deep learning began to dominate industry benchmarks in 2012. The transformer architecture debuted in 2017 and was used to produce impressive generative AI applications. In 2023, large language models demonstrated abilities in a wide range of tasks, including understanding and generating natural language, solving mathematical problems, writing computer code, and many other tasks that were not anticipated by the researchers who developed them.",
+    "The recent explosion of generative AI has raised fundamental questions about the nature of intelligence, creativity, and consciousness. As these systems become more capable, society faces unprecedented challenges in areas of employment, education, intellectual property, and governance. The development of artificial general intelligence remains one of the most ambitious and controversial goals in the history of technology.",
+    "Neural network architectures have evolved significantly since the perceptron was introduced in 1958. Convolutional neural networks revolutionized computer vision, recurrent neural networks transformed sequence modeling, and attention mechanisms enabled the processing of long-range dependencies. The scaling laws discovered in recent years suggest that simply making models larger and training them on more data continues to improve their capabilities.",
+    "The environmental impact of training large AI models has become a growing concern. A single training run for a large language model can consume as much energy as several households use in a year. Researchers are exploring more efficient training methods, including sparse models, mixture of experts architectures, and novel hardware designs that could reduce the carbon footprint of AI development.",
+    "Reinforcement learning from human feedback has emerged as a key technique for aligning AI systems with human values and preferences. This approach involves training a reward model based on human evaluations, then using reinforcement learning to optimize the AI system against this reward model. The technique has been instrumental in making large language models more helpful, harmless, and honest.",
+  ];
+  const longText = paragraphs.join(" ") + "\n\nBased on all the information above, what are the three most important turning points in the history of AI and why?";
+  inputEl.value = longText;
+  inputEl.focus();
 });
 
 main();
