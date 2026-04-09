@@ -13,7 +13,7 @@ import { TQKVCache } from "./tq-kv-cache.js";
 
 env.backends.onnx.wasm!.numThreads = 1;
 
-const MODEL_ID = "onnx-community/gemma-3-1b-it-ONNX";
+const MODEL_ID = "onnx-community/gemma-4-E2B-it-ONNX";
 
 const $ = (s: string) => document.querySelector(s)!;
 const statusEl = $("#status") as HTMLElement;
@@ -128,7 +128,7 @@ async function main() {
   try {
     gen = await pipeline("text-generation", MODEL_ID, {
       device: "webgpu",
-      dtype: "q4",
+      dtype: "q4f16",
       progress_callback: (progress: any) => {
         if (progress.status === "downloading") {
           const pct = progress.progress?.toFixed(0) || "?";
