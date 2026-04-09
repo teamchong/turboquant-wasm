@@ -11,8 +11,8 @@ import {
   type LiteRtExports,
 } from "./litert-glue.js";
 
-// MobileNet V1 quantized (4.1MB) to verify pipeline, then switch to Gemma 4 E2B
-const MODEL_URL = "/test-model.tflite";
+// Gemma 4 E2B web model (2GB tflite)
+const MODEL_URL = "https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/main/gemma-4-E2B-it-web.task";
 
 const $ = (s: string) => document.querySelector(s)!;
 const statusEl = $("#status") as HTMLElement;
@@ -50,7 +50,7 @@ function formatBytes(b: number): string {
 async function fetchAndLoadModel(): Promise<{ ptr: number; size: number }> {
   if (!lm) throw new Error("WASM not initialized");
   const root = await navigator.storage.getDirectory();
-  const fileName = "test-model.tflite";
+  const fileName = "gemma-4-E2B-it-web.task";
 
   // Check OPFS cache
   let fileSize = 0;
@@ -119,17 +119,13 @@ async function main() {
     return;
   }
 
-  // Step 2: Fetch model directly into WASM heap
+  // Step 2: Download model to OPFS, then stream into WASM heap in chunks
   let modelPtr: number;
   let modelSize: number;
   try {
-    statusEl.textContent = "Fetching model...";
-    const response = await fetch(MODEL_URL);
-    const modelData = new Uint8Array(await response.arrayBuffer());
-    modelSize = modelData.byteLength;
-    console.log("[model] fetched", modelSize, "bytes");
-    modelPtr = lm.wasm_malloc(modelSize);
-    new Uint8Array(lm.memory.buffer, modelPtr, modelSize).set(modelData);
+    const result = await fetchAndLoadModel();
+    modelPtr = result.ptr;
+    modelSize = result.size;
   } catch (e) {
     statusEl.textContent = `Model load failed: ${(e as Error).message}`;
     statusEl.classList.add("error");
