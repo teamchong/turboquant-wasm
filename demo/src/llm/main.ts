@@ -31,14 +31,20 @@ let generating = false;
 
 const tqToggle = $("#tq-toggle") as HTMLInputElement;
 tqToggle.addEventListener("change", () => {
-  tqEnabled = tqToggle.checked;
-  const label = tqEnabled ? "TQ KV Cache ON" : "TQ KV Cache OFF";
-  console.log(`[TQ] ${label}`);
-  if (tqCache) {
-    if (!tqEnabled) {
-      statKV.textContent = "KV: uncompressed";
+  if (!tqToggle.checked) {
+    const ok = confirm(
+      "⚠️ Disabling TQ removes ~6.7x KV cache compression.\n\n" +
+      "Long contexts WILL crash your browser tab (out of GPU memory).\n\n" +
+      "Disable TQ compression?"
+    );
+    if (!ok) {
+      tqToggle.checked = true;
+      return;
     }
   }
+  tqEnabled = tqToggle.checked;
+  console.log(`[TQ] ${tqEnabled ? "ON" : "OFF"}`);
+  statKV.textContent = tqEnabled ? "KV: —" : "KV: uncompressed (no protection)";
 });
 
 function addMsg(role: "user" | "assistant" | "system", text: string): HTMLElement {
