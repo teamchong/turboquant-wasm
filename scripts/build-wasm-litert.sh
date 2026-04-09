@@ -472,6 +472,12 @@ $CXX "${TFLITE_FORCE_INCLUDES[@]}" "${TFLITE_INCLUDES[@]}" "${TFLITE_DEFINES[@]}
   -c "$SHIMS/tflite_wasm_impls.cc" -o "$CACHE/extra/tflite_wasm_impls.o"
 SHIM_OBJECTS+=("$CACHE/extra/tflite_wasm_impls.o")
 
+# LiteRT WASM platform layer (SentencePiece UTF-8, protobuf byte order, abseil platform)
+$CXX "${TFLITE_FORCE_INCLUDES[@]}" "${TFLITE_INCLUDES[@]}" "${TFLITE_DEFINES[@]}" \
+  "${PB_INCLUDES[@]}" \
+  -c "$SHIMS/litert_wasm_platform.cc" -o "$CACHE/extra/litert_wasm_platform.o"
+SHIM_OBJECTS+=("$CACHE/extra/litert_wasm_platform.o")
+
 echo "  ${#SHIM_OBJECTS[@]} compiled"
 
 # --------------------------------------------------------------------------
@@ -681,8 +687,11 @@ ALL_OBJECTS=(
 
 echo "  ${#ALL_OBJECTS[@]} total objects"
 
+# --allow-undefined: platform-unavailable symbols (GPU, filesystem, Rust deps)
+# trap at runtime if called — correct for features not reachable on WASM.
 wasm-ld --no-entry --export-dynamic \
   --export=wasm_malloc --export=wasm_free \
+  --allow-undefined \
   --error-limit=0 \
   "${ALL_OBJECTS[@]}" \
   $ZIGCXX_LIBS \
