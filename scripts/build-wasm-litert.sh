@@ -66,6 +66,7 @@ TFLITE_DEFINES=(
 )
 
 TFLITE_FORCE_INCLUDES=(
+  -include "$SHIMS/fstream"
   -include "$SHIMS/mutex"
   -include "$SHIMS/shared_mutex"
   -include "$SHIMS/condition_variable"
@@ -600,6 +601,8 @@ LM_INCLUDES=(
   "${TFLITE_INCLUDES[@]}"
   "${PB_INCLUDES[@]}"
   -I "$SP/src"
+  -I "$SP"
+  -I "$SP/third_party"
   -I "$ROOT/vendor/nlohmann-json/include"
   -I "$ZLIB"
   -I "$ZLIB/contrib"
@@ -625,6 +628,7 @@ LM_SOURCES=()
 LM_SOURCES+=("$LM/runtime/components/rust/minijinja_template_impl.cc")
 for dir in \
   "$LM/c" \
+  "$LM/schema/core" \
   "$LM/runtime/components" \
   "$LM/runtime/components/constrained_decoding" \
   "$LM/runtime/components/embedding_lookup" \
