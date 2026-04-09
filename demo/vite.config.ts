@@ -27,7 +27,13 @@ export default defineConfig(({ command }) => ({
       "Cross-Origin-Opener-Policy": "same-origin",
       "Cross-Origin-Embedder-Policy": "require-corp",
     },
+    fs: {
+      // Allow serving files from repo root (for dist/*.wasm)
+      allow: [resolve(__dirname, "..")],
+    },
   },
+  // Serve repo-root dist/ as /dist/ so WASM files are accessible
+  publicDir: resolve(__dirname, "../dist"),
   optimizeDeps: {
     exclude: ["turboquant-wasm"],
   },

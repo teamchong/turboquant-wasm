@@ -339,7 +339,7 @@ for subdir in \
   "absl/types/internal"; do
   for f in "$ABSL/$subdir"/*.cc; do
     [ -f "$f" ] || continue
-    echo "$f" | grep -qiE "test|benchmark|_testing|_mock|print_hash_of|gentables" && continue
+    echo "$f" | grep -qiE "test|benchmark|_testing|_mock|print_hash_of|gentables|/flags/" && continue
     rel="${f#$ABSL/}"
     oname="${rel//\//__}"
     oname="${oname%.cc}.o"
@@ -454,6 +454,24 @@ for f in "$LITERT/tflite/delegates/xnnpack/file_util.cc" \
   fi
 done
 
+# zlib + minizip (for .task/.litertlm model loading)
+echo "  Compiling zlib + minizip..."
+ZLIB="$ROOT/vendor/zlib"
+for f in "$ZLIB/adler32.c" "$ZLIB/crc32.c" "$ZLIB/inffast.c" "$ZLIB/inflate.c" \
+         "$ZLIB/inftrees.c" "$ZLIB/zutil.c" "$ZLIB/uncompr.c" \
+         "$ZLIB/compress.c" "$ZLIB/deflate.c" "$ZLIB/trees.c" \
+         "$ZLIB/contrib/minizip/ioapi.c" "$ZLIB/contrib/minizip/unzip.c"; do
+  [ -f "$f" ] || continue
+  base=$(basename "$f" .c)
+  obj="$CACHE/deps/zlib_${base}.o"
+  if [ ! -f "$obj" ] || [ "$f" -nt "$obj" ]; then
+    $CC -I "$ZLIB" -I "$ZLIB/contrib/minizip" -DHAVE_ZLIB=1 \
+      -c "$f" -o "$obj" 2>/dev/null && DEP_OBJECTS+=("$obj") || echo "  zlib FAIL: $(basename $f)"
+  else
+    DEP_OBJECTS+=("$obj")
+  fi
+done
+
 echo "  ${#DEP_OBJECTS[@]} total dep objects"
 
 # --------------------------------------------------------------------------
@@ -495,7 +513,7 @@ PB_INCLUDES=(
   -I "$ORT_EXT/abseil-cpp"
 )
 PB_DEFINES=(
-  -DHAVE_ZLIB=0
+  -DHAVE_ZLIB=1
   -DPROTOBUF_USE_DLLS=0
   -DABSL_MIN_LOG_LEVEL=4
 )
@@ -573,6 +591,7 @@ LM="$ROOT/vendor/litert-lm"
 LM_OBJECTS=()
 mkdir -p "$CACHE/litert-lm"
 
+ZLIB="$ROOT/vendor/zlib"
 LM_INCLUDES=(
   -I "$LM"
   -I "$LM/runtime"
@@ -582,6 +601,9 @@ LM_INCLUDES=(
   "${PB_INCLUDES[@]}"
   -I "$SP/src"
   -I "$ROOT/vendor/nlohmann-json/include"
+  -I "$ZLIB"
+  -I "$ZLIB/contrib"
+  -I "$ZLIB/contrib/minizip"
 )
 
 LM_DEFINES=(
@@ -596,7 +618,7 @@ LM_EXTRA_FORCE_INCLUDES=(
 )
 
 # Skip list: files that need unavailable platform features
-LM_SKIP_PATTERNS="test|benchmark|_main\.|worker_thread_pthread|memory_mapped_file_win|audio_preprocessor_miniaudio|npu_compiled_model|huggingface_tokenizer|gemma_model_constraint_provider\.cc|llg_constraint|llguidance|zip_utils|zip_readonly|tool_use/|parsers\.rs|stb_image_preprocessor|log_tensor_buffer|file_data_stream|lora_util|lora_data|metrics_util|logging_tensor_buffer|model_resources_task|engine_advanced_impl|session_advanced|litert_lm_lib\.cc|resource_manager|execution_manager|constraint_provider_factory"
+LM_SKIP_PATTERNS="test|benchmark|_main\.|worker_thread_pthread|memory_mapped_file_win|audio_preprocessor_miniaudio|npu_compiled_model|huggingface_tokenizer|gemma_model_constraint_provider\.cc|llg_constraint|llguidance|tool_use/|parsers\.rs|stb_image_preprocessor|log_tensor_buffer|file_data_stream|lora_util|lora_data|metrics_util|logging_tensor_buffer|model_resources_task|engine_advanced_impl|session_advanced|litert_lm_lib\.cc|resource_manager|execution_manager|constraint_provider_factory"
 
 LM_SOURCES=()
 # Minijinja C++ replacement (replaces Rust CXX bridge)
@@ -689,8 +711,49 @@ echo "  ${#ALL_OBJECTS[@]} total objects"
 
 # --allow-undefined: platform-unavailable symbols (GPU, filesystem, Rust deps)
 # trap at runtime if called — correct for features not reachable on WASM.
-wasm-ld --no-entry --export-dynamic \
+# Only export the C API functions we need (not --export-dynamic which exports 23K symbols).
+wasm-ld --no-entry \
+  --export=memory \
   --export=wasm_malloc --export=wasm_free \
+  --export=litert_lm_engine_settings_create \
+  --export=litert_lm_engine_settings_delete \
+  --export=litert_lm_engine_settings_set_max_num_tokens \
+  --export=litert_lm_engine_settings_set_prefill_chunk_size \
+  --export=litert_lm_engine_settings_enable_benchmark \
+  --export=litert_lm_engine_settings_set_activation_data_type \
+  --export=litert_lm_engine_settings_set_num_prefill_tokens \
+  --export=litert_lm_engine_settings_set_num_decode_tokens \
+  --export=litert_lm_engine_settings_set_parallel_file_section_loading \
+  --export=litert_lm_engine_settings_set_cache_dir \
+  --export=litert_lm_engine_create --export=litert_lm_engine_delete \
+  --export=litert_lm_engine_create_session \
+  --export=litert_lm_session_config_create --export=litert_lm_session_config_delete \
+  --export=litert_lm_session_config_set_max_output_tokens \
+  --export=litert_lm_session_config_set_sampler_params \
+  --export=litert_lm_session_delete \
+  --export=litert_lm_session_generate_content \
+  --export=litert_lm_session_generate_content_stream \
+  --export=litert_lm_session_get_benchmark_info \
+  --export=litert_lm_responses_delete \
+  --export=litert_lm_responses_get_num_candidates \
+  --export=litert_lm_responses_get_response_text_at \
+  --export=litert_lm_benchmark_info_delete \
+  --export=litert_lm_benchmark_info_get_time_to_first_token \
+  --export=litert_lm_benchmark_info_get_decode_tokens_per_sec_at \
+  --export=litert_lm_benchmark_info_get_prefill_tokens_per_sec_at \
+  --export=litert_lm_conversation_config_create \
+  --export=litert_lm_conversation_config_delete \
+  --export=litert_lm_conversation_create --export=litert_lm_conversation_delete \
+  --export=litert_lm_conversation_send_message \
+  --export=litert_lm_conversation_send_message_stream \
+  --export=litert_lm_conversation_cancel_process \
+  --export=litert_lm_json_response_delete \
+  --export=litert_lm_json_response_get_string \
+  --export=litert_lm_set_min_log_level \
+  --export=tq_kv_create --export=tq_kv_destroy \
+  --export=tq_kv_append --export=tq_kv_dot_batch \
+  --export=tq_kv_decode_position --export=tq_kv_length \
+  --export=tq_kv_compressed_size \
   --allow-undefined \
   --error-limit=0 \
   "${ALL_OBJECTS[@]}" \

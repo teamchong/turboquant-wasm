@@ -6,7 +6,7 @@
  * 89 imports total: 19 WASI + 70 env.
  */
 
-const WASM_URL = "/dist/turboquant-litert.wasm";
+const WASM_URL = "/turboquant-litert.wasm";
 
 // ============================================================================
 // LiteRT-LM C API exports
@@ -202,112 +202,18 @@ export function registerModelFile(path: string, data: ArrayBuffer): void {
 }
 
 export async function initLiteRt(): Promise<LiteRtExports> {
-  // Generic no-op for env imports (GPU, NPU, compiler, etc.)
-  function trap(): never { throw new Error("Unreachable WASM import called"); }
-  function noop() {}
-  function zero() { return 0; }
-  function zeroN(..._args: unknown[]) { return 0; }
+  // Auto-provide any env import as a no-op function that returns 0.
+  // Platform-unavailable symbols (GPU, NPU, compiler, abseil flags, Rust deps)
+  // become imports via --allow-undefined. They are unreachable on CPU-only WASM.
+  // If one IS reached, the console.warn helps debug which symbol was called.
+  const envProxy = new Proxy({} as Record<string, Function>, {
+    get(_target, prop: string) {
+      return (..._args: unknown[]) => 0;
+    },
+  });
 
   const imports: WebAssembly.Imports = {
-    env: {
-      // Abseil threading/sync — single-threaded WASM
-      AbslInternalPerThreadSemPost_lts_20250814: noop,
-      AbslInternalPerThreadSemWait_lts_20250814: zeroN,
-
-      // Abseil time — UTC only
-      '_ZN4absl12lts_2025081413time_internal4cctz12TimeZoneInfo3UTCEv': zero,
-      '_ZN4absl12lts_2025081413time_internal4cctz12TimeZoneInfo4MakeERKNSt3__112basic_stringIcNS4_11char_traitsIcEENS4_9allocatorIcEEEE': zero,
-      '_ZN4absl12lts_2025081415random_internal21InverseNormalSurvivalEd': () => 0.0,
-
-      // UTF-8 validation — return "valid"
-      utf8_range: zeroN,
-      utf8_lemire: zeroN,
-      utf8_range2: zeroN,
-
-      // LiteRT accelerator registration — CPU only on WASM
-      '_ZN6litert39TriggerAcceleratorAutomaticRegistrationER18LiteRtEnvironmentT': noop,
-
-      // GPU options — all no-ops (GPU not available)
-      '_ZN6litert10GpuOptions6CreateEv': zero,
-      '_ZN6litert10GpuOptions27EnableConstantTensorSharingEb': noop,
-      '_ZN6litert10GpuOptions12SetPrecisionENS0_9PrecisionE': noop,
-      '_ZN6litert10GpuOptions23SetPreferTextureWeightsEb': noop,
-      '_ZN6litert10GpuOptions16SetModelCacheKeyEPKc': noop,
-      '_ZN6litert10GpuOptions19SetSerializationDirEPKc': noop,
-      '_ZN6litert10GpuOptions27SetSerializeExternalTensorsEb': noop,
-      '_ZN6litert10GpuOptions17SetProgramCacheFdEi': noop,
-      '_ZN6litert10GpuOptions24SetSerializeProgramCacheEb': noop,
-      '_ZN6litert10GpuOptions26EnableInfiniteFloatCappingEb': noop,
-      '_ZN6litert10GpuOptions25CacheCompiledProgramsOnlyEb': noop,
-      '_ZN6litert10GpuOptions25EnableExternalTensorsModeEb': noop,
-      '_ZN6litert10GpuOptions24AddExternalTensorPatternEPKc': noop,
-      '_ZN6litert10GpuOptions29AddBufferStorageTensorPatternEPKc': noop,
-      '_ZN6litert10GpuOptions37SetHintFullyDelegatedToSingleDelegateEb': noop,
-      '_ZN6litert10GpuOptions31SetMadviseOriginalSharedTensorsEb': noop,
-      '_ZN6litert10GpuOptions22SetConvertWeightsOnGpuEb': noop,
-      '_ZN6litert10GpuOptions32EnableAllowSrcQuantizedFcConvOpsEb': noop,
-      '_ZN6litert10GpuOptions24HintWaitingForCompletionEb': noop,
-      '_ZN6litert10GpuOptions28SetSyncExecutionModeWaitTypeENS0_25SyncExecutionModeWaitTypeE': noop,
-      '_ZN6litert10GpuOptions32WaitForWeightsConversionCompleteEb': noop,
-      '_ZN6litert10GpuOptions11SetPriorityENS0_8PriorityE': noop,
-      '_ZN6litert10GpuOptions24SetPreferredDeviceSubstrEPKc': noop,
-      '_ZN6litert10GpuOptions25DisableShaderOptimizationEb': noop,
-      '_ZN6litert10GpuOptions38SetNumStepsOfCommandBufferPreparationsEi': noop,
-      '_ZN6litert10GpuOptions21SetNumThreadsToUploadEi': noop,
-      '_ZN6litert10GpuOptions22SetNumThreadsToCompileEi': noop,
-      LrtGetOpaqueGpuOptionsData: zero,
-      LrtGetOpaqueCompilerOptionsData: zero,
-      LrtDestroyGpuOptions: noop,
-      LrtDestroyCompilerOptions: noop,
-
-      // Compiler options — not available on WASM
-      '_ZN6litert15CompilerOptions6CreateEv': zero,
-
-      // LiteRT internal — platform-unavailable features
-      '_ZN6litert8internal14GpuEnvironmentD1Ev': noop,
-      '_ZN6litert8internal14SerializeModelEO12LiteRtModelTm': zero,
-      '_ZN6litert8internal14LoadBinaryFileENSt3__117basic_string_viewIcNS1_11char_traitsIcEEEE': zero,
-      '_ZN6litert8internal20GetDispatchOpOptionsENS_9BufferRefIhEE': zero,
-      '_ZN6litert8internal18CustomOpDispatcherC1ERKN14LiteRtOptionsT14CustomOpOptionE': noop,
-      '_ZN6litert8internal18CustomOpDispatcherD1Ev': noop,
-      '_ZN6litert8internal23DispatchDelegateOptions6CreateEv': zero,
-      '_ZN6litert8internal23DispatchDelegateOptions12SetAllocBaseEPKv': noop,
-      '_ZN6litert8internal23DispatchDelegateOptions14SetAllocBaseFdEi': noop,
-
-      // Weight loader
-      '_ZN13weight_loader24CreateLiteRtWeightLoaderEP20LiteRtRuntimeContextPKN6tflite5ModelENSt3__18optionalINS6_12basic_stringIcNS6_11char_traitsIcEENS6_9allocatorIcEEEEEENS6_10unique_ptrIN6litert18ScopedWeightSourceENS6_14default_deleteISH_EEEE': zero,
-
-      // LiteRT-LM: constrained decoding (needs Rust llguidance)
-      '_ZN6litert2lm24CreateConstraintProviderERKNSt3__17variantIJNS0_24ExternalConstraintConfigENS0_16LlGuidanceConfigENS0_9FstConfigEEEERKNS0_9TokenizerERKNS1_6vectorINSC_IiNS1_9allocatorIiEEEENSD_ISF_EEEE': zero,
-      LiteRtLmGemmaModelConstraintProvider_Create: zero,
-      LiteRtLmGemmaModelConstraintProvider_Destroy: noop,
-      LiteRtLmGemmaModelConstraintProvider_CreateConstraintFromTools: zero,
-
-      // LiteRT-LM: channel content, tool use, LoRA
-      '_ZN6litert2lm21ExtractChannelContentERKNSt3__16vectorINS0_7ChannelENS1_9allocatorIS3_EEEERNS0_9ResponsesE': zero,
-      '_ZN6litert2lm31InsertChannelContentIntoMessageERKN4absl12lts_2025081413flat_hash_mapINSt3__112basic_stringIcNS4_11char_traitsIcEENS4_9allocatorIcEEEESA_NS2_18container_internal10StringHashENSB_8StringEqENS8_INS4_4pairIKSA_SA_EEEEEERN8nlohmann16json_abi_v3_12_010basic_jsonINSM_11ordered_mapENS4_6vectorESA_bxydS8_NSM_14adl_serializerENSP_IhNS8_IhEEEEvEE': zero,
-      '_ZN6litert2lm15FormatValueAsFcERKN8nlohmann16json_abi_v3_12_010basic_jsonINS2_11ordered_mapENSt3__16vectorENS5_12basic_stringIcNS5_11char_traitsIcEENS5_9allocatorIcEEEEbxydSA_NS2_14adl_serializerENS6_IhNSA_IhEEEEvEENS5_17basic_string_viewIcS9_EE': zero,
-      '_ZN6litert2lm14FormatToolAsFcERKN8nlohmann16json_abi_v3_12_010basic_jsonINS2_11ordered_mapENSt3__16vectorENS5_12basic_stringIcNS5_11char_traitsIcEENS5_9allocatorIcEEEEbxydSA_NS2_14adl_serializerENS6_IhNSA_IhEEEEvEENS5_17basic_string_viewIcS9_EE': zero,
-      '_ZN6litert2lm13GetSyntaxTypeENSt3__117basic_string_viewIcNS1_11char_traitsIcEEEE': zero,
-      '_ZN6litert2lm21ParseTextAndToolCallsENSt3__117basic_string_viewIcNS1_11char_traitsIcEEEES5_S5_NS0_10SyntaxTypeEbS5_': zero,
-      '_ZN6litert2lm8LoraData20CreateFromScopedFileENSt3__110shared_ptrIKNS_10ScopedFileEEE': zero,
-      '_ZN6litert2lm15IsLoRAInputNameENSt3__117basic_string_viewIcNS1_11char_traitsIcEEEE': zero,
-
-      // LiteRT-LM: Gemma data processors, model resources, logging
-      '_ZN6litert2lm19Gemma3DataProcessor6CreateENS0_25Gemma3DataProcessorConfigENSt3__18optionalINS3_7variantIJNS0_11JsonPrefaceEEEEEEPKNS0_9TokenizerERKNS3_6vectorINSC_IiNS3_9allocatorIiEEEENSD_ISF_EEEEb': zero,
-      '_ZN6litert2lm19Gemma4DataProcessor6CreateENS0_25Gemma4DataProcessorConfigENSt3__18optionalINS3_7variantIJNS0_11JsonPrefaceEEEEEEPKNS0_9TokenizerERKNS3_6vectorINSC_IiNS3_9allocatorIiEEEENSD_ISF_EEEEb': zero,
-      '_ZN6litert2lm18ModelResourcesTask6CreateENSt3__110unique_ptrINS0_25ModelAssetBundleResourcesENS2_14default_deleteIS4_EEEE': zero,
-      '_ZN6litert2lm9LogTensorERNS_12TensorBufferEmNSt3__117basic_string_viewIcNS3_11char_traitsIcEEEE': noop,
-      '_ZN6litert2lmlsERNSt3__113basic_ostreamIcNS1_11char_traitsIcEEEERKNS_12TensorBufferE': zero,
-
-      // LiteRT-LM: model loading (critical — needs VFS)
-      '_ZN6litert2lm6schema22ReadHeaderFromLiteRTLMEPvmPNS1_14LitertlmHeaderE': zero,
-      '_ZN6litert2lm6schema14DecompressDataEPKhmPNSt3__16vectorIhNS4_9allocatorIhEEEE': zero,
-      '_ZN6litert2lm23ExtractFilesfromZipFileENSt3__117basic_string_viewIcNS1_11char_traitsIcEEEE': zero,
-
-      // std::filesystem::path::__parent_path
-      '_ZNKSt3__14__fs10filesystem4path13__parent_pathEv': zero,
-    },
+    env: envProxy,
 
     wasi_snapshot_preview1: {
       clock_time_get(_id: number, _prec: bigint, time_ptr: number): number {
@@ -316,7 +222,7 @@ export async function initLiteRt(): Promise<LiteRtExports> {
         );
         return 0;
       },
-      environ_get: zero,
+      environ_get() { return 0; },
       environ_sizes_get(count_ptr: number, size_ptr: number): number {
         const v = new DataView(wasm!.memory.buffer);
         v.setUint32(count_ptr, 0, true);
@@ -324,8 +230,8 @@ export async function initLiteRt(): Promise<LiteRtExports> {
         return 0;
       },
       fd_close(fd: number): number { return vfs.fdClose(fd); },
-      fd_fdstat_get: zero,
-      fd_fdstat_set_flags: zero,
+      fd_fdstat_get() { return 0; },
+      fd_fdstat_set_flags() { return 0; },
       fd_filestat_get(fd: number, buf: number): number {
         return vfs.fdFilestatGet(fd, buf, new DataView(wasm!.memory.buffer));
       },
@@ -368,14 +274,16 @@ export async function initLiteRt(): Promise<LiteRtExports> {
           new DataView(wasm!.memory.buffer), new Uint8Array(wasm!.memory.buffer));
       },
       path_filestat_get(): number { return 8; },
-      poll_oneoff: zero,
+      poll_oneoff() { return 0; },
       proc_exit(code: number): void { throw new Error(`WASM exit: ${code}`); },
-      sched_yield: zero,
+      sched_yield() { return 0; },
     },
   };
 
+  // Compile in background thread to avoid freezing the UI
   const response = await fetch(WASM_URL);
-  const { instance } = await WebAssembly.instantiateStreaming(response, imports);
+  const module = await WebAssembly.compileStreaming(response);
+  const instance = await WebAssembly.instantiate(module, imports);
   wasm = instance.exports as unknown as LiteRtExports;
 
   return wasm;
