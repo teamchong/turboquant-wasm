@@ -104,6 +104,10 @@ int dup(int fd) { (void)fd; return -1; }
 /* getpagesize — not in WASI, return 64KB (WASM page size) */
 int getpagesize(void) { return 65536; }
 
+/* getuid/getgid — POSIX user/group ID, not in WASI. Return 0 (root). */
+unsigned int getuid(void) { return 0; }
+unsigned int getgid(void) { return 0; }
+
 /* madvise — POSIX memory advisory, no-op on WASM (no virtual memory) */
 int madvise(void* addr, size_t len, int advice) {
   (void)addr; (void)len; (void)advice; return 0;

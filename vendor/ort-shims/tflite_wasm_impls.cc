@@ -30,67 +30,9 @@ enum TfLiteStatus { kTfLiteOk = 0, kTfLiteError = 1 };
 
 namespace Eigen { struct half {}; }
 
-// ============================================================================
-// ErrorReporter — varargs wrapper (same logic as converter/core/api/error_reporter.cc)
-// ============================================================================
+// ErrorReporter and MemoryAllocation now provided by litert runtime.
+
 namespace tflite {
-
-class ErrorReporter {
- public:
-  virtual ~ErrorReporter() = default;
-  virtual int Report(const char* format, va_list args) = 0;
-  int Report(const char* format, ...);
-  int ReportError(void*, const char* format, ...);
-};
-
-int ErrorReporter::Report(const char* format, ...) {
-  va_list args;
-  va_start(args, format);
-  int code = Report(format, args);
-  va_end(args);
-  return code;
-}
-
-int ErrorReporter::ReportError(void*, const char* format, ...) {
-  va_list args;
-  va_start(args, format);
-  int code = Report(format, args);
-  va_end(args);
-  return code;
-}
-
-// ============================================================================
-// MemoryAllocation — in-memory buffer view (no file I/O needed)
-// ============================================================================
-class Allocation {
- public:
-  virtual ~Allocation() = default;
-  virtual const void* base() const = 0;
-  virtual size_t bytes() const = 0;
-  virtual bool valid() const = 0;
-};
-
-class MemoryAllocation : public Allocation {
- public:
-  MemoryAllocation(const void* ptr, size_t num_bytes, ErrorReporter*);
-  ~MemoryAllocation() override;
-  const void* base() const override { return ptr_; }
-  size_t bytes() const override { return num_bytes_; }
-  bool valid() const override { return ptr_ != nullptr; }
- private:
-  const void* ptr_;
-  size_t num_bytes_;
-};
-
-MemoryAllocation::MemoryAllocation(const void* ptr, size_t num_bytes,
-                                   ErrorReporter*)
-    : ptr_(ptr), num_bytes_(num_bytes) {}
-MemoryAllocation::~MemoryAllocation() = default;
-
-// No filesystem in WASM — models are loaded from memory buffers via JS
-Allocation* GetAllocationFromFile(const char*, ErrorReporter*, bool) {
-  return nullptr;
-}
 
 // ============================================================================
 // Kernel registrations — ops excluded from build (audio, RNG, LSH, conv2d)

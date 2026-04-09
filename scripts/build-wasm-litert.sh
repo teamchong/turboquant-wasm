@@ -399,6 +399,45 @@ done
 DEP_OBJECTS+=("${XNN_REF_OBJECTS[@]}")
 echo "  xnn reference: ${#XNN_REF_OBJECTS[@]} compiled"
 
+# LiteRT runtime (CC/C API, core, runtime, accelerators)
+echo "  Compiling LiteRT runtime..."
+LITERT_API_OBJECTS=()
+LITERT_SKIP="test|benchmark|_mock|gpu_|npu_|dispatch|dynamic_runtime|compiler|no_builtin|_win\.|metal_info|open_cl|dynamic_loading|filesystem\.cc|model_serialize|compilation_cache"
+for subdir in \
+  "$LITERT/litert/c" \
+  "$LITERT/litert/c/internal" \
+  "$LITERT/litert/c/options" \
+  "$LITERT/litert/cc" \
+  "$LITERT/litert/cc/internal" \
+  "$LITERT/litert/cc/options" \
+  "$LITERT/litert/core" \
+  "$LITERT/litert/core/model" \
+  "$LITERT/litert/core/cache" \
+  "$LITERT/litert/core/util" \
+  "$LITERT/litert/runtime" \
+  "$LITERT/litert/runtime/from_tflite" \
+  "$LITERT/litert/runtime/accelerators/xnnpack"; do
+  for f in "$subdir"/*.cc; do
+    [ -f "$f" ] || continue
+    echo "$f" | grep -qiE "$LITERT_SKIP" && continue
+    rel="${f#$LITERT/}"
+    oname="${rel//\//__}"
+    oname="${oname%.cc}.o"
+    obj="$CACHE/deps/litert_api__$oname"
+    if [ ! -f "$obj" ] || [ "$f" -nt "$obj" ]; then
+      $CXX "${TFLITE_FORCE_INCLUDES[@]}" "${TFLITE_INCLUDES[@]}" "${TFLITE_DEFINES[@]}" \
+        -I "$LITERT" -I "$ORT_EXT/abseil-cpp" \
+        -I "$PROTOBUF/src" -I "$PROTOBUF/third_party/utf8_range" \
+        -I "$ROOT/vendor/flatbuffers/include" \
+        -c "$f" -o "$obj" 2>/dev/null && LITERT_API_OBJECTS+=("$obj") || echo "  litert FAIL: ${f#$LITERT/}"
+    else
+      LITERT_API_OBJECTS+=("$obj")
+    fi
+  done
+done
+DEP_OBJECTS+=("${LITERT_API_OBJECTS[@]}")
+echo "  litert runtime: ${#LITERT_API_OBJECTS[@]} compiled"
+
 # TFLite XNNPack file I/O and mmap (compiled with no-mmap debug path for WASM)
 echo "  Compiling XNNPack file_util and mmap_handle..."
 for f in "$LITERT/tflite/delegates/xnnpack/file_util.cc" \

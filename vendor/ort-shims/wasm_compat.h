@@ -6,6 +6,8 @@ extern "C" {
 #endif
 int dup(int fd);
 int getpagesize(void);
+unsigned int getuid(void);
+unsigned int getgid(void);
 #ifdef __cplusplus
 }
 #endif
