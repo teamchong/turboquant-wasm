@@ -2,15 +2,10 @@
  * Burner AI — Gemma 4 E2B in browser with TQ-compressed KV cache.
  * LiteRT-LM + TurboQuant unified WASM. No cloud, no data leaks.
  *
- * Flow: page load → WASM init → model auto-download (2GB) → ready to chat.
- * Input is always enabled. Messages queue until model is ready.
+ * Architecture:
+ *   Main thread: UI + model download to OPFS
+ *   Worker thread: WASM + inference with sync OPFS file access (zero-copy)
  */
-
-import {
-  initLiteRt, registerModelFile,
-  writeString, readString, writeInputData,
-  type LiteRtExports,
-} from "./litert-glue.js";
 
 const MODEL_URL = "https://huggingface.co/litert-community/gemma-4-E2B-it-litert-lm/resolve/main/gemma-4-E2B-it-web.task";
 const MODEL_NAME = "gemma-4-E2B-it-web.task";
@@ -22,10 +17,8 @@ const inputEl = $("#input") as HTMLInputElement;
 const sendBtn = $("#send") as HTMLButtonElement;
 const statSpeed = $("#stat-speed") as HTMLElement;
 const statCtx = $("#stat-ctx") as HTMLElement;
-const statKV = $("#stat-kv") as HTMLElement;
 
-let lm: LiteRtExports | null = null;
-let session = 0;
+let worker: Worker | null = null;
 let ready = false;
 let generating = false;
 
@@ -46,29 +39,28 @@ function formatBytes(b: number): string {
 }
 
 /**
- * Download model to OPFS (Origin Private File System), then read back.
- * Streams directly to disk — never holds 2GB in JS memory.
- * On subsequent visits, serves from OPFS cache (instant).
+ * Download model to OPFS. Streams to disk — never holds full model in JS heap.
+ * Returns true if model is ready in OPFS.
  */
-async function downloadModelToOPFS(url: string, filename: string): Promise<ArrayBuffer> {
+async function ensureModelInOPFS(): Promise<boolean> {
   const root = await navigator.storage.getDirectory();
 
-  // Check cache first
+  // Check cache
   try {
-    const existing = await root.getFileHandle(filename);
+    const existing = await root.getFileHandle(MODEL_NAME);
     const file = await existing.getFile();
-    if (file.size > 100_000_000) { // >100MB = valid cached model
-      statusEl.textContent = `Loading cached model (${formatBytes(file.size)})...`;
-      return await file.arrayBuffer();
+    if (file.size > 100_000_000) {
+      statusEl.textContent = `Model cached (${formatBytes(file.size)})`;
+      return true;
     }
   } catch { /* not cached */ }
 
-  // Download with streaming write to OPFS
-  const response = await fetch(url);
+  // Stream download to OPFS
+  const response = await fetch(MODEL_URL);
   if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`);
   const total = Number(response.headers.get("content-length") || 0);
 
-  const fileHandle = await root.getFileHandle(filename, { create: true });
+  const fileHandle = await root.getFileHandle(MODEL_NAME, { create: true });
   const writable = await fileHandle.createWritable();
   const reader = response.body!.getReader();
   let loaded = 0;
@@ -82,143 +74,107 @@ async function downloadModelToOPFS(url: string, filename: string): Promise<Array
       const pct = ((loaded / total) * 100).toFixed(0);
       statusEl.textContent = `Downloading Gemma 4 E2B: ${pct}% (${formatBytes(loaded)} / ${formatBytes(total)})`;
     } else {
-      statusEl.textContent = `Downloading Gemma 4 E2B: ${formatBytes(loaded)}`;
+      statusEl.textContent = `Downloading: ${formatBytes(loaded)}`;
     }
   }
   await writable.close();
+  return true;
+}
 
-  // Read back from OPFS
-  statusEl.textContent = "Reading model from storage...";
-  const file = await (await root.getFileHandle(filename)).getFile();
-  return await file.arrayBuffer();
+let pendingResolve: ((msg: any) => void) | null = null;
+
+function handleWorkerMessage(e: MessageEvent) {
+  const msg = e.data;
+  switch (msg.type) {
+    case "status":
+      statusEl.textContent = msg.text;
+      if (msg.text.includes("ready")) {
+        ready = true;
+        statusEl.classList.add("ready");
+        inputEl.focus();
+      }
+      break;
+    case "result":
+      if (pendingResolve) {
+        pendingResolve(msg);
+        pendingResolve = null;
+      }
+      generating = false;
+      inputEl.focus();
+      break;
+    case "error":
+      statusEl.textContent = `Error: ${msg.text}`;
+      statusEl.classList.add("error");
+      console.error("Worker error:", msg.text);
+      if (pendingResolve) {
+        pendingResolve(msg);
+        pendingResolve = null;
+      }
+      generating = false;
+      break;
+  }
 }
 
 function sendMessage() {
   const text = inputEl.value.trim();
-  if (!text) return;
+  if (!text || !worker) return;
   inputEl.value = "";
   addMsg("user", text);
 
-  if (!ready || !lm || !session) {
-    addMsg("system", "Model is still loading. Your message will be processed when ready.");
+  if (!ready) {
+    addMsg("system", "Model is still loading.");
     return;
   }
-
   if (generating) {
-    addMsg("system", "Already generating a response. Please wait.");
+    addMsg("system", "Generating...");
     return;
   }
 
   generating = true;
   const assistantDiv = addMsg("assistant", "...");
 
-  try {
-    const inputPtr = writeInputData(lm, text);
-    const responses = lm.litert_lm_session_generate_content(session, inputPtr, 1);
+  const resultPromise = new Promise<any>((resolve) => { pendingResolve = resolve; });
+  worker.postMessage({ type: "generate", text });
 
-    if (responses) {
-      const textPtr = lm.litert_lm_responses_get_response_text_at(responses, 0);
-      const responseText = textPtr ? readString(lm, textPtr) : "[empty response]";
-      assistantDiv.textContent = responseText;
-
-      const bench = lm.litert_lm_session_get_benchmark_info(session);
-      if (bench) {
-        const ttft = lm.litert_lm_benchmark_info_get_time_to_first_token(bench);
-        const decSpeed = lm.litert_lm_benchmark_info_get_decode_tokens_per_sec_at(bench, 0);
-        statSpeed.textContent = `${decSpeed.toFixed(1)} tok/s`;
-        statCtx.textContent = `TTFT: ${(ttft * 1000).toFixed(0)}ms`;
-        lm.litert_lm_benchmark_info_delete(bench);
+  resultPromise.then((msg) => {
+    if (msg.type === "result") {
+      assistantDiv.textContent = msg.text || "[empty]";
+      if (msg.tokPerSec > 0) {
+        statSpeed.textContent = `${msg.tokPerSec.toFixed(1)} tok/s`;
       }
-
-      lm.litert_lm_responses_delete(responses);
+      if (msg.ttft > 0) {
+        statCtx.textContent = `TTFT: ${(msg.ttft * 1000).toFixed(0)}ms`;
+      }
     } else {
-      assistantDiv.textContent = "[No response from model]";
+      assistantDiv.textContent = `Error: ${msg.text}`;
     }
-
-    lm.wasm_free(inputPtr);
-  } catch (e) {
-    assistantDiv.textContent = `Error: ${(e as Error).message}`;
-    console.error("Inference error:", e);
-  }
-
-  generating = false;
-  inputEl.focus();
-}
-
-function logMemory(label: string) {
-  const perf = (performance as any);
-  if (perf.memory) {
-    const mb = (b: number) => (b / 1e6).toFixed(0) + "MB";
-    console.log(`[mem] ${label}: heap=${mb(perf.memory.usedJSHeapSize)} / ${mb(perf.memory.jsHeapSizeLimit)}`);
-  }
-  if (lm?.memory) {
-    const pages = lm.memory.buffer.byteLength / 65536;
-    console.log(`[mem] ${label}: WASM=${(pages * 64 / 1024).toFixed(0)}MB (${pages} pages)`);
-  }
+  });
 }
 
 async function main() {
-  // Step 1: Load WASM runtime
-  statusEl.textContent = "Loading WASM runtime...";
+  // Step 1: Download model to OPFS (streams to disk, no JS heap copy)
+  statusEl.textContent = "Checking model cache...";
   try {
-    lm = await initLiteRt();
-    logMemory("after WASM init");
-    statusEl.textContent = "WASM loaded. Downloading model...";
-  } catch (e) {
-    statusEl.textContent = `WASM error: ${(e as Error).message}`;
-    statusEl.classList.add("error");
-    console.error("WASM init error:", e);
-    return;
-  }
-
-  // Step 2: Download Gemma 4 E2B model (streams to OPFS, cached on disk)
-  let modelBuffer: ArrayBuffer;
-  try {
-    modelBuffer = await downloadModelToOPFS(MODEL_URL, MODEL_NAME);
-    logMemory("after model load to ArrayBuffer");
+    await ensureModelInOPFS();
   } catch (e) {
     statusEl.textContent = `Download failed: ${(e as Error).message}`;
     statusEl.classList.add("error");
-    console.error("Model download error:", e);
+    console.error("Download error:", e);
     return;
   }
 
-  // Step 3: Initialize engine + session
-  statusEl.textContent = "Initializing model...";
-  try {
-    const modelPath = `/${MODEL_NAME}`;
-    registerModelFile(modelPath, modelBuffer);
-    logMemory("after registerModelFile (VFS)");
-
-    const pathPtr = writeString(lm, modelPath);
-    const cpuPtr = writeString(lm, "cpu");
-
-    const settings = lm.litert_lm_engine_settings_create(pathPtr, cpuPtr, 0, 0);
-    lm.litert_lm_engine_settings_set_max_num_tokens(settings, 2048);
-    lm.litert_lm_engine_settings_enable_benchmark(settings);
-    lm.wasm_free(pathPtr);
-    lm.wasm_free(cpuPtr);
-
-    logMemory("before engine_create");
-    const engine = lm.litert_lm_engine_create(settings);
-    logMemory("after engine_create");
-    if (!engine) throw new Error("Engine creation returned null");
-
-    const config = lm.litert_lm_session_config_create();
-    lm.litert_lm_session_config_set_max_output_tokens(config, 512);
-    session = lm.litert_lm_engine_create_session(engine, config);
-    lm.litert_lm_session_config_delete(config);
-    lm.litert_lm_engine_settings_delete(settings);
-
-    ready = true;
-    statusEl.textContent = "Gemma 4 E2B ready";
-    statusEl.classList.add("ready");
-    inputEl.focus();
-  } catch (e) {
-    statusEl.textContent = `Engine error: ${(e as Error).message}`;
+  // Step 2: Start worker — WASM + inference with sync OPFS access
+  statusEl.textContent = "Starting inference engine...";
+  worker = new Worker(
+    new URL("./litert-worker.ts", import.meta.url),
+    { type: "module" }
+  );
+  worker.onmessage = handleWorkerMessage;
+  worker.onerror = (e) => {
+    statusEl.textContent = `Worker error: ${e.message}`;
     statusEl.classList.add("error");
-    console.error("Engine init error:", e);
-  }
+  };
+  worker.postMessage({ type: "init", modelFileName: MODEL_NAME });
 }
 
 sendBtn.addEventListener("click", sendMessage);
