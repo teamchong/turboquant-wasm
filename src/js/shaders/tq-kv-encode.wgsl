@@ -63,8 +63,7 @@ fn write_bit(blob_offset: u32, bit_pos: u32, bit_val: u32) {
   let byte_idx = bit_pos / 8u;
   let word_idx = blob_offset + byte_idx / 4u;
   let shift = (byte_idx % 4u) * 8u + (bit_pos % 8u);
-  // Atomic OR to avoid race conditions between threads in same workgroup
-  atomicOr(&compressed[word_idx], 1u << shift);
+  compressed[word_idx] = compressed[word_idx] | (1u << shift);
 }
 
 // Each workgroup processes one vector. Thread 0 does all the work
