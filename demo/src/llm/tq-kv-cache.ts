@@ -31,9 +31,8 @@ function buildPolarLUT(): Float32Array {
 }
 
 interface TQLayerCache {
-  kBuffer: GPUBuffer;   // compressed K: [max_positions * blob_u32s_per_vec * 4] bytes
+  kBuffer: GPUBuffer;   // compressed K: [capacity * blob_u32s_per_vec * 4] bytes
   vBuffer: GPUBuffer;   // compressed V: same layout
-  paramsBuffer: GPUBuffer; // per-position params (max_r, gamma) — stored in blob header
   length: number;       // current number of cached positions
   capacity: number;     // max positions allocated
 }
@@ -103,16 +102,35 @@ export class TQKVCache {
 
     let layer = this.layers.get(layerIdx);
     if (!layer) {
-      const capacity = 4096; // initial capacity
+      const capacity = 4096;
       const bufSize = capacity * this.blobU32s * 4;
       layer = {
-        kBuffer: this.device.createBuffer({ size: bufSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
-        vBuffer: this.device.createBuffer({ size: bufSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST }),
-        paramsBuffer: this.device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST }),
+        kBuffer: this.device.createBuffer({ size: bufSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC }),
+        vBuffer: this.device.createBuffer({ size: bufSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC }),
         length: 0,
         capacity,
       };
       this.layers.set(layerIdx, layer);
+    }
+
+    // Grow buffers if needed (double capacity)
+    if (layer.length + numNewPositions > layer.capacity) {
+      const newCapacity = Math.max(layer.capacity * 2, layer.length + numNewPositions);
+      const newBufSize = newCapacity * this.blobU32s * 4;
+      const oldBufSize = layer.length * this.blobU32s * 4;
+      const newK = this.device.createBuffer({ size: newBufSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+      const newV = this.device.createBuffer({ size: newBufSize, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC });
+      if (oldBufSize > 0) {
+        const copyEncoder = this.device.createCommandEncoder();
+        copyEncoder.copyBufferToBuffer(layer.kBuffer, 0, newK, 0, oldBufSize);
+        copyEncoder.copyBufferToBuffer(layer.vBuffer, 0, newV, 0, oldBufSize);
+        this.device.queue.submit([copyEncoder.finish()]);
+      }
+      layer.kBuffer.destroy();
+      layer.vBuffer.destroy();
+      layer.kBuffer = newK;
+      layer.vBuffer = newV;
+      layer.capacity = newCapacity;
     }
 
     // Encode config
@@ -269,7 +287,6 @@ export class TQKVCache {
     for (const [, layer] of this.layers) {
       layer.kBuffer.destroy();
       layer.vBuffer.destroy();
-      layer.paramsBuffer.destroy();
     }
     this.polarLutBuffer.destroy();
     this.layers.clear();

@@ -38,7 +38,7 @@ const DIR_COS = array<f32, 8>(
   -1.0, -0.62349, 0.22252, 0.90097, 0.90097, 0.22252, -0.62349, -1.0
 );
 const DIR_SIN = array<f32, 8>(
-  0.0, 0.78183, 0.97493, 0.43388, -0.43388, -0.97493, -0.78183, 0.0
+  0.0, -0.78183, -0.97493, -0.43388, 0.43388, 0.97493, 0.78183, 0.0
 );
 
 fn find_nearest_angle(x: f32, y: f32) -> u32 {
@@ -122,16 +122,32 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
     }
   }
 
-  // Step 5: QJL encoding — 1 sign bit per dimension
-  // QJL encodes sign(R * residual) where R is a random rotation.
-  // For KV cache, we skip the rotation and encode sign(vector) directly.
-  // This is the "fast" QJL variant — same as estimateDotFast in the Zig code.
+  // Step 5: QJL encoding — 1 sign bit per dimension of the residual
+  // residual = vector - polar_reconstruction
+  // QJL encodes sign(residual) — captures information polar missed.
+  // (Rotation matrix R omitted for KV cache — applied at dot product time.)
   let qjl_bit_start = polar_bit_start + num_pairs * BITS_PER_PAIR;
   for (var d: u32 = 0u; d < dim; d += 1u) {
-    // Compute residual: vector - polar_reconstruction
-    // For the fast path, just use the sign of each dimension
     let v = input_vectors[input_offset + d];
-    let bit_val = select(0u, 1u, v > 0.0);
+
+    // Reconstruct polar value for this dimension
+    let pair_idx = d / 2u;
+    let bp = polar_bit_start + pair_idx * BITS_PER_PAIR;
+    // Re-extract the 7-bit code we already wrote
+    let byte_idx = bp / 8u;
+    let word_idx = blob_offset + byte_idx / 4u;
+    let b0 = (compressed[word_idx] >> ((byte_idx % 4u) * 8u)) & 0xFFu;
+    let b1 = (compressed[word_idx + select(0u, 1u, (byte_idx + 1u) / 4u != byte_idx / 4u)] >>
+              (((byte_idx + 1u) % 4u) * 8u)) & 0xFFu;
+    let window = b0 | (b1 << 8u);
+    let combined = (window >> (bp % 8u)) & 0x7Fu;
+    let r_norm = f32((combined >> 3u) & 0xFu) / 15.0;
+    let bucket = combined & 0x7u;
+    let theta = f32(bucket) / THETA_LEVELS * TWO_PI - PI;
+    let polar_val = select(r_norm * cos(theta), r_norm * sin(theta), d % 2u == 1u) * max_r;
+
+    let residual = v - polar_val;
+    let bit_val = select(0u, 1u, residual > 0.0);
     write_bit(blob_offset, qjl_bit_start + d, bit_val);
   }
 }

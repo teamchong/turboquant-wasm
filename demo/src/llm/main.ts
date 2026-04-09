@@ -80,8 +80,8 @@ async function sendMessage() {
     const streamer = new TextStreamer((gen as any).tokenizer, {
       skip_prompt: true,
       skip_special_tokens: true,
+      token_callback_function: () => { tokenCount++; },
       callback_function: (chunk: string) => {
-        tokenCount++;
         assistantDiv.textContent += chunk;
         messagesEl.scrollTop = messagesEl.scrollHeight;
         const elapsed = (performance.now() - startTime) / 1000;
