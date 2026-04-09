@@ -61,11 +61,21 @@ async function sendMessage() {
       max_new_tokens: 256,
       do_sample: false,
       callback_function: (data: any) => {
+        tokenCount++;
         if (data?.[0]?.generated_text) {
           const lastMsg = data[0].generated_text.at(-1);
           if (lastMsg?.role === "assistant") {
             assistantDiv.textContent = lastMsg.content;
-            tokenCount++;
+            // Live stats update
+            const elapsed = (performance.now() - startTime) / 1000;
+            statSpeed.textContent = `${(tokenCount / elapsed).toFixed(1)} tok/s`;
+            if (tqCache) {
+              const stats = tqCache.getStats();
+              if (stats.compressedBytes > 0) {
+                const ratio = (stats.uncompressedBytes / stats.compressedBytes).toFixed(1);
+                statKV.textContent = `KV: ${formatBytes(stats.compressedBytes)} (${ratio}x)`;
+              }
+            }
           }
         }
       },
@@ -76,13 +86,13 @@ async function sendMessage() {
 
     const elapsed = (performance.now() - startTime) / 1000;
     statSpeed.textContent = `${(tokenCount / elapsed).toFixed(1)} tok/s`;
-    statCtx.textContent = `${elapsed.toFixed(1)}s`;
+    statCtx.textContent = `${elapsed.toFixed(1)}s · ${tokenCount} tokens`;
 
     if (tqCache) {
       const stats = tqCache.getStats();
-      if (stats.uncompressedBytes > 0) {
+      if (stats.compressedBytes > 0) {
         const ratio = (stats.uncompressedBytes / stats.compressedBytes).toFixed(1);
-        statKV.textContent = `KV: ${formatBytes(stats.compressedBytes)} (${ratio}x)`;
+        statKV.textContent = `KV: ${formatBytes(stats.compressedBytes)} (${ratio}x) · ${stats.layers}L × ${stats.positions}pos`;
       }
     }
   } catch (e) {

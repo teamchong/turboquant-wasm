@@ -93,7 +93,14 @@ export class TQKVCache {
    * Input: float32 GPU buffer [num_new_positions, head_dim]
    * The data stays compressed on GPU.
    */
+  private encodeCount = 0;
+
   encodeAndAppend(layerIdx: number, kData: GPUBuffer, vData: GPUBuffer, numNewPositions: number) {
+    if (this.encodeCount < 3) {
+      console.log(`[TQ] encode layer=${layerIdx} positions=${numNewPositions} dim=${this.dim} blobBytes=${this.blobBytes}`);
+    }
+    this.encodeCount++;
+
     let layer = this.layers.get(layerIdx);
     if (!layer) {
       const capacity = 4096; // initial capacity
