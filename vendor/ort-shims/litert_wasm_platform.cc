@@ -102,7 +102,23 @@ namespace string_util {
 }
 }
 
-// ghtonl now compiled from protobuf sources.
+// ============================================================================
+// std::filesystem::path internal methods (WASI libc++ doesn't implement these)
+// Called by LiteRT dispatch library path resolution — returns empty paths
+// since dynamic library loading isn't available on WASM.
+// ============================================================================
+#include <filesystem>
+#include <string_view>
+
+namespace std { inline namespace __1 { namespace __fs { namespace filesystem {
+  basic_string_view<path::value_type> path::__root_directory() const { return {}; }
+  basic_string_view<path::value_type> path::__filename() const {
+    auto s = native();
+    auto pos = s.rfind('/');
+    if (pos == string_type::npos) return basic_string_view<value_type>(s);
+    return basic_string_view<value_type>(s).substr(pos + 1);
+  }
+}}}}
 
 // ============================================================================
 // Abseil platform layer (sync/threading/debugging infrastructure)

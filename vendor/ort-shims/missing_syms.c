@@ -11,6 +11,7 @@
 
 #include <stdlib.h>
 #include <stdint.h>
+#include <unistd.h>
 
 /* Exported allocator for JS glue (JSEP callbacks need WASM heap access). */
 __attribute__((visibility("default")))
@@ -146,7 +147,12 @@ void* __cxa_allocate_exception(size_t size) {
   return malloc(size);
 }
 void __cxa_throw(void* obj, void* type, void (*dtor)(void*)) {
-  (void)obj; (void)type; (void)dtor;
+  (void)type; (void)dtor;
+  const char msg[] = "FATAL: C++ exception thrown in WASM\n";
+  write(2, msg, sizeof(msg) - 1);
+  /* If the exception object is a std::exception, try to print what() */
+  /* The first vptr slot after typeinfo points to what() for std::exception */
+  (void)obj;
   __builtin_trap();
 }
 

@@ -138,12 +138,28 @@ async function main() {
   try {
     const env = createEnvironment(lm);
 
+    // Check model magic bytes
+    const header = new Uint8Array(lm.memory.buffer, modelPtr, 8);
+    console.log("[model] first 8 bytes:", Array.from(header).map(b => b.toString(16).padStart(2, '0')).join(' '));
+    console.log("[model] as string:", new TextDecoder().decode(header));
+    console.log("[model] size:", modelSize, "bytes =", (modelSize / 1e9).toFixed(2), "GB");
+
     // LiteRtCreateModelFromBuffer — parse the model from WASM heap
+    console.log("[model] calling LiteRtCreateModelFromBuffer...");
     const modelOut = lm.wasm_malloc(4);
-    const status = lm.LiteRtCreateModelFromBuffer(modelPtr, modelSize, modelOut);
-    const model = new DataView(lm.memory.buffer).getUint32(modelOut, true);
+    let status: number;
+    let model: number;
+    try {
+      status = lm.LiteRtCreateModelFromBuffer(modelPtr, modelSize, modelOut);
+      model = new DataView(lm.memory.buffer).getUint32(modelOut, true);
+      console.log("[model] status =", status, "model =", model);
+    } catch (e) {
+      console.error("[model] LiteRtCreateModelFromBuffer threw:", e);
+      lm.wasm_free(modelOut);
+      throw e;
+    }
     lm.wasm_free(modelOut);
-    lm.wasm_free(modelPtr); // Free raw model bytes — LiteRT copies what it needs
+    lm.wasm_free(modelPtr);
     if (status !== 0 || !model) throw new Error(`LiteRtCreateModelFromBuffer failed: status=${status}`);
 
     statusEl.textContent = "Compiling model...";

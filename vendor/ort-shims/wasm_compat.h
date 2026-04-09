@@ -42,3 +42,10 @@ namespace std { namespace filesystem {
   inline path read_symlink(const path& p) { return p; }
   inline path read_symlink(const path& p, error_code&) { return p; }
 }}
+
+// path decomposition — these are called by LiteRT for library path resolution
+namespace std { namespace __1 { namespace __fs { namespace filesystem {
+  // These methods need to exist to prevent --allow-undefined from making them
+  // unreachable traps. They're never called with real paths on WASM.
+}}}}
+
