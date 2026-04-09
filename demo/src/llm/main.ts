@@ -145,11 +145,24 @@ function sendMessage() {
   inputEl.focus();
 }
 
+function logMemory(label: string) {
+  const perf = (performance as any);
+  if (perf.memory) {
+    const mb = (b: number) => (b / 1e6).toFixed(0) + "MB";
+    console.log(`[mem] ${label}: heap=${mb(perf.memory.usedJSHeapSize)} / ${mb(perf.memory.jsHeapSizeLimit)}`);
+  }
+  if (lm?.memory) {
+    const pages = lm.memory.buffer.byteLength / 65536;
+    console.log(`[mem] ${label}: WASM=${(pages * 64 / 1024).toFixed(0)}MB (${pages} pages)`);
+  }
+}
+
 async function main() {
   // Step 1: Load WASM runtime
   statusEl.textContent = "Loading WASM runtime...";
   try {
     lm = await initLiteRt();
+    logMemory("after WASM init");
     statusEl.textContent = "WASM loaded. Downloading model...";
   } catch (e) {
     statusEl.textContent = `WASM error: ${(e as Error).message}`;
@@ -162,6 +175,7 @@ async function main() {
   let modelBuffer: ArrayBuffer;
   try {
     modelBuffer = await downloadModelToOPFS(MODEL_URL, MODEL_NAME);
+    logMemory("after model load to ArrayBuffer");
   } catch (e) {
     statusEl.textContent = `Download failed: ${(e as Error).message}`;
     statusEl.classList.add("error");
@@ -174,6 +188,7 @@ async function main() {
   try {
     const modelPath = `/${MODEL_NAME}`;
     registerModelFile(modelPath, modelBuffer);
+    logMemory("after registerModelFile (VFS)");
 
     const pathPtr = writeString(lm, modelPath);
     const cpuPtr = writeString(lm, "cpu");
@@ -184,7 +199,9 @@ async function main() {
     lm.wasm_free(pathPtr);
     lm.wasm_free(cpuPtr);
 
+    logMemory("before engine_create");
     const engine = lm.litert_lm_engine_create(settings);
+    logMemory("after engine_create");
     if (!engine) throw new Error("Engine creation returned null");
 
     const config = lm.litert_lm_session_config_create();

@@ -52,6 +52,9 @@ TFLITE_INCLUDES=(
 TFLITE_DEFINES=(
   -D__wasm__
   -D_WASI_EMULATED_MMAN
+  -DLITERT_DISABLE_OPENCL_SUPPORT
+  -DLITERT_DISABLE_OPENGL_SUPPORT
+  -DLITERT_DISABLE_VULKAN_SUPPORT
   -DTFLITE_ENABLE_XNNPACK=1
   -DTFLITE_ENABLE_MMAP=0
   -DEIGEN_DONT_PARALLELIZE
@@ -324,7 +327,7 @@ ABSL="$ORT_EXT/abseil-cpp"
 ABSL_OBJECTS=()
 set +e
 for f in $(find "$ABSL/absl" -name "*.cc" -not -path "*/testutil/*" \
-  | grep -viE "test|benchmark|_testing|_mock|print_hash_of|gentables|/compiler/"); do
+  | grep -viE "test|benchmark|_testing|_mock|print_hash_of|gentables|/compiler/|absl/log/flags\.cc"); do
   rel="${f#$ABSL/}"
   oname="${rel//\//__}"
   oname="${oname%.cc}.o"
@@ -387,7 +390,7 @@ echo "  xnn reference: ${#XNN_REF_OBJECTS[@]} compiled"
 # LiteRT runtime (CC/C API, core, runtime, accelerators)
 echo "  Compiling LiteRT runtime..."
 LITERT_API_OBJECTS=()
-LITERT_SKIP="test|benchmark|_mock|gpu_|npu_|dispatch|dynamic_runtime|compiler|no_builtin|_win\.|metal_info|open_cl|dynamic_loading|filesystem\.cc|model_serialize|compilation_cache"
+LITERT_SKIP="test|benchmark|_mock|npu_|dynamic_runtime|compiler|no_builtin|_win\.|metal_info|open_cl|dynamic_loading|filesystem\.cc|model_serialize|compilation_cache"
 for subdir in \
   "$LITERT/litert/c" \
   "$LITERT/litert/c/internal" \
