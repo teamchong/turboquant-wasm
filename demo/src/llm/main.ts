@@ -26,7 +26,20 @@ const statKV = $("#stat-kv") as HTMLElement;
 
 let gen: TextGenerationPipeline | null = null;
 let tqCache: TQKVCache | null = null;
+let tqEnabled = true;
 let generating = false;
+
+const tqToggle = $("#tq-toggle") as HTMLInputElement;
+tqToggle.addEventListener("change", () => {
+  tqEnabled = tqToggle.checked;
+  const label = tqEnabled ? "TQ KV Cache ON" : "TQ KV Cache OFF";
+  console.log(`[TQ] ${label}`);
+  if (tqCache) {
+    if (!tqEnabled) {
+      statKV.textContent = "KV: uncompressed";
+    }
+  }
+});
 
 function addMsg(role: "user" | "assistant" | "system", text: string): HTMLElement {
   const div = document.createElement("div");
@@ -145,8 +158,8 @@ async function main() {
         ) {
           const cache = originalGetPKV(decoderResults, pastKeyValues, ...rest);
 
-          // Compress new K/V tensors into TQ cache on GPU
-          if (tqCache) {
+          // Compress new K/V tensors into TQ cache on GPU (when toggle is on)
+          if (tqCache && tqEnabled) {
             for (const name in decoderResults) {
               if (!name.startsWith("present") || !name.endsWith(".value")) continue;
               const vTensor = decoderResults[name];

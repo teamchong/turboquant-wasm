@@ -21,7 +21,11 @@
       <span id="stat-speed">--</span>
       <span id="stat-ctx">--</span>
       <span id="stat-kv">KV: --</span>
-      <span id="stat-model">Gemma · WebGPU + TQ KV cache</span>
+      <label id="tq-toggle-label">
+        <input type="checkbox" id="tq-toggle" checked>
+        TQ KV Cache
+      </label>
+      <span id="stat-model">Gemma · WebGPU</span>
     </div>
   </div>
   <script type="module" src="./src/llm/main.ts"></script>
