@@ -42,47 +42,69 @@ function formatBytes(b: number): string {
 }
 
 /**
- * Download model to OPFS cache, return as Uint8Array.
- * Streams to disk during download, reads back after.
+ * Download model to OPFS cache, then stream directly into WASM heap.
+ * Never holds the full model in JS — reads in chunks from OPFS File,
+ * writes each chunk into WASM linear memory via HEAPU8.set.
+ * Returns the WASM pointer and size.
  */
-async function fetchModel(): Promise<Uint8Array> {
+async function fetchAndLoadModel(): Promise<{ ptr: number; size: number }> {
+  if (!lm) throw new Error("WASM not initialized");
   const root = await navigator.storage.getDirectory();
   const fileName = "gemma-4-E2B-it-web.task";
 
   // Check OPFS cache
+  let fileSize = 0;
   try {
     const existing = await root.getFileHandle(fileName);
     const file = await existing.getFile();
     if (file.size > 100_000_000) {
-      statusEl.textContent = `Loading cached model (${formatBytes(file.size)})...`;
-      return new Uint8Array(await file.arrayBuffer());
+      fileSize = file.size;
+      statusEl.textContent = `Model cached (${formatBytes(fileSize)})`;
     }
   } catch { /* not cached */ }
 
-  // Stream download to OPFS
-  const response = await fetch(MODEL_URL);
-  if (!response.ok) throw new Error(`HTTP ${response.status}`);
-  const total = Number(response.headers.get("content-length") || 0);
-  const fileHandle = await root.getFileHandle(fileName, { create: true });
-  const writable = await fileHandle.createWritable();
-  const reader = response.body!.getReader();
-  let loaded = 0;
+  // Download if not cached
+  if (!fileSize) {
+    const response = await fetch(MODEL_URL);
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const total = Number(response.headers.get("content-length") || 0);
+    const fileHandle = await root.getFileHandle(fileName, { create: true });
+    const writable = await fileHandle.createWritable();
+    const reader = response.body!.getReader();
+    let loaded = 0;
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    await writable.write(value);
-    loaded += value.length;
-    if (total > 0) {
-      statusEl.textContent = `Downloading Gemma 4 E2B: ${((loaded / total) * 100).toFixed(0)}% (${formatBytes(loaded)})`;
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      await writable.write(value);
+      loaded += value.length;
+      if (total > 0) {
+        statusEl.textContent = `Downloading Gemma 4 E2B: ${((loaded / total) * 100).toFixed(0)}% (${formatBytes(loaded)})`;
+      }
     }
+    await writable.close();
+    fileSize = loaded;
   }
-  await writable.close();
 
-  // Read back
-  statusEl.textContent = "Loading model into memory...";
+  // Allocate WASM memory for the model
+  statusEl.textContent = `Loading model into WASM (${formatBytes(fileSize)})...`;
+  const wasmPtr = lm.wasm_malloc(fileSize);
+  if (!wasmPtr) throw new Error("wasm_malloc failed for model");
+
+  // Stream from OPFS into WASM memory in chunks (never hold full model in JS)
   const file = await (await root.getFileHandle(fileName)).getFile();
-  return new Uint8Array(await file.arrayBuffer());
+  const CHUNK_SIZE = 16 * 1024 * 1024; // 16MB chunks
+  let offset = 0;
+  for (let start = 0; start < fileSize; start += CHUNK_SIZE) {
+    const end = Math.min(start + CHUNK_SIZE, fileSize);
+    const blob = file.slice(start, end);
+    const chunk = new Uint8Array(await blob.arrayBuffer());
+    new Uint8Array(lm.memory.buffer, wasmPtr + offset, chunk.length).set(chunk);
+    offset += chunk.length;
+    statusEl.textContent = `Loading model: ${((offset / fileSize) * 100).toFixed(0)}%`;
+  }
+
+  return { ptr: wasmPtr, size: fileSize };
 }
 
 async function main() {
@@ -97,23 +119,32 @@ async function main() {
     return;
   }
 
-  // Step 2: Fetch model
-  let modelData: Uint8Array;
+  // Step 2: Fetch model and stream into WASM heap (16MB chunks, no full JS copy)
+  let modelPtr: number;
+  let modelSize: number;
   try {
-    modelData = await fetchModel();
+    const result = await fetchAndLoadModel();
+    modelPtr = result.ptr;
+    modelSize = result.size;
   } catch (e) {
-    statusEl.textContent = `Download failed: ${(e as Error).message}`;
+    statusEl.textContent = `Model load failed: ${(e as Error).message}`;
     statusEl.classList.add("error");
     console.error(e);
     return;
   }
 
-  // Step 3: Load + compile model (matches @litertjs/core flow)
-  statusEl.textContent = "Loading model into WASM...";
+  // Step 3: Parse + compile model
+  statusEl.textContent = "Parsing model...";
   try {
     const env = createEnvironment(lm);
-    const model = loadModel(lm, modelData);
-    modelData = null!; // Release JS reference — model copied into WASM heap
+
+    // LiteRtCreateModelFromBuffer — parse the model from WASM heap
+    const modelOut = lm.wasm_malloc(4);
+    const status = lm.LiteRtCreateModelFromBuffer(modelPtr, modelSize, modelOut);
+    const model = new DataView(lm.memory.buffer).getUint32(modelOut, true);
+    lm.wasm_free(modelOut);
+    lm.wasm_free(modelPtr); // Free raw model bytes — LiteRT copies what it needs
+    if (status !== 0 || !model) throw new Error(`LiteRtCreateModelFromBuffer failed: status=${status}`);
 
     statusEl.textContent = "Compiling model...";
     compiledModel = compileModel(lm, env, model);
