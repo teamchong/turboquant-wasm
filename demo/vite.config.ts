@@ -3,6 +3,12 @@ import { resolve } from "path";
 
 export default defineConfig(({ command }) => ({
   base: command === "serve" ? "/" : "/turboquant-wasm/",
+  resolve: {
+    alias: {
+      // Use local source until TQStream is published to npm
+      "turboquant-wasm": resolve(__dirname, "../src/js/index.ts"),
+    },
+  },
   build: {
     outDir: "dist",
     emptyOutDir: true,

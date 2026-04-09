@@ -89,6 +89,13 @@ int pthread_join(void* t, void** retval) {
 int pthread_cond_broadcast(void* c) { (void)c; return 0; }
 int pthread_cond_destroy(void* c) { (void)c; return 0; }
 int pthread_mutex_destroy(void* m) { (void)m; return 0; }
+int pthread_once(int* once_control, void (*init_routine)(void)) {
+  if (once_control && *once_control == 0) {
+    *once_control = 1;
+    if (init_routine) init_routine();
+  }
+  return 0;
+}
 
 /* dup — POSIX fd duplication, not available in WASI.
    Weight caching file I/O won't be used in browser WASM. */
@@ -120,6 +127,12 @@ void xnn_f32_qs8_vcvt_ukernel__wasmsimd_magic_u32(
 void xnn_f32_qu8_vcvt_ukernel__wasmsimd_magic_u32(
     size_t batch, const float* input, void* output, const void* params) {
   (void)batch; (void)input; (void)output; (void)params;
+}
+
+/* Abseil internal thread primitives — single-threaded WASM */
+void AbslInternalPerThreadSemPost_lts_20250814(void* w) { (void)w; }
+int AbslInternalPerThreadSemWait_lts_20250814(void* w, void* t) {
+  (void)w; (void)t; return 0;
 }
 
 /* C++ exception allocation — WASM runs with exceptions disabled,

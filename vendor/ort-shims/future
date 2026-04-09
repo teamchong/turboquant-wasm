@@ -1,0 +1,66 @@
+/**
+ * Single-threaded <future> for WASM.
+ * std::async always runs deferred (synchronously on .get()).
+ * std::future stores the result and returns it on get().
+ */
+#ifndef _LIBCPP_FUTURE
+#define _LIBCPP_FUTURE
+
+#include <functional>
+#include <utility>
+
+namespace std {
+
+enum class launch { async = 1, deferred = 2 };
+
+inline constexpr launch operator|(launch a, launch b) {
+  return static_cast<launch>(static_cast<int>(a) | static_cast<int>(b));
+}
+
+template <typename T>
+class future {
+ public:
+  future() = default;
+  future(future&& o) : fn_(std::move(o.fn_)), has_fn_(o.has_fn_) {
+    o.has_fn_ = false;
+  }
+  future& operator=(future&& o) {
+    fn_ = std::move(o.fn_);
+    has_fn_ = o.has_fn_;
+    o.has_fn_ = false;
+    return *this;
+  }
+
+  T get() { return fn_(); }
+  bool valid() const { return has_fn_; }
+
+ private:
+  template <typename Fn, typename... Args>
+  friend future<typename std::invoke_result<Fn, Args...>::type>
+  async(launch, Fn&&, Args&&...);
+
+  std::function<T()> fn_;
+  bool has_fn_ = false;
+};
+
+template <typename Fn, typename... Args>
+future<typename std::invoke_result<Fn, Args...>::type>
+async(launch, Fn&& fn, Args&&... args) {
+  using R = typename std::invoke_result<Fn, Args...>::type;
+  future<R> f;
+  // Capture function and args — runs synchronously on get()
+  f.fn_ = std::bind(std::forward<Fn>(fn), std::forward<Args>(args)...);
+  f.has_fn_ = true;
+  return f;
+}
+
+template <typename Fn, typename... Args>
+future<typename std::invoke_result<Fn, Args...>::type>
+async(Fn&& fn, Args&&... args) {
+  return async(launch::deferred, std::forward<Fn>(fn),
+               std::forward<Args>(args)...);
+}
+
+}  // namespace std
+
+#endif  // _LIBCPP_FUTURE

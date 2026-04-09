@@ -27,7 +27,7 @@ mkdir -p "$OUT" "$CACHE/tflite" "$CACHE/xnnpack" "$CACHE/litert-lm" "$CACHE/deps
 # --------------------------------------------------------------------------
 # Compiler flags
 # --------------------------------------------------------------------------
-CXX="zig c++ -target wasm32-wasi -std=c++17 -Os -fvisibility=default -Wno-deprecated-declarations"
+CXX="zig c++ -target wasm32-wasi -std=c++20 -Os -fvisibility=default -Wno-deprecated-declarations"
 CC="zig cc -target wasm32-wasi -Os -fvisibility=default"
 
 ORT_EXT="$ROOT/vendor/onnxruntime/cmake/external"
@@ -317,23 +317,41 @@ done
 DEP_OBJECTS+=("${RUY_OBJECTS[@]}")
 echo "  ruy: ${#RUY_OBJECTS[@]} compiled"
 
-# Abseil containers (hash tables used by TFLite op registry)
+# Abseil (strings, status, hash, containers, synchronization, time, numeric)
 echo "  Compiling abseil..."
 ABSL="$ORT_EXT/abseil-cpp"
 ABSL_OBJECTS=()
-for f in "$ABSL/absl/container/internal/raw_hash_set.cc" \
-         "$ABSL/absl/container/internal/hashtablez_sampler.cc" \
-         "$ABSL/absl/container/internal/hashtablez_sampler_force_weak_definition.cc"; do
-  [ -f "$f" ] || continue
-  base=$(basename "$f" .cc)
-  obj="$CACHE/deps/absl_${base}.o"
-  if [ ! -f "$obj" ] || [ "$f" -nt "$obj" ]; then
-    $CXX "${TFLITE_FORCE_INCLUDES[@]}" \
-      -I "$ABSL" "${TFLITE_DEFINES[@]}" \
-      -c "$f" -o "$obj" 2>/dev/null && ABSL_OBJECTS+=("$obj") || echo "  absl FAIL: $(basename $f)"
-  else
-    ABSL_OBJECTS+=("$obj")
-  fi
+for subdir in \
+  "absl/base" "absl/base/internal" \
+  "absl/container/internal" \
+  "absl/crc" "absl/crc/internal" \
+  "absl/debugging" "absl/debugging/internal" \
+  "absl/flags" "absl/flags/internal" \
+  "absl/hash/internal" \
+  "absl/log" "absl/log/internal" \
+  "absl/numeric" \
+  "absl/profiling/internal" \
+  "absl/random" "absl/random/internal" \
+  "absl/status" "absl/status/internal" \
+  "absl/strings" "absl/strings/internal" "absl/strings/internal/str_format" \
+  "absl/synchronization" "absl/synchronization/internal" \
+  "absl/time" "absl/time/internal/cctz/src" \
+  "absl/types/internal"; do
+  for f in "$ABSL/$subdir"/*.cc; do
+    [ -f "$f" ] || continue
+    echo "$f" | grep -qiE "test|benchmark|_testing|_mock|print_hash_of|gentables" && continue
+    rel="${f#$ABSL/}"
+    oname="${rel//\//__}"
+    oname="${oname%.cc}.o"
+    obj="$CACHE/deps/absl__$oname"
+    if [ ! -f "$obj" ] || [ "$f" -nt "$obj" ]; then
+      $CXX "${TFLITE_FORCE_INCLUDES[@]}" \
+        -I "$ABSL" "${TFLITE_DEFINES[@]}" \
+        -c "$f" -o "$obj" 2>/dev/null && ABSL_OBJECTS+=("$obj") || true
+    else
+      ABSL_OBJECTS+=("$obj")
+    fi
+  done
 done
 DEP_OBJECTS+=("${ABSL_OBJECTS[@]}")
 echo "  abseil: ${#ABSL_OBJECTS[@]} compiled"
@@ -415,11 +433,6 @@ $CXX "${TFLITE_FORCE_INCLUDES[@]}" "${TFLITE_INCLUDES[@]}" "${TFLITE_DEFINES[@]}
   -c "$SHIMS/tflite_wasm_impls.cc" -o "$CACHE/extra/tflite_wasm_impls.o"
 SHIM_OBJECTS+=("$CACHE/extra/tflite_wasm_impls.o")
 
-# Abseil WASM implementations (Mutex, Notification, Duration, RawLog — for ruy)
-$CXX "${TFLITE_FORCE_INCLUDES[@]}" "${TFLITE_DEFINES[@]}" \
-  -c "$SHIMS/abseil_wasm.cc" -o "$CACHE/extra/abseil_wasm.o"
-SHIM_OBJECTS+=("$CACHE/extra/abseil_wasm.o")
-
 echo "  ${#SHIM_OBJECTS[@]} compiled"
 
 # --------------------------------------------------------------------------
@@ -493,7 +506,7 @@ SP_INCLUDES=(
 
 for f in "$SP/src"/*.cc; do
   [ -f "$f" ] || continue
-  echo "$f" | grep -qiE "test|_main\.|trainer" && continue
+  echo "$f" | grep -qiE "test|_main\.|trainer|filesystem\.cc|init\.cc|pretokenizer_for_training" && continue
   base=$(basename "$f" .cc)
   obj="$CACHE/sentencepiece/sp_${base}.o"
   if [ ! -f "$obj" ] || [ "$f" -nt "$obj" ]; then
@@ -533,10 +546,16 @@ LM_DEFINES=(
   -DLITERTLM_USE_STD_THREAD=1
 )
 
+LM_EXTRA_FORCE_INCLUDES=(
+  -include "$SHIMS/future"
+)
+
 # Skip list: files that need unavailable platform features
-LM_SKIP_PATTERNS="test|benchmark|_main\.|worker_thread_pthread|memory_mapped_file_win|audio_preprocessor_miniaudio|npu_compiled_model|huggingface_tokenizer|gemma_model_constraint_provider\.cc"
+LM_SKIP_PATTERNS="test|benchmark|_main\.|worker_thread_pthread|memory_mapped_file_win|audio_preprocessor_miniaudio|npu_compiled_model|huggingface_tokenizer|gemma_model_constraint_provider\.cc|llg_constraint|llguidance|zip_utils|zip_readonly|tool_use/|parsers\.rs|stb_image_preprocessor|log_tensor_buffer|file_data_stream|lora_util|lora_data|metrics_util|logging_tensor_buffer|model_resources_task|engine_advanced_impl|session_advanced|litert_lm_lib\.cc|resource_manager|execution_manager|constraint_provider_factory"
 
 LM_SOURCES=()
+# Minijinja C++ replacement (replaces Rust CXX bridge)
+LM_SOURCES+=("$LM/runtime/components/rust/minijinja_template_impl.cc")
 for dir in \
   "$LM/c" \
   "$LM/runtime/components" \
@@ -561,8 +580,8 @@ for dir in \
   done
 done
 
-# Generated proto sources
-for f in "$LM/runtime/proto"/*.pb.cc "$LM/runtime/util"/*.pb.cc "$LM/runtime/executor/proto"/*.pb.cc; do
+# Generated proto sources (only from proto/ dirs — util/ and executor/ pb.cc already picked up by dir scan)
+for f in "$LM/runtime/proto"/*.pb.cc "$LM/runtime/executor/proto"/*.pb.cc; do
   [ -f "$f" ] && LM_SOURCES+=("$f")
 done
 
@@ -580,7 +599,7 @@ for src in "${LM_SOURCES[@]}"; do
     compiled=$((compiled + 1))
     continue
   fi
-  if $CXX "${TFLITE_FORCE_INCLUDES[@]}" "${LM_INCLUDES[@]}" "${LM_DEFINES[@]}" \
+  if $CXX "${TFLITE_FORCE_INCLUDES[@]}" "${LM_EXTRA_FORCE_INCLUDES[@]}" "${LM_INCLUDES[@]}" "${LM_DEFINES[@]}" \
     -c "$src" -o "$obj" 2>/dev/null; then
     LM_OBJECTS+=("$obj")
     compiled=$((compiled + 1))
