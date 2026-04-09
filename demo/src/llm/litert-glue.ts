@@ -77,9 +77,16 @@ let wasm: LiteRtExports | null = null;
 
 export async function initLiteRt(): Promise<LiteRtExports> {
   // 6 env imports — all safe no-ops for WASM
+  const envCalled = new Set<string>();
   const envProxy = new Proxy({} as Record<string, Function>, {
     get(_target, prop: string) {
-      return (..._args: unknown[]) => 0;
+      return (..._args: unknown[]) => {
+        if (!envCalled.has(prop)) {
+          envCalled.add(prop);
+          console.log(`[env] ${prop}`);
+        }
+        return 0;
+      };
     },
   });
 

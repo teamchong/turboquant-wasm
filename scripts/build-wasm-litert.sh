@@ -369,7 +369,7 @@ for subdir in \
   "$LITERT/litert/cc" "$LITERT/litert/cc/internal" "$LITERT/litert/cc/options" \
   "$LITERT/litert/core" "$LITERT/litert/core/model" "$LITERT/litert/core/cache" \
   "$LITERT/litert/core/util" "$LITERT/litert/runtime" "$LITERT/litert/runtime/from_tflite" \
-  "$LITERT/litert/runtime/accelerators/xnnpack"; do
+  "$LITERT/litert/runtime/accelerators" "$LITERT/litert/runtime/accelerators/xnnpack"; do
   for f in "$subdir"/*.cc; do
     [ -f "$f" ] || continue
     echo "$f" | grep -qiE "$LITERT_SKIP" && continue
