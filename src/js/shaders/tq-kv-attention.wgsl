@@ -87,33 +87,37 @@ fn tq_dot(
   return polar_sum + (2.0 * pos_sum - q_sum) * qjl_scale;
 }
 
-// Decode one dimension of a compressed vector (polar + QJL reconstruction)
-fn tq_decode_dim(
+// Weighted V contribution from a single compressed position for one dimension.
+// Computes weight * V[dim_idx] directly from compressed data — no decompression.
+// Polar: weight * lut[c].{x|y} * max_r
+// QJL:   weight * sign * sqrt(pi/2) / dim * gamma
+fn tq_weighted_v_dim(
   cache: ptr<storage, array<u32>, read>,
   blob_offset: u32,
   dim_idx: u32,
   dim: u32,
+  weight: f32,
 ) -> f32 {
   let max_r = bitcast<f32>((*cache)[blob_offset]);
   let gamma = bitcast<f32>((*cache)[blob_offset + 1u]);
   let polar_start = config.polar_byte_offset;
   let qjl_start = config.qjl_byte_offset;
 
-  // Polar: decode the pair containing this dimension
+  // Polar: read 7-bit code for the pair, extract this dimension's component
   let pair_idx = dim_idx / 2u;
   let combined = extract7_from(cache, blob_offset, polar_start, pair_idx * 7u);
   let lv = polar_lut[combined];
-  let polar_val = select(lv.x, lv.y, dim_idx % 2u == 1u) * max_r;
+  let polar_contrib = weight * select(lv.x, lv.y, dim_idx % 2u == 1u) * max_r;
 
-  // QJL: decode sign bit for this dimension
+  // QJL: read sign bit, compute weighted contribution
   let byte_idx = qjl_start + dim_idx / 8u;
   let word_idx = blob_offset + byte_idx / 4u;
   let shift = (byte_idx % 4u) * 8u + (dim_idx % 8u);
   let bit = ((*cache)[word_idx] >> shift) & 1u;
   let sign = f32(bit) * 2.0 - 1.0;
-  let qjl_val = sign * SQRT_PI_OVER_2 / f32(dim) * gamma;
+  let qjl_contrib = weight * sign * SQRT_PI_OVER_2 / f32(dim) * gamma;
 
-  return polar_val + qjl_val;
+  return polar_contrib + qjl_contrib;
 }
 
 // Main: dispatch (dim, num_q_heads, 1)
@@ -150,7 +154,7 @@ fn main(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     let w = exp(raw_score - new_max);
     let v_blob = pos * config.blob_u32s_per_vec;
-    weighted_v += w * tq_decode_dim(&v_cache, v_blob, dim_id, dim);
+    weighted_v += tq_weighted_v_dim(&v_cache, v_blob, dim_id, dim, w);
     running_sum += w;
     running_max = new_max;
   }
