@@ -1,7 +1,9 @@
 import { defineConfig } from "vite";
 import { resolve } from "path";
+import tqGqaPlugin from "./vite-plugin-tq-gqa";
 
 export default defineConfig(({ command }) => ({
+  plugins: [tqGqaPlugin()],
   base: command === "serve" ? "/" : "/turboquant-wasm/",
   assetsInclude: ["**/*.wgsl"],
   resolve: {

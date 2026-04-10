@@ -1,6 +1,6 @@
 /** Prompt to Diagram: Gemma 4 E2B generates drawmode code, rendered as Excalidraw. */
 
-import { TQGpuCache } from "./tq-gpu.js";
+import { resetTqCaches } from "./tq-apply-attention.js";
 import { pipeline, env, TextStreamer, InterruptableStoppingCriteria, type TextGenerationPipeline } from "@huggingface/transformers";
 import { executeCode } from "./drawmode/executor.js";
 import { SDK_TYPES } from "./drawmode/sdk-types.js";
@@ -185,13 +185,9 @@ async function main() {
   await loadWasm(drawmodeWasm);
   mountExcalidraw(diagramContainer);
 
-  statusEl.innerHTML = '<span class="spinner"></span> Initializing TQ GPU engine...';
-  const adapter = await navigator.gpu?.requestAdapter();
-  const gpuDevice = await adapter?.requestDevice();
-  if (!gpuDevice) throw new Error("WebGPU not available");
-  const tqCache = new TQGpuCache(gpuDevice, 256, 8192, 42);
-  await tqCache.initPipelines();
-  console.log("[TQ] GPU cache initialized (dim=256, max=8192 positions)");
+  // TQ attention is patched into ORT's GQA kernel by the Vite plugin (vite-plugin-tq-gqa).
+  // No manual hook needed — the plugin replaces applyAttention with tqApplyAttention
+  // so all KV data is stored and operated on in TQ compressed format automatically.
 
   statusEl.innerHTML = '<span class="spinner"></span> Loading Gemma 4 E2B...';
 
@@ -211,27 +207,7 @@ async function main() {
       },
     }) as TextGenerationPipeline;
 
-    // Hook TQ GPU cache into the model's KV store
-    const model = (gen as any).model;
-    if (model?.getPastKeyValues) {
-      const origGetPKV = model.getPastKeyValues.bind(model);
-      model.getPastKeyValues = function(decoderResults: any, pastKeyValues: any, disposeEncoderPKVs: boolean) {
-        const cache = origGetPKV(decoderResults, pastKeyValues, disposeEncoderPKVs);
-        for (const [name, tensor] of Object.entries(cache) as [string, any][]) {
-          if (!name.startsWith("past_key_values") || !tensor?.dims) continue;
-          const dims = tensor.dims as number[];
-          if (dims.length !== 4) continue;
-          const [_batch, _heads, seqLen, headDim] = dims;
-          if (tensor.location === "cpu" && headDim === 256) {
-            const data = tensor.data as Float32Array;
-            tqCache.encodeAndAppend(name, data.subarray((seqLen - 1) * headDim, seqLen * headDim));
-          }
-        }
-        tqCache.flush();
-        return cache;
-      };
-      console.log("[TQ] KV cache hooked");
-    }
+    console.log("[TQ] model loaded — TQ attention active via GQA kernel patch");
 
     statusEl.innerHTML = "Ready";
     statusEl.classList.add("ready");
