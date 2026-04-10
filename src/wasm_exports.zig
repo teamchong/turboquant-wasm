@@ -105,8 +105,11 @@ export fn tq_dot_batch(
     const idx = resolveHandle(handle) orelse return;
     const engine_ptr = engine_slots[idx] orelse return;
 
+    // Guard against u32 overflow: num_vectors * bytes_per_vector must not wrap.
+    const total_bytes = std.math.mul(u32, num_vectors, bytes_per_vector) catch return;
+
     const q = query_ptr[0..dim];
-    const compressed = compressed_ptr[0 .. num_vectors * bytes_per_vector];
+    const compressed = compressed_ptr[0..total_bytes];
     const scores = out_scores[0..num_vectors];
 
     engine_ptr.dotBatch(q, compressed, bytes_per_vector, num_vectors, scores);
