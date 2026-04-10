@@ -251,6 +251,7 @@ renderBtn.addEventListener("click", async () => {
 
 wipeBtn.addEventListener("click", () => {
   if (busy) stopCriteria.interrupt();
+  window.stop(); // abort all in-flight fetches (model downloads)
   statusEl.textContent = "Wiping all data...";
   wipeBtn.disabled = true;
 
