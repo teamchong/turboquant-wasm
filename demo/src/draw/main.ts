@@ -1,12 +1,6 @@
-/**
- * Prompt → Diagram — Gemma 4 E2B generates drawmode code, rendered as Excalidraw.
- * Transformers.js (ORT Web + WebGPU) for local inference.
- * TQ WebGPU shaders compress KV cache on GPU.
- * vectorjson streams the structured output as the model generates it.
- * drawmode SDK executes the code and produces Excalidraw diagrams.
- */
+/** Prompt to Diagram: Gemma 4 E2B generates drawmode code, rendered as Excalidraw. */
 
-import { patchOnnxRuntime } from "./tq-ort-patch.js";
+import { TQGpuCache } from "./tq-gpu.js";
 import { pipeline, env, TextStreamer, InterruptableStoppingCriteria, type TextGenerationPipeline } from "@huggingface/transformers";
 import { executeCode } from "./drawmode/executor.js";
 import { SDK_TYPES } from "./drawmode/sdk-types.js";
@@ -187,18 +181,17 @@ async function generate() {
 }
 
 async function main() {
-  // Initialize code editor
   createEditor(codeArea, (code) => { currentCode = code; });
-
-  // Load layout engine WASM (Graphviz, inlined as base64)
   await loadWasm(drawmodeWasm);
-
-  // Mount Excalidraw viewer
   mountExcalidraw(diagramContainer);
 
-  // Patch onnxruntime-web to use our Zig ORT binary with TQ attention kernel
-  statusEl.innerHTML = '<span class="spinner"></span> Loading TQ-ORT engine...';
-  await patchOnnxRuntime();
+  statusEl.innerHTML = '<span class="spinner"></span> Initializing TQ GPU engine...';
+  const adapter = await navigator.gpu?.requestAdapter();
+  const gpuDevice = await adapter?.requestDevice();
+  if (!gpuDevice) throw new Error("WebGPU not available");
+  const tqCache = new TQGpuCache(gpuDevice, 256, 8192, 42);
+  await tqCache.initPipelines();
+  console.log("[TQ] GPU cache initialized (dim=256, max=8192 positions)");
 
   statusEl.innerHTML = '<span class="spinner"></span> Loading Gemma 4 E2B...';
 
@@ -218,9 +211,27 @@ async function main() {
       },
     }) as TextGenerationPipeline;
 
-    // TQ attention kernel is compiled into our ORT WASM binary.
-    // K/V compression and compressed attention happen inside OrtRun automatically.
-    console.log("[TQ-ORT] model loaded — TQ attention kernel active");
+    // Hook TQ GPU cache into the model's KV store
+    const model = (gen as any).model;
+    if (model?.getPastKeyValues) {
+      const origGetPKV = model.getPastKeyValues.bind(model);
+      model.getPastKeyValues = function(decoderResults: any, pastKeyValues: any, disposeEncoderPKVs: boolean) {
+        const cache = origGetPKV(decoderResults, pastKeyValues, disposeEncoderPKVs);
+        for (const [name, tensor] of Object.entries(cache) as [string, any][]) {
+          if (!name.startsWith("past_key_values") || !tensor?.dims) continue;
+          const dims = tensor.dims as number[];
+          if (dims.length !== 4) continue;
+          const [_batch, _heads, seqLen, headDim] = dims;
+          if (tensor.location === "cpu" && headDim === 256) {
+            const data = tensor.data as Float32Array;
+            tqCache.encodeAndAppend(name, data.subarray((seqLen - 1) * headDim, seqLen * headDim));
+          }
+        }
+        tqCache.flush();
+        return cache;
+      };
+      console.log("[TQ] KV cache hooked");
+    }
 
     statusEl.innerHTML = "Ready";
     statusEl.classList.add("ready");
