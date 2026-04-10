@@ -145,7 +145,7 @@ async function main() {
     if (gpuDevice) {
       const config = (gen as any).model?.config;
       const headDim = config?.head_dim || 256;
-      tqCache = await TQKVCache.create(gpuDevice, headDim, 8192);
+      tqCache = await TQKVCache.create(gpuDevice, headDim, 131072);
       console.log("[TQ] KV cache ready: head_dim=%d", headDim);
 
       // Intercept KV cache between generation steps.
