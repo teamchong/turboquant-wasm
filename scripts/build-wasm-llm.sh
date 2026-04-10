@@ -430,17 +430,36 @@ if [ -f "$OUT/turboquant-llm-raw.wasm" ]; then
   RAW_SIZE=$(ls -lh "$OUT/turboquant-llm-raw.wasm" | awk '{print $5}')
   echo "  Raw: $RAW_SIZE"
 
-  echo "  Stripping debug + optimizing..."
-  wasm-ld --no-entry --export-dynamic \
-    --export=wasm_malloc --export=wasm_free \
-    --allow-undefined-file="$ALLOWED" \
-    --strip-debug \
-    --error-limit=0 \
-    "${ALL_OBJECTS[@]}" \
-    $ZIGCXX_LIBS \
-    -o "$OUT/turboquant-llm-stripped.wasm" 2>/dev/null
-  wasm-opt -O3 --skip-pass=remove-unused-module-elements "$OUT/turboquant-llm-stripped.wasm" -o "$OUT/turboquant-llm.wasm"
-  rm "$OUT/turboquant-llm-stripped.wasm"
+  echo "  Stripping DWARF debug sections (keeping function table)..."
+  python3 -c "
+import sys
+with open('$OUT/turboquant-llm-raw.wasm', 'rb') as f:
+    data = f.read()
+out = bytearray(data[:8])
+pos = 8
+while pos < len(data):
+    sid = data[pos]; pos += 1
+    size = 0; shift = 0
+    while True:
+        b = data[pos]; pos += 1
+        size |= (b & 0x7f) << shift; shift += 7
+        if not (b & 0x80): break
+    chunk = data[pos:pos+size]; pos += size
+    if sid == 0:
+        nl = chunk[0]
+        nm = chunk[1:1+nl].decode('ascii', errors='replace')
+        if nm.startswith('.debug') or nm == 'producers' or nm == 'target_features' or nm == 'name':
+            continue
+    s = size; leb = bytearray()
+    while True:
+        byte = s & 0x7f; s >>= 7
+        leb.append(byte | 0x80 if s else byte)
+        if not s: break
+    out.append(sid); out += leb; out += chunk
+with open('$OUT/turboquant-llm.wasm', 'wb') as f:
+    f.write(bytes(out))
+print(f'  {len(data)/1e6:.0f}M -> {len(out)/1e6:.0f}M')
+"
 
   OPT_SIZE=$(ls -lh "$OUT/turboquant-llm.wasm" | awk '{print $5}')
   IMPORTS=$(wasm-objdump -j Import -x "$OUT/turboquant-llm.wasm" 2>/dev/null | grep "func\[" | wc -l | tr -d ' ')

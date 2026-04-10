@@ -140,21 +140,7 @@ int AbslInternalPerThreadSemWait_lts_20250814(void* w, void* t) {
   (void)w; (void)t; return 0;
 }
 
-/* C++ exception allocation — WASM runs with exceptions disabled,
-   but some TFLite code has throw paths that the linker pulls in.
-   __cxa_throw traps immediately (exception = fatal in WASM). */
-void* __cxa_allocate_exception(size_t size) {
-  return malloc(size);
-}
-void __cxa_throw(void* obj, void* type, void (*dtor)(void*)) {
-  (void)type; (void)dtor;
-  const char msg[] = "FATAL: C++ exception thrown in WASM\n";
-  write(2, msg, sizeof(msg) - 1);
-  /* If the exception object is a std::exception, try to print what() */
-  /* The first vptr slot after typeinfo points to what() for std::exception */
-  (void)obj;
-  __builtin_trap();
-}
+/* __cxa_allocate_exception and __cxa_throw provided by Zig's libc++abi */
 
 /* Arena initialization — returns a sentinel. The arena pointer is only
  * passed back to AllocWithArena which ignores it (above). */
