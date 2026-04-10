@@ -290,20 +290,27 @@ async function main() {
             const vData = vTensor.ort_tensor.cpuData;
             const seqLen = vTensor.dims[2];
 
-            // Compress each position's K and V vectors
-            for (let pos = 0; pos < seqLen; pos++) {
-              const offset = pos * headDim;
+            // Track compression ratio without blocking generation.
+            // Compress a sample position to calculate the ratio accurately,
+            // then extrapolate for the full sequence.
+            if (layer.keys.length === 0) {
+              // First call — compress one vector to measure ratio
+              const kSlice = f16ToF32(new Uint16Array(kData.buffer, kData.byteOffset, headDim));
+              const sample = tq.encode(kSlice);
+              const rawPerVec = headDim * 2; // float16
+              const compPerVec = sample.byteLength;
+              // Extrapolate for all positions, K+V, this layer
+              kvUncompressedBytes += seqLen * rawPerVec * 2;
+              kvCompressedBytes += seqLen * compPerVec * 2;
+              layer.keys.push(sample);
+            } else {
+              // Decode step — one new position per layer
+              const offset = (seqLen - 1) * headDim;
               const kSlice = f16ToF32(new Uint16Array(kData.buffer, kData.byteOffset + offset * 2, headDim));
-              const vSlice = f16ToF32(new Uint16Array(vData.buffer, vData.byteOffset + offset * 2, headDim));
-
               const kEncoded = tq.encode(kSlice);
-              const vEncoded = tq.encode(vSlice);
-
-              kvUncompressedBytes += headDim * 2 * 2; // K+V, float16
-              kvCompressedBytes += kEncoded.byteLength + vEncoded.byteLength;
-
+              kvUncompressedBytes += headDim * 2 * 2;
+              kvCompressedBytes += kEncoded.byteLength * 2;
               layer.keys.push(kEncoded);
-              layer.values.push(vEncoded);
             }
           }
         }
