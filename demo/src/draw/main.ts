@@ -262,8 +262,18 @@ wipeBtn.addEventListener("click", () => {
     ? indexedDB.databases().then(list => list.forEach(db => { if (db.name) indexedDB.deleteDatabase(db.name); }))
     : Promise.resolve();
 
-  // Wipe storage, then reload to kill all in-flight downloads and free GPU memory
-  Promise.all([wipeCache, wipeDb]).then(() => location.reload());
+  Promise.all([wipeCache, wipeDb]).then(() => {
+    resetTqCaches();
+    gen = null;
+    setCode("");
+    currentCode = "";
+    updateDiagram([]);
+    statSpeed.textContent = "--";
+    statKV.textContent = "KV: --";
+    statusEl.textContent = "All data wiped. Close this tab to free memory.";
+    wipeBtn.style.display = "none";
+    generateBtn.disabled = true;
+  });
 });
 
 // Show wipe button immediately
