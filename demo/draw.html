@@ -41,16 +41,22 @@
     <p class="subtitle">Describe any diagram, Gemma 4 E2B generates it as Excalidraw — entirely in your browser.</p>
     <p class="note">The LLM outputs compact code (~50 tokens) instead of raw Excalidraw JSON (~5,000 tokens). TQ compresses the KV cache ~3.3x so longer conversations fit in GPU memory.</p>
     <nav class="demo-nav"><a href="./">All demos</a> · <a href="https://www.npmjs.com/package/turboquant-wasm">npm</a> · <a href="https://github.com/teamchong/turboquant-wasm">GitHub</a></nav>
-    <span id="status"><span class="spinner"></span> Loading model...</span>
+    <div style="display:flex;align-items:center;justify-content:center;gap:12px;margin-top:4px;">
+      <span id="status"><span class="spinner"></span> Loading model...</span>
+      <button id="wipe" style="padding:4px 12px;background:#da3633;color:#fff;border:none;border-radius:4px;font-size:12px;cursor:pointer;display:none;">Stop + Wipe All Data</button>
+    </div>
   </div>
   <div id="main">
     <div id="left-panel">
       <div id="prompt-area">
         <textarea id="prompt">What happens when you type a URL into your browser? Include every network layers</textarea>
-        <button id="generate">Generate Diagram</button>
+        <button id="generate" style="margin-top:8px;width:100%;padding:8px;background:#238636;color:#fff;border:none;border-radius:6px;font-size:14px;cursor:pointer;">Generate Diagram</button>
         <div class="hint">Cmd+Enter to generate</div>
       </div>
       <div id="code-area"></div>
+      <div style="padding:8px 12px;border-top:1px solid #30363d;">
+        <button id="render" style="width:100%;padding:6px;background:#1f6feb;color:#fff;border:none;border-radius:6px;font-size:13px;cursor:pointer;">Render Code</button>
+      </div>
     </div>
     <div id="diagram-container"></div>
   </div>

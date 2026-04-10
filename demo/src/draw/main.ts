@@ -19,6 +19,8 @@ const promptEl = $("#prompt") as HTMLTextAreaElement;
 const generateBtn = $("#generate") as HTMLButtonElement;
 const codeArea = $("#code-area") as HTMLElement;
 const diagramContainer = $("#diagram-container") as HTMLElement;
+const renderBtn = $("#render") as HTMLButtonElement;
+const wipeBtn = $("#wipe") as HTMLButtonElement;
 const statSpeed = $("#stat-speed") as HTMLElement;
 const statKV = $("#stat-kv") as HTMLElement;
 
@@ -232,4 +234,46 @@ promptEl.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) generate();
 });
 
+renderBtn.addEventListener("click", async () => {
+  const code = getCode();
+  if (!code) return;
+  statusEl.textContent = "Rendering...";
+  const { result, error } = await executeCode(code);
+  if (error) {
+    statusEl.textContent = `Code error: ${error}`;
+    statusEl.classList.add("error");
+  } else if (result.json) {
+    updateDiagram(result.json.elements || []);
+    statusEl.textContent = "Diagram ready";
+    statusEl.classList.remove("error");
+  }
+});
+
+wipeBtn.addEventListener("click", () => {
+  if (busy) {
+    stopCriteria.interrupt();
+  }
+  resetTqCaches();
+  setCode("");
+  currentCode = "";
+  updateDiagram([]);
+  statSpeed.textContent = "--";
+  statKV.textContent = "KV: --";
+  statusEl.textContent = "All data wiped";
+  statusEl.classList.remove("ready", "error");
+
+  // Clear caches — model weights, KV, everything
+  if ("caches" in window) {
+    caches.keys().then(names => names.forEach(n => caches.delete(n)));
+  }
+  const dbs = indexedDB.databases ? indexedDB.databases() : Promise.resolve([]);
+  dbs.then(list => list.forEach(db => { if (db.name) indexedDB.deleteDatabase(db.name); }));
+
+  gen = null;
+  setTimeout(() => { statusEl.textContent = "Wiped. Reload to start fresh."; }, 500);
+});
+
 main();
+
+// Show wipe button once model starts loading
+setTimeout(() => { wipeBtn.style.display = "inline-block"; }, 1000);
