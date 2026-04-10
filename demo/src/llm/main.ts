@@ -146,7 +146,14 @@ async function main() {
       const config = (gen as any).model?.config;
       const headDim = config?.head_dim || 256;
       tqCache = await TQKVCache.create(gpuDevice, headDim, 131072);
-      console.log("[TQ] KV cache ready: head_dim=%d", headDim);
+      tqCache.onContextLimitReached = (used, max) => {
+        const msg = `Context limit reached: ${used.toLocaleString()} / ${max.toLocaleString()} tokens. Clear conversation to continue.`;
+        statusEl.textContent = msg;
+        statusEl.classList.add("error");
+        addMsg("system", msg);
+        console.warn(`[TQ] ${msg}`);
+      };
+      console.log("[TQ] KV cache ready: head_dim=%d max=128K", headDim);
 
       // Intercept KV cache between generation steps.
       // After each forward pass, getPastKeyValues receives the model's

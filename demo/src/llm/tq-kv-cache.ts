@@ -62,6 +62,7 @@ export class TQKVCache {
     cache.qjlBytes = Math.ceil(headDim / 8);
     cache.blobBytes = cache.headerBytes + cache.polarBytes + cache.qjlBytes;
     cache.blobU32s = Math.ceil(cache.blobBytes / 4);
+    cache.maxPositions = maxPositions;
 
     // Create polar LUT buffer
     const lutData = buildPolarLUT();
@@ -93,6 +94,8 @@ export class TQKVCache {
    * The data stays compressed on GPU.
    */
   private encodeCount = 0;
+  private maxPositions: number;
+  onContextLimitReached: ((used: number, max: number) => void) | null = null;
 
   encodeAndAppend(layerIdx: number, kData: GPUBuffer, vData: GPUBuffer, numNewPositions: number) {
     if (this.encodeCount < 3) {
@@ -101,6 +104,11 @@ export class TQKVCache {
     this.encodeCount++;
 
     let layer = this.layers.get(layerIdx);
+    const currentLen = layer ? layer.length : 0;
+    if (currentLen + numNewPositions > this.maxPositions) {
+      this.onContextLimitReached?.(currentLen + numNewPositions, this.maxPositions);
+      return;
+    }
     if (!layer) {
       const capacity = 4096;
       const bufSize = capacity * this.blobU32s * 4;
