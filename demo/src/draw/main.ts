@@ -163,9 +163,11 @@ async function generate() {
     // Update TQ stats
     if (kvCompressedBytes > 0) {
       const compressed = (kvCompressedBytes / 1e6).toFixed(1);
-      const uncompressed = (kvUncompressedBytes / 1e6).toFixed(1);
-      const ratio = (kvUncompressedBytes / kvCompressedBytes).toFixed(1);
-      statKV.textContent = `KV: ${uncompressed} MB → ${compressed} MB (${ratio}x compression)`;
+      const f16Size = (kvUncompressedBytes / 1e6).toFixed(1);
+      const f32Size = (kvUncompressedBytes * 2 / 1e6).toFixed(1);
+      const ratioF16 = (kvUncompressedBytes / kvCompressedBytes).toFixed(1);
+      const ratioF32 = (kvUncompressedBytes * 2 / kvCompressedBytes).toFixed(1);
+      statKV.textContent = `KV: ${compressed} MB (${ratioF16}x vs f16, ${ratioF32}x vs f32)`;
     } else {
       statKV.textContent = `${tokenCount} tokens`;
     }
@@ -257,8 +259,29 @@ async function main() {
       return f32;
     }
 
-    // Intercept KV cache — compress with TQ WASM on CPU
+    // Intercept KV cache — compress with TQ, replace originals, decompress on demand
+    const { Tensor } = await import("@huggingface/transformers");
     const model = (gen as any).model;
+
+    // Float32 → Float16 conversion
+    function f32ToF16(f32: Float32Array): Uint16Array {
+      const f16 = new Uint16Array(f32.length);
+      for (let i = 0; i < f32.length; i++) {
+        const v = f32[i];
+        // Fast f32 to f16 via DataView
+        const buf = new ArrayBuffer(4);
+        new Float32Array(buf)[0] = v;
+        const bits = new Uint32Array(buf)[0];
+        const s = (bits >> 16) & 0x8000;
+        const e = ((bits >> 23) & 0xff) - 127 + 15;
+        const m = (bits >> 13) & 0x3ff;
+        if (e <= 0) f16[i] = s;
+        else if (e >= 31) f16[i] = s | 0x7c00;
+        else f16[i] = s | (e << 10) | m;
+      }
+      return f16;
+    }
+
     if (model?.getPastKeyValues) {
       const originalGetPKV = model.getPastKeyValues.bind(model);
       model.getPastKeyValues = function(
@@ -268,56 +291,77 @@ async function main() {
       ) {
         const cache = originalGetPKV(decoderResults, pastKeyValues, ...rest);
 
-        if (tq) {
-          for (const name in decoderResults) {
-            if (!name.startsWith("present") || !name.endsWith(".value")) continue;
-            const vTensor = decoderResults[name];
-            const kName = name.replace(".value", ".key");
-            const kTensor = decoderResults[kName];
-            if (!vTensor?.ort_tensor?.cpuData || !kTensor?.ort_tensor?.cpuData) continue;
+        if (!tq) return cache;
 
-            const match = name.match(/(\d+)\.value/);
-            if (!match) continue;
-            const layerIdx = parseInt(match[1]);
+        // Compress each layer's new K/V vectors
+        for (const name in decoderResults) {
+          if (!name.startsWith("present") || !name.endsWith(".value")) continue;
+          const vTensor = decoderResults[name];
+          const kName = name.replace(".value", ".key");
+          const kTensor = decoderResults[kName];
+          if (!vTensor?.ort_tensor?.cpuData || !kTensor?.ort_tensor?.cpuData) continue;
 
-            if (!kvCache.has(layerIdx)) {
-              kvCache.set(layerIdx, { keys: [], values: [] });
-            }
-            const layer = kvCache.get(layerIdx)!;
+          const match = name.match(/(\d+)\.value/);
+          if (!match) continue;
+          const layerIdx = parseInt(match[1]);
+          if (!kvCache.has(layerIdx)) kvCache.set(layerIdx, { keys: [], values: [] });
+          const layer = kvCache.get(layerIdx)!;
 
-            // Get raw data — float16 Uint16Array
-            const kData = kTensor.ort_tensor.cpuData;
-            const vData = vTensor.ort_tensor.cpuData;
-            const seqLen = vTensor.dims[2];
+          const kData = kTensor.ort_tensor.cpuData;
+          const vData = vTensor.ort_tensor.cpuData;
+          const seqLen = vTensor.dims[2];
+          const numHeads = vTensor.dims[1];
 
-            // Track compression ratio without blocking generation.
-            // Compress a sample position to calculate the ratio accurately,
-            // then extrapolate for the full sequence.
-            if (layer.keys.length === 0) {
-              // First call — compress one vector to measure ratio
-              const kSlice = f16ToF32(new Uint16Array(kData.buffer, kData.byteOffset, headDim));
-              const sample = tq.encode(kSlice);
-              const rawPerVec = headDim * 2; // float16
-              const compPerVec = sample.byteLength;
-              // Extrapolate for all positions, K+V, this layer
-              kvUncompressedBytes += seqLen * rawPerVec * 2;
-              kvCompressedBytes += seqLen * compPerVec * 2;
-              layer.keys.push(sample);
-            } else {
-              // Decode step — one new position per layer
-              const offset = (seqLen - 1) * headDim;
+          // Only compress the NEW positions (seqLen - existing compressed count)
+          const existingCount = layer.keys.length;
+          for (let pos = existingCount; pos < seqLen; pos++) {
+            for (let h = 0; h < numHeads; h++) {
+              const offset = (h * seqLen + pos) * headDim;
               const kSlice = f16ToF32(new Uint16Array(kData.buffer, kData.byteOffset + offset * 2, headDim));
-              const kEncoded = tq.encode(kSlice);
-              kvUncompressedBytes += headDim * 2 * 2;
-              kvCompressedBytes += kEncoded.byteLength * 2;
-              layer.keys.push(kEncoded);
+              const vSlice = f16ToF32(new Uint16Array(vData.buffer, vData.byteOffset + offset * 2, headDim));
+              layer.keys.push(tq.encode(kSlice));
+              layer.values.push(tq.encode(vSlice));
+              kvCompressedBytes += layer.keys[layer.keys.length - 1].byteLength + layer.values[layer.values.length - 1].byteLength;
+              kvUncompressedBytes += headDim * 2 * 2; // K+V float16
             }
           }
         }
 
+        // Replace cache tensors with decompressed from TQ compressed data.
+        // This frees the original ORT tensors and reconstructs from compressed.
+        const pkvNames = Object.keys(cache).filter(n => n.startsWith("past_key_values."));
+        for (const name of pkvNames) {
+          const match = name.match(/(\d+)\.(key|value)/);
+          if (!match) continue;
+          const layerIdx = parseInt(match[1]);
+          const isKey = match[2] === "key";
+          const layer = kvCache.get(layerIdx);
+          if (!layer) continue;
+
+          const origTensor = (cache as any)[name];
+          const [batch, numHeads, seqLen, dim] = origTensor.dims;
+          const stored = isKey ? layer.keys : layer.values;
+          if (stored.length === 0) continue;
+
+          // Reconstruct float16 tensor from compressed data
+          const f16Data = new Uint16Array(batch * numHeads * seqLen * dim);
+          const positionsPerHead = seqLen;
+          for (let h = 0; h < numHeads; h++) {
+            for (let pos = 0; pos < positionsPerHead; pos++) {
+              const idx = pos * numHeads + h;
+              if (idx >= stored.length) break;
+              const decoded = tq.decode(stored[idx]);
+              const f16 = f32ToF16(decoded);
+              const outOffset = (h * positionsPerHead + pos) * dim;
+              f16Data.set(f16, outOffset);
+            }
+          }
+          (cache as any)[name] = new Tensor("float16", f16Data, [batch, numHeads, seqLen, dim]);
+        }
+
         return cache;
       };
-      console.log("[TQ] KV cache compression active");
+      console.log("[TQ] KV cache compress/decompress active");
     }
 
     statusEl.innerHTML = "Ready";
