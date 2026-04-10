@@ -1,6 +1,6 @@
 /** Prompt to Diagram: Gemma 4 E2B generates drawmode code, rendered as Excalidraw. */
 
-import { resetTqCaches } from "./tq-apply-attention.js";
+import { resetTqCaches, getTqStats } from "./tq-apply-attention.js";
 import { pipeline, env, TextStreamer, InterruptableStoppingCriteria, type TextGenerationPipeline } from "@huggingface/transformers";
 import { executeCode } from "./drawmode/executor.js";
 import { SDK_TYPES } from "./drawmode/sdk-types.js";
@@ -135,6 +135,12 @@ async function generate() {
         appendCode(chunk);
         const elapsed = (performance.now() - startTime) / 1000;
         statSpeed.textContent = `${(tokenCount / elapsed).toFixed(1)} tok/s`;
+        const tq = getTqStats();
+        if (tq.contextLength > 0) {
+          const compKB = (tq.compressedBytes / 1024).toFixed(0);
+          const rawKB = (tq.uncompressedBytes / 1024).toFixed(0);
+          statKV.textContent = `KV: ${compKB}KB / ${rawKB}KB (${tq.ratio.toFixed(1)}x) · ${tq.contextLength} pos · ${tq.layers} layers`;
+        }
       },
     });
 
@@ -148,8 +154,10 @@ async function generate() {
     const elapsed = (performance.now() - startTime) / 1000;
     statSpeed.textContent = `${(tokenCount / elapsed).toFixed(1)} tok/s · ${tokenCount} tok · ${elapsed.toFixed(1)}s`;
 
-    // Update TQ stats
-    statKV.textContent = `${tokenCount} tokens (TQ attention)`;
+    const tqFinal = getTqStats();
+    const compKB = (tqFinal.compressedBytes / 1024).toFixed(0);
+    const rawKB = (tqFinal.uncompressedBytes / 1024).toFixed(0);
+    statKV.textContent = `KV: ${compKB}KB / ${rawKB}KB (${tqFinal.ratio.toFixed(1)}x) · ${tqFinal.contextLength} pos · ${tqFinal.layers} layers`;
 
     // Strip markdown code fences if present
     let code = generatedCode.trim();

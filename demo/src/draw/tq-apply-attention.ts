@@ -340,3 +340,19 @@ export function resetTqCaches(): void {
     for (const lc of state.layers.values()) lc.length = 0;
   }
 }
+
+/** Live stats for the UI. */
+export function getTqStats(): { contextLength: number; compressedBytes: number; uncompressedBytes: number; ratio: number; layers: number } {
+  if (!state) return { contextLength: 0, compressedBytes: 0, uncompressedBytes: 0, ratio: 0, layers: 0 };
+  let maxLen = 0;
+  let layers = 0;
+  for (const lc of state.layers.values()) {
+    if (lc.length > maxLen) maxLen = lc.length;
+    layers++;
+  }
+  const bytesPerPosTq = (state.polarWordsPerPos * 4 + state.qjlWordsPerPos * 4 + 8); // polar + qjl + max_r + gamma
+  const bytesPerPosRaw = state.dim * 2; // f16
+  const compressedBytes = maxLen * bytesPerPosTq * layers;
+  const uncompressedBytes = maxLen * bytesPerPosRaw * layers;
+  return { contextLength: maxLen, compressedBytes, uncompressedBytes, ratio: uncompressedBytes > 0 ? uncompressedBytes / compressedBytes : 0, layers };
+}
