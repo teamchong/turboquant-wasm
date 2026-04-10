@@ -3,6 +3,7 @@ import { resolve } from "path";
 
 export default defineConfig(({ command }) => ({
   base: command === "serve" ? "/" : "/turboquant-wasm/",
+  assetsInclude: ["**/*.wgsl"],
   resolve: {
     alias: {
       // Use local source until TQStream is published to npm

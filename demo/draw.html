@@ -7,52 +7,57 @@
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: system-ui, sans-serif; background: #0d1117; color: #e6edf3; height: 100vh; display: flex; flex-direction: column; }
-    #header { padding: 12px 16px; border-bottom: 1px solid #30363d; display: flex; align-items: center; gap: 12px; }
-    #header h1 { font-size: 16px; font-weight: 600; }
+    #header { padding: 16px 24px; border-bottom: 1px solid #30363d; text-align: center; }
+    #header h1 { font-size: 20px; font-weight: 600; margin-bottom: 4px; }
     #header .dim { color: #7d8590; font-weight: 400; }
+    .subtitle { font-size: 14px; color: #e6edf3; margin-bottom: 4px; }
+    .note { font-size: 12px; color: #7d8590; margin-bottom: 6px; }
+    .demo-nav { font-size: 12px; color: #7d8590; margin-bottom: 6px; }
+    .demo-nav a { color: #58a6ff; text-decoration: none; }
+    .demo-nav a:hover { text-decoration: underline; }
     #status { font-size: 12px; color: #7d8590; }
     #status.ready { color: #3fb950; }
     #status.error { color: #f85149; }
+    .spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 4px; }
+    #status .spinner { border-color: #7d8590; border-top-color: #58a6ff; }
+    @keyframes spin { to { transform: rotate(360deg); } }
     #main { flex: 1; display: flex; overflow: hidden; }
-    #left-panel { width: 400px; min-width: 300px; display: flex; flex-direction: column; border-right: 1px solid #30363d; }
+    #left-panel { width: 360px; min-width: 280px; display: flex; flex-direction: column; border-right: 1px solid #30363d; }
     #prompt-area { padding: 12px; }
     #prompt { width: 100%; height: 80px; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-family: inherit; font-size: 14px; padding: 8px 12px; resize: vertical; }
     #prompt:focus { outline: none; border-color: #58a6ff; }
     #generate { margin-top: 8px; width: 100%; padding: 8px; background: #238636; color: #fff; border: none; border-radius: 6px; font-size: 14px; cursor: pointer; }
     #generate:hover { background: #2ea043; }
-    #generate:disabled { background: #21262d; color: #7d8590; cursor: not-allowed; }
     #code-area { flex: 1; overflow: auto; padding: 12px; border-top: 1px solid #30363d; }
-    #code-output { font-family: 'SF Mono', 'Cascadia Code', monospace; font-size: 12px; line-height: 1.5; color: #79c0ff; white-space: pre-wrap; word-break: break-all; min-height: 100px; }
-    #right-panel { flex: 1; display: flex; flex-direction: column; }
-    #diagram-frame { flex: 1; border: none; background: #fff; }
+    #code-output { font-family: 'SF Mono', 'Cascadia Code', monospace; font-size: 12px; line-height: 1.5; color: #79c0ff; white-space: pre-wrap; word-break: break-all; }
+    #diagram-container { flex: 1; background: #fff; position: relative; min-height: 400px; }
     #stats-bar { padding: 6px 16px; border-top: 1px solid #30363d; display: flex; gap: 16px; font-size: 11px; color: #7d8590; }
     .hint { font-size: 11px; color: #7d8590; margin-top: 4px; }
   </style>
 </head>
 <body>
   <div id="header">
-    <h1>Prompt → Diagram <span class="dim">Gemma 4 E2B · WebGPU · TQ</span></h1>
-    <span id="status">Initializing...</span>
+    <h1>TurboQuant <span class="dim">Prompt → Diagram</span></h1>
+    <p class="subtitle">Describe any diagram, Gemma 4 E2B generates it as Excalidraw — entirely in your browser.</p>
+    <p class="note">The LLM outputs compact code (~50 tokens) instead of raw Excalidraw JSON (~5,000 tokens). TQ compresses the KV cache ~3.3x so longer conversations fit in GPU memory.</p>
+    <nav class="demo-nav"><a href="./">All demos</a> · <a href="https://www.npmjs.com/package/turboquant-wasm">npm</a> · <a href="https://github.com/teamchong/turboquant-wasm">GitHub</a></nav>
+    <span id="status"><span class="spinner"></span> Loading model...</span>
   </div>
   <div id="main">
     <div id="left-panel">
       <div id="prompt-area">
-        <textarea id="prompt">microservices with API gateway, auth service, user service, and PostgreSQL</textarea>
-        <button id="generate" disabled>Generate Diagram</button>
+        <textarea id="prompt">What happens when you type a URL into your browser? Include every network layers</textarea>
+        <button id="generate">Generate Diagram</button>
         <div class="hint">Cmd+Enter to generate</div>
       </div>
-      <div id="code-area">
-        <pre id="code-output"></pre>
-      </div>
+      <div id="code-area"></div>
     </div>
-    <div id="right-panel">
-      <iframe id="diagram-frame" src="about:blank"></iframe>
-    </div>
+    <div id="diagram-container"></div>
   </div>
   <div id="stats-bar">
     <span id="stat-speed">--</span>
     <span id="stat-kv">KV: --</span>
   </div>
-  <script type="module" src="./src/llm/main.ts"></script>
+  <script type="module" src="./src/draw/main.ts"></script>
 </body>
 </html>

@@ -482,7 +482,7 @@ export class Diagram {
   }): string {
     const id = this.nextId("txt");
     const preset = opts?.color ?? "backend";
-    const paletteColor = COLOR_PALETTE[preset];
+    const paletteColor = COLOR_PALETTE[preset] ?? COLOR_PALETTE["backend"];
     const strokeColor = opts?.strokeColor ?? paletteColor.stroke;
     const fontSize = opts?.fontSize ?? 16;
     const textMeasured = measureText(text, fontSize, opts?.fontFamily ?? 1);
@@ -578,14 +578,7 @@ export class Diagram {
 
   // ── Editing / Query Methods ──
 
-  /** Load an existing .excalidraw file for editing. */
-  static async fromFile(this: new () => Diagram, path: string): Promise<Diagram> {
-    const { readFile } = await import("node:fs/promises");
-    const raw = await readFile(path, "utf-8");
-    const parsed = ExcalidrawFileSchema.safeParse(JSON.parse(raw));
-    if (!parsed.success) throw new Error(`Invalid .excalidraw file: ${parsed.error.message}`);
-    return (this as typeof Diagram).fromElements(parsed.data.elements);
-  }
+  // fromFile removed — browser build has no filesystem
 
   /** Reconstruct a Diagram from raw Excalidraw elements (no filesystem needed). */
   static fromElements(this: new () => Diagram, elements: ExcalidrawElement[]): Diagram {
@@ -1379,7 +1372,7 @@ export class Diagram {
 
     // Update color
     if (update.color) {
-      node.color = COLOR_PALETTE[update.color];
+      node.color = COLOR_PALETTE[update.color] ?? COLOR_PALETTE["backend"];
     }
     if (update.strokeColor) {
       node.color = { ...node.color, stroke: update.strokeColor };
@@ -1447,7 +1440,7 @@ export class Diagram {
   }
 
   /** Render the diagram to the specified format. */
-  async render(opts?: RenderOpts): Promise<RenderResult> {
+  async render(_opts?: RenderOpts): Promise<RenderResult> {
     const warnings: string[] = [];
     const elements = await this.buildElements(warnings);
 
@@ -1491,86 +1484,7 @@ export class Diagram {
       groups: this.groups.size,
     };
 
-    const formatInput = opts?.format ?? "excalidraw";
-    const formats: OutputFormat[] = Array.isArray(formatInput) ? formatInput : [formatInput];
-    const filePaths: string[] = [];
-
-    // Import fs once if any format writes to disk
-    const needsFs = formats.includes("excalidraw") || formats.includes("png") || formats.includes("svg");
-    const fs = needsFs ? await import("node:fs/promises") : null;
-
-    for (const format of formats) {
-      if (format === "excalidraw") {
-        const path = opts?.path ?? "diagram.excalidraw";
-
-        // Compute diff against existing file (if any)
-        try {
-          await fs!.access(path);
-          const oldContent = await fs!.readFile(path, "utf-8");
-          const oldFile = ExcalidrawFileSchema.parse(JSON.parse(oldContent));
-          const summary = computeChangeSummary(oldFile.elements, elements);
-          if (summary) result.changeSummary = summary;
-        } catch { /* file doesn't exist or is unparseable — skip diff */ }
-
-        await fs!.writeFile(path, JSON.stringify(excalidrawJson, null, 2));
-        if (!result.filePath) result.filePath = path;
-        filePaths.push(path);
-      }
-
-      if (format === "url") {
-        const { uploadToExcalidraw } = await import("./upload.js");
-        result.url = await uploadToExcalidraw(JSON.stringify(excalidrawJson));
-      }
-
-      if (format === "png") {
-        const pngPath = (opts?.path ?? "diagram").replace(/\.(excalidraw|png|svg)$/, "") + ".png";
-        let pngData: string | null = null;
-
-        const { renderPngWasm } = await import("./png.js");
-        const wasmResult = await renderPngWasm(elements);
-        if (wasmResult) {
-          pngData = wasmResult.pngBase64;
-          if (fs) await fs.writeFile(pngPath, wasmResult.pngBytes);
-          result.pngBase64 = pngData;
-          if (!result.filePath) result.filePath = pngPath;
-          filePaths.push(pngPath);
-        } else {
-          throw new Error("PNG export failed. Ensure WASM and linkedom are available.");
-        }
-      }
-
-      if (format === "svg") {
-        const svgPath = (opts?.path ?? "diagram").replace(/\.(excalidraw|png|svg)$/, "") + ".svg";
-        let svgData: string | null = null;
-
-        const { renderSvgWasm } = await import("./png.js");
-        svgData = await renderSvgWasm(elements);
-        if (svgData) {
-          if (fs) await fs.writeFile(svgPath, svgData, "utf-8");
-          result.svgString = svgData;
-          if (!result.filePath) result.filePath = svgPath;
-          filePaths.push(svgPath);
-        } else {
-          throw new Error("SVG export failed. Ensure linkedom is available.");
-        }
-      }
-    }
-
-    // Write sidecar .drawmode.ts for any format that writes to disk
-    // Wrapped in try/catch — sidecar is a convenience, should never fail the render
-    if (fs && filePaths.length > 0) {
-      try {
-        const basePath = (opts?.path ?? "diagram").replace(/\.(excalidraw|png|svg)$/, "");
-        const sidecarPath = basePath + ".drawmode.ts";
-        const sidecarCode = this.toCode({ path: opts?.path });
-        if (sidecarCode) {
-          await fs.writeFile(sidecarPath, sidecarCode);
-        }
-      } catch { /* sidecar write is non-critical */ }
-    }
-
-    if (filePaths.length > 1) result.filePaths = filePaths;
-
+    // Browser build: JSON is always available, no file I/O or upload API needed
     return result;
   }
 
@@ -2204,8 +2118,8 @@ export class Diagram {
         type: "rectangle",
         x, y: BASE_Y,
         width: SEQ_ACTOR_WIDTH, height: SEQ_ACTOR_HEIGHT,
-        backgroundColor: actor.opts?.backgroundColor ?? COLOR_PALETTE[actor.opts?.color ?? "backend"].background,
-        strokeColor: actor.opts?.strokeColor ?? COLOR_PALETTE[actor.opts?.color ?? "backend"].stroke,
+        backgroundColor: actor.opts?.backgroundColor ?? (COLOR_PALETTE[actor.opts?.color ?? "backend"] ?? COLOR_PALETTE["backend"]).background,
+        strokeColor: actor.opts?.strokeColor ?? (COLOR_PALETTE[actor.opts?.color ?? "backend"] ?? COLOR_PALETTE["backend"]).stroke,
         fillStyle: "solid", strokeWidth: 2, roughness: 1, opacity: 100,
         angle: 0, strokeStyle: "solid",
         roundness: { type: 3 },
@@ -2228,7 +2142,7 @@ export class Diagram {
         lineHeight: getLineHeight(ff), textAlign: "center" as TextAlign,
         verticalAlign: "middle" as VerticalAlign,
         containerId: actor.id, originalText: actor.label, autoResize: true,
-        strokeColor: COLOR_PALETTE[actor.opts?.color ?? "backend"].stroke,
+        strokeColor: (COLOR_PALETTE[actor.opts?.color ?? "backend"] ?? COLOR_PALETTE["backend"]).stroke,
         backgroundColor: "transparent", fillStyle: "solid",
         strokeWidth: 1, roughness: 0, opacity: 100, angle: 0,
         groupIds: [], frameId: null, isDeleted: false,
@@ -2510,7 +2424,7 @@ export class Diagram {
 /** Resolve color from opts: hex overrides > preset > default */
 function resolveColor(opts?: ShapeOpts, defaultPreset: ColorPreset = "backend"): ColorPair {
   const preset = opts?.color ?? defaultPreset;
-  const palette = COLOR_PALETTE[preset];
+  const palette = COLOR_PALETTE[preset] ?? COLOR_PALETTE["backend"];
   return {
     background: opts?.backgroundColor ?? palette.background,
     stroke: opts?.strokeColor ?? palette.stroke,
