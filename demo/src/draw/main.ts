@@ -271,7 +271,7 @@ wipeBtn.addEventListener("click", () => {
     updateDiagram([]);
     statSpeed.textContent = "--";
     statKV.textContent = "KV: --";
-    statusEl.textContent = "All data wiped. Close this tab to free memory.";
+    statusEl.textContent = "All data wiped.";
     wipeBtn.style.display = "none";
     generateBtn.disabled = true;
   });
