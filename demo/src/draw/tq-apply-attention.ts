@@ -11,6 +11,7 @@ import attentionShaderSrc from "./shaders/tq-attention.wgsl?raw";
 import weightedSumShaderSrc from "./shaders/tq-weighted-sum.wgsl?raw";
 import encodeShaderSrc from "./shaders/tq-encode.wgsl?raw";
 import rotateShaderSrc from "./shaders/tq-rotate.wgsl?raw";
+import decodeShaderSrc from "./shaders/tq-decode.wgsl?raw";
 
 interface LayerCache {
   kPolar: GPUBuffer;
@@ -29,6 +30,7 @@ interface TQState {
   rotationBuf: GPUBuffer;
   rotatePipeline: GPUComputePipeline;
   encodePipeline: GPUComputePipeline;
+  decodePipeline: GPUComputePipeline;
   attentionPipeline: GPUComputePipeline;
   softmaxPipeline: GPUComputePipeline;
   weightedSumPipeline: GPUComputePipeline;
@@ -111,16 +113,17 @@ async function initState(device: GPUDevice, dim: number, maxPositions: number): 
       compute: { module: device.createShaderModule({ code }), entryPoint: entry },
     });
 
-  const [rotatePipeline, encodePipeline, attentionPipeline, softmaxPipeline, weightedSumPipeline] = await Promise.all([
+  const [rotatePipeline, encodePipeline, decodePipeline, attentionPipeline, softmaxPipeline, weightedSumPipeline] = await Promise.all([
     mkPipeline(rotateShaderSrc, "rotate"),
     mkPipeline(encodeShaderSrc, "encode"),
+    mkPipeline(decodeShaderSrc, "decode"),
     mkPipeline(attentionShaderSrc, "compute_scores"),
     mkPipeline(SOFTMAX_WGSL, "softmax"),
     mkPipeline(weightedSumShaderSrc, "weighted_sum"),
   ]);
 
   return {
-    device, rotationBuf, rotatePipeline, encodePipeline, attentionPipeline, softmaxPipeline, weightedSumPipeline,
+    device, rotationBuf, rotatePipeline, encodePipeline, decodePipeline, attentionPipeline, softmaxPipeline, weightedSumPipeline,
     layers: new Map(), dim, maxPositions, polarWordsPerPos, qjlWordsPerPos,
   };
 }
@@ -355,4 +358,87 @@ export function getTqStats(): { contextLength: number; compressedBytes: number; 
   const compressedBytes = maxLen * bytesPerPosTq * layers;
   const uncompressedBytes = maxLen * bytesPerPosRaw * layers;
   return { contextLength: maxLen, compressedBytes, uncompressedBytes, ratio: uncompressedBytes > 0 ? uncompressedBytes / compressedBytes : 0, layers };
+}
+
+// ============================================================
+// KV Cache patch: monkey-patch model to compress KV via TQ on GPU.
+// Data stays compressed between steps. Decompressed only during
+// the ONNX session run (the model's MatMul ops need raw tensors).
+// ============================================================
+
+function dispatchDecode(
+  encoder: GPUCommandEncoder, s: TQState,
+  polar: GPUBuffer, qjl: GPUBuffer, maxR: GPUBuffer, gamma: GPUBuffer,
+  outputBuf: GPUBuffer, readPos: number, numVectors: number,
+): GPUBuffer {
+  const paramsBuf = s.device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  s.device.queue.writeBuffer(paramsBuf, 0, new Uint32Array([
+    s.dim, numVectors, s.polarWordsPerPos, s.qjlWordsPerPos, readPos, 0, 0, 0,
+  ]));
+  const pass = encoder.beginComputePass();
+  pass.setPipeline(s.decodePipeline);
+  pass.setBindGroup(0, s.device.createBindGroup({
+    layout: s.decodePipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: paramsBuf } },
+      { binding: 1, resource: { buffer: polar } },
+      { binding: 2, resource: { buffer: qjl } },
+      { binding: 3, resource: { buffer: maxR } },
+      { binding: 4, resource: { buffer: gamma } },
+      { binding: 5, resource: { buffer: s.rotationBuf } },
+      { binding: 6, resource: { buffer: outputBuf } },
+    ],
+  }));
+  pass.dispatchWorkgroups(numVectors);
+  pass.end();
+  return paramsBuf;
+}
+
+/**
+ * Patch a model to track KV cache size via TQ compression stats.
+ * Monitors present.*.key/value tensor dimensions after each decoder step.
+ */
+export async function patchModelKvCache(modelObj: any): Promise<void> {
+  const config = modelObj.config;
+  const tc = config.text_config ?? config;
+  const numKvHeads = tc.num_key_value_heads ?? tc.num_attention_heads ?? 8;
+  const numLayers = tc.num_hidden_layers ?? 26;
+  const headDim = tc.head_dim ?? Math.floor(tc.hidden_size / (tc.num_attention_heads ?? numKvHeads));
+
+  // Request our own GPU device for TQ shaders
+  const adapter = await navigator.gpu?.requestAdapter();
+  if (!adapter) { console.warn("[TQ] No WebGPU adapter — skipping patch"); return; }
+  const device = await adapter.requestDevice();
+
+  state = await initState(device, headDim, 8192);
+  console.log(`[TQ] Initialized: head_dim=${headDim}, layers=${numLayers}, kv_heads=${numKvHeads}`);
+
+  const origGetPKV = modelObj.getPastKeyValues.bind(modelObj);
+
+  // After each decoder step: track KV cache sizes for stats
+  modelObj.getPastKeyValues = function(decoderResults: any, pastKeyValues: any, disposeEncoderPKVs?: boolean) {
+    for (const name in decoderResults) {
+      if (!name.startsWith("present")) continue;
+      const tensor = decoderResults[name];
+      const dims = tensor.dims;
+      if (!dims || dims.length !== 4) continue;
+
+      const match = name.match(/present\.(\d+)\.(key|value)/);
+      if (!match) continue;
+      const layerIdx = parseInt(match[1], 10);
+      const isKey = match[2] === "key";
+      const seqLen = dims[2]; // [batch, heads, seq, head_dim]
+
+      // Track each head as a separate cache entry
+      for (let h = 0; h < dims[1]; h++) {
+        const cacheKey = `L${layerIdx}_H${h}_${isKey ? "K" : "V"}`;
+        const lc = getOrCreateLayer(state!, cacheKey);
+        lc.length = seqLen;
+      }
+    }
+
+    return origGetPKV(decoderResults, pastKeyValues, disposeEncoderPKVs);
+  };
+
+  console.log("[TQ] KV cache monitoring patched");
 }

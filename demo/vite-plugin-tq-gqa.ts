@@ -50,19 +50,12 @@ export default function tqGqaPlugin(): Plugin {
       //
       // We replace it with tqApplyAttention which takes the backend from context.
 
-      // Find the groupQueryAttention function and replace the applyAttention call.
-      // The pattern is stable: it's the only place that calls applyAttention with
-      // Q, K, V as named variables (capital letters).
-      const pattern = /applyAttention\(\s*context,\s*Q,\s*K,\s*V,\s*void 0,\s*void 0,\s*pastKey,\s*pastValue,\s*void 0,\s*params,\s*seqLens,\s*totalSequenceLengthInput\s*\);/;
+      // Patch both GroupQueryAttention and MultiHeadAttention call sites.
+      // GQA signature: applyAttention(context, Q, K, V, void 0, void 0, pastKey, pastValue, void 0, params, seqLens, totalSequenceLengthInput);
+      // MHA signature: applyAttention(context, Q, K, V, keyPaddingMask, void 0, pastKey, pastValue, attentionBias, params);
+      const gqaPattern = /applyAttention\(\s*context,\s*Q,\s*K,\s*V,\s*void 0,\s*void 0,\s*pastKey,\s*pastValue,\s*void 0,\s*params,\s*seqLens,\s*totalSequenceLengthInput\s*\);/;
+      const mhaPattern = /applyAttention\(\s*context,\s*Q,\s*K,\s*V,\s*keyPaddingMask,\s*void 0,\s*pastKey,\s*pastValue,\s*attentionBias,\s*params\s*\);/;
 
-      const match = code.match(pattern);
-      if (!match) {
-        console.warn("[tq-gqa-patch] Could not find applyAttention call in GQA — TQ patch NOT applied");
-        return;
-      }
-
-      // Extract the layer index from the GQA context. Each GQA node has a unique kernelId.
-      // We use kernelCustomData to track the layer index.
       const replacement = `{
         if (!context.kernelCustomData._tqLayerIdx) {
           context.kernelCustomData._tqLayerIdx = (globalThis.__tqLayerCounter = (globalThis.__tqLayerCounter || 0) + 1);
@@ -70,9 +63,26 @@ export default function tqGqaPlugin(): Plugin {
         tqApplyAttention(context.backend, Q, K, V, context, params, context.kernelCustomData._tqLayerIdx);
       }`;
 
-      const patched = code.replace(pattern, replacement);
+      let patched = code;
+      let patchCount = 0;
 
-      console.log("[tq-gqa-patch] Replaced applyAttention with tqApplyAttention in GQA kernel");
+      if (gqaPattern.test(patched)) {
+        patched = patched.replace(gqaPattern, replacement);
+        patchCount++;
+        console.log("[tq-gqa-patch] Patched GroupQueryAttention");
+      }
+      if (mhaPattern.test(patched)) {
+        patched = patched.replace(mhaPattern, replacement);
+        patchCount++;
+        console.log("[tq-gqa-patch] Patched MultiHeadAttention");
+      }
+
+      if (patchCount === 0) {
+        console.warn("[tq-gqa-patch] Could not find any attention calls to patch — TQ NOT applied");
+        return;
+      }
+
+      console.log(`[tq-gqa-patch] Replaced ${patchCount} applyAttention call(s) with tqApplyAttention`);
       return tqImport + patched;
     },
   };

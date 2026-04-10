@@ -1,6 +1,6 @@
 /** Prompt to Diagram: Gemma 4 E2B generates drawmode code, rendered as Excalidraw. */
 
-import { resetTqCaches, getTqStats } from "./tq-apply-attention.js";
+import { resetTqCaches, getTqStats, patchModelKvCache } from "./tq-apply-attention.js";
 import { env, TextStreamer, InterruptableStoppingCriteria, RawImage, AutoTokenizer, AutoProcessor, AutoModelForImageTextToText } from "@huggingface/transformers";
 import { executeCode } from "./drawmode/executor.js";
 import { SDK_TYPES } from "./drawmode/sdk-types.js";
@@ -326,9 +326,10 @@ async function main() {
       AutoProcessor.from_pretrained(MODEL_ID, modelOpts),
       AutoModelForImageTextToText.from_pretrained(MODEL_ID, modelOpts),
     ]);
+    await patchModelKvCache(model);
     modelReady = true;
 
-    console.log("[TQ] model loaded — TQ attention active via GQA kernel patch");
+    console.log("[draw] model loaded (tokenizer + processor + vision encoder)");
 
     statusEl.innerHTML = "Ready";
     statusEl.classList.add("ready");
