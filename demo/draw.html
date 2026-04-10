@@ -26,8 +26,12 @@
     #prompt-area { padding: 12px; }
     #prompt { width: 100%; height: 80px; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-family: inherit; font-size: 14px; padding: 8px 12px; resize: vertical; }
     #prompt:focus { outline: none; border-color: #58a6ff; }
-    #generate { margin-top: 8px; width: 100%; padding: 8px; background: #238636; color: #fff; border: none; border-radius: 6px; font-size: 14px; cursor: pointer; }
-    #generate:hover { background: #2ea043; }
+    button { border: none; border-radius: 6px; color: #fff; cursor: pointer; font-size: 14px; padding: 8px; transition: filter 0.15s; }
+    button:hover { filter: brightness(1.2); }
+    button:active { filter: brightness(0.9); }
+    #generate { background: #238636; }
+    #render { background: #1f6feb; font-size: 13px; padding: 6px; }
+    #wipe { background: #da3633; font-size: 12px; padding: 4px 12px; display: none; }
     #code-area { flex: 1; overflow: auto; padding: 12px; border-top: 1px solid #30363d; }
     #code-output { font-family: 'SF Mono', 'Cascadia Code', monospace; font-size: 12px; line-height: 1.5; color: #79c0ff; white-space: pre-wrap; word-break: break-all; }
     #diagram-container { flex: 1; background: #fff; position: relative; min-height: 400px; }
@@ -43,19 +47,19 @@
     <nav class="demo-nav"><a href="./">All demos</a> · <a href="https://www.npmjs.com/package/turboquant-wasm">npm</a> · <a href="https://github.com/teamchong/turboquant-wasm">GitHub</a></nav>
     <div style="display:flex;align-items:center;justify-content:center;gap:12px;margin-top:4px;">
       <span id="status"><span class="spinner"></span> Loading model...</span>
-      <button id="wipe" style="padding:4px 12px;background:#da3633;color:#fff;border:none;border-radius:4px;font-size:12px;cursor:pointer;display:none;">Stop + Wipe All Data</button>
+      <button id="wipe">Stop + Wipe All Data</button>
     </div>
   </div>
   <div id="main">
     <div id="left-panel">
       <div id="prompt-area">
         <textarea id="prompt">What happens when you type a URL into your browser? Include every network layers</textarea>
-        <button id="generate" style="margin-top:8px;width:100%;padding:8px;background:#238636;color:#fff;border:none;border-radius:6px;font-size:14px;cursor:pointer;">Generate Diagram</button>
+        <button id="generate" style="margin-top:8px;width:100%;">Generate Diagram</button>
         <div class="hint">Cmd+Enter to generate</div>
       </div>
       <div id="code-area"></div>
       <div style="padding:8px 12px;border-top:1px solid #30363d;">
-        <button id="render" style="width:100%;padding:6px;background:#1f6feb;color:#fff;border:none;border-radius:6px;font-size:13px;cursor:pointer;">Render Code</button>
+        <button id="render" style="width:100%;">Render Code</button>
       </div>
     </div>
     <div id="diagram-container"></div>
