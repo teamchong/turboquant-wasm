@@ -1,7 +1,7 @@
 /** Prompt to Diagram: Gemma 4 E2B generates drawmode code, rendered as Excalidraw. */
 
 import { resetTqCaches, getTqStats } from "./tq-apply-attention.js";
-import { pipeline, env, TextStreamer, InterruptableStoppingCriteria, type TextGenerationPipeline } from "@huggingface/transformers";
+import { env, TextStreamer, InterruptableStoppingCriteria, RawImage, AutoTokenizer, AutoProcessor, AutoModelForImageTextToText } from "@huggingface/transformers";
 import { executeCode } from "./drawmode/executor.js";
 import { SDK_TYPES } from "./drawmode/sdk-types.js";
 import { loadWasm } from "./drawmode/layout.js";
@@ -23,12 +23,82 @@ const renderBtn = $("#render") as HTMLButtonElement;
 const wipeBtn = $("#wipe") as HTMLButtonElement;
 const statSpeed = $("#stat-speed") as HTMLElement;
 const statKV = $("#stat-kv") as HTMLElement;
+const attachBtn = $("#attach-btn") as HTMLButtonElement;
+const fileInput = $("#file-input") as HTMLInputElement;
+const thumbnailsEl = $("#thumbnails") as HTMLElement;
+const promptArea = $("#prompt-area") as HTMLElement;
 
-let gen: TextGenerationPipeline | null = null;
+let tokenizer: any = null;
+let processor: any = null;
+let model: any = null;
+let modelReady = false;
 let busy = false;
 let currentCode = "";
 let lastStmtCount = 0;
 const stopCriteria = new InterruptableStoppingCriteria();
+
+// -- Attachments --
+interface Attachment { blob: Blob; objectUrl: string; rawImage: RawImage; isPdf: boolean }
+const attachments: Attachment[] = [];
+const MAX_ATTACHMENTS = 6;
+
+async function pdfPageToBlob(file: File): Promise<Blob> {
+  const pdfjsLib: any = await import(/* @vite-ignore */ "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.9.155/pdf.min.mjs");
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.9.155/pdf.worker.min.mjs";
+  const pdf = await pdfjsLib.getDocument({ data: await file.arrayBuffer() }).promise;
+  const page = await pdf.getPage(1);
+  const vp = page.getViewport({ scale: 1.5 });
+  const canvas = new OffscreenCanvas(vp.width, vp.height);
+  await page.render({ canvasContext: canvas.getContext("2d")!, viewport: vp }).promise;
+  return canvas.convertToBlob({ type: "image/png" });
+}
+
+async function addFiles(files: FileList | File[]) {
+  for (const file of Array.from(files)) {
+    if (attachments.length >= MAX_ATTACHMENTS) break;
+    const isPdf = file.type === "application/pdf";
+    if (!file.type.startsWith("image/") && !isPdf) continue;
+    const blob = isPdf ? await pdfPageToBlob(file) : file;
+    const objectUrl = URL.createObjectURL(blob);
+    const rawImage = await RawImage.fromBlob(blob);
+    attachments.push({ blob, objectUrl, rawImage, isPdf });
+  }
+  renderThumbnails();
+}
+
+function renderThumbnails() {
+  thumbnailsEl.innerHTML = "";
+  attachments.forEach((att, i) => {
+    const wrap = document.createElement("div");
+    wrap.className = "thumb";
+    const img = document.createElement("img");
+    img.src = att.objectUrl;
+    wrap.appendChild(img);
+    if (att.isPdf) {
+      const badge = document.createElement("span");
+      badge.className = "pdf-badge";
+      badge.textContent = "PDF";
+      wrap.appendChild(badge);
+    }
+    const x = document.createElement("button");
+    x.className = "thumb-x";
+    x.textContent = "\u00d7";
+    x.addEventListener("click", () => { URL.revokeObjectURL(attachments[i].objectUrl); attachments.splice(i, 1); renderThumbnails(); });
+    wrap.appendChild(x);
+    thumbnailsEl.appendChild(wrap);
+  });
+}
+
+/** Unified generation: always goes through processor → model.generate */
+async function callModel(
+  messages: Array<{ role: string; content: any }>,
+  images: RawImage[] | null,
+  genOptions: Record<string, any>,
+) {
+  const text: string = tokenizer.apply_chat_template(messages, { tokenize: false, add_generation_prompt: true });
+  const processed = await processor(text, images?.length ? images : null);
+  await model.generate({ ...processed, ...genOptions });
+}
 
 const SYSTEM_PROMPT = `Output a complete Diagram script. No markdown, no comments, no helpers. One statement per line. Assign every node to a const, use those consts in connect/addGroup.
 
@@ -64,9 +134,9 @@ async function generate() {
   busy = true;
   stopCriteria.reset();
 
-  if (!gen) {
+  if (!modelReady) {
     generateBtn.innerHTML = '<span class="spinner"></span> Waiting for model...';
-    while (!gen) {
+    while (!modelReady) {
       await new Promise(r => setTimeout(r, 500));
     }
   }
@@ -84,16 +154,28 @@ async function generate() {
   try {
     // Always read latest from editor (user may have edited manually)
     currentCode = getCode();
-    let userContent = prompt;
+
+    // Build text part of user content
+    let textPart = prompt;
     if (currentCode) {
-      userContent = `Current diagram code:\n\`\`\`\n${currentCode}\n\`\`\`\n\nModify it: ${prompt}`;
+      textPart = `Current diagram code:\n\`\`\`\n${currentCode}\n\`\`\`\n\nModify it: ${prompt}`;
     }
+
+    // Build user content — multimodal array when images attached, plain string otherwise
+    const images = attachments.map(a => a.rawImage);
+    let userContent: any = textPart;
+    if (images.length > 0) {
+      const blocks: any[] = images.map(img => ({ type: "image", image: img }));
+      blocks.push({ type: "text", text: textPart });
+      userContent = blocks;
+    }
+
     const messages = [
       { role: "system" as const, content: SYSTEM_PROMPT },
       { role: "user" as const, content: userContent },
     ];
 
-    const streamer = new TextStreamer((gen as any).tokenizer, {
+    const streamer = new TextStreamer(tokenizer, {
       skip_prompt: true,
       skip_special_tokens: true,
       token_callback_function: () => { tokenCount++; },
@@ -131,7 +213,7 @@ async function generate() {
       },
     });
 
-    await gen(messages, {
+    await callModel(messages, images, {
       max_new_tokens: 1024,
       do_sample: false,
       streamer,
@@ -183,7 +265,7 @@ async function generate() {
         { role: "assistant" as const, content: code },
         { role: "user" as const, content: `That code threw an error: ${error}\nRespond with ONLY the corrected code.` },
       ];
-      const retryStreamer = new TextStreamer((gen as any).tokenizer, {
+      const retryStreamer = new TextStreamer(tokenizer, {
         skip_prompt: true,
         skip_special_tokens: true,
         token_callback_function: () => { tokenCount++; },
@@ -192,7 +274,7 @@ async function generate() {
           appendCode(chunk);
         },
       });
-      await gen(retryMessages, {
+      await callModel(retryMessages, null, {
         max_new_tokens: 1024,
         do_sample: false,
         streamer: retryStreamer,
@@ -224,21 +306,27 @@ async function main() {
 
   statusEl.innerHTML = '<span class="spinner"></span> Loading Gemma 4 E2B...';
 
+  const dlFiles: Record<string, { loaded: number; total: number }> = {};
+  const progress_callback = (progress: any) => {
+    if (progress.status === "progress" && progress.file) {
+      dlFiles[progress.file] = { loaded: progress.loaded || 0, total: progress.total || 0 };
+      let totalLoaded = 0, totalSize = 0;
+      for (const f of Object.values(dlFiles)) { totalLoaded += f.loaded; totalSize += f.total; }
+      const pct = totalSize > 0 ? ((totalLoaded / totalSize) * 100).toFixed(0) : "0";
+      statusEl.innerHTML = `<span class="spinner"></span> Downloading Gemma 4 E2B: ${pct}% (${(totalLoaded / 1e9).toFixed(1)} / ${(totalSize / 1e9).toFixed(1)} GB)`;
+    } else if (progress.status === "loading" || progress.status === "ready") {
+      statusEl.innerHTML = `<span class="spinner"></span> Loading model into WebGPU...`;
+    }
+  };
+  const modelOpts = { device: "webgpu" as const, dtype: "q4f16" as const, progress_callback };
+
   try {
-    gen = await pipeline("text-generation", MODEL_ID, {
-      device: "webgpu",
-      dtype: "q4f16",
-      progress_callback: (progress: any) => {
-        if (progress.status === "progress_total" || progress.status === "progress") {
-          const pct = progress.progress?.toFixed(0) || "0";
-          const loaded = (progress.loaded / 1e9).toFixed(1);
-          const total = (progress.total / 1e9).toFixed(1);
-          statusEl.innerHTML = `<span class="spinner"></span> Downloading Gemma 4 E2B: ${pct}% (${loaded} / ${total} GB)`;
-        } else if (progress.status === "loading" || progress.status === "ready") {
-          statusEl.innerHTML = `<span class="spinner"></span> Loading model into WebGPU...`;
-        }
-      },
-    }) as TextGenerationPipeline;
+    [tokenizer, processor, model] = await Promise.all([
+      AutoTokenizer.from_pretrained(MODEL_ID, modelOpts),
+      AutoProcessor.from_pretrained(MODEL_ID, modelOpts),
+      AutoModelForImageTextToText.from_pretrained(MODEL_ID, modelOpts),
+    ]);
+    modelReady = true;
 
     console.log("[TQ] model loaded — TQ attention active via GQA kernel patch");
 
@@ -262,6 +350,22 @@ document.querySelectorAll(".suggestion").forEach(btn => {
     promptEl.value = (btn as HTMLElement).dataset.prompt!;
     promptEl.focus();
   });
+});
+
+// -- Attachment event listeners --
+attachBtn.addEventListener("click", () => fileInput.click());
+fileInput.addEventListener("change", () => { if (fileInput.files) addFiles(fileInput.files); fileInput.value = ""; });
+promptArea.addEventListener("dragover", (e) => { e.preventDefault(); promptArea.classList.add("drag-over"); });
+promptArea.addEventListener("dragleave", () => promptArea.classList.remove("drag-over"));
+promptArea.addEventListener("drop", (e) => { e.preventDefault(); promptArea.classList.remove("drag-over"); if (e.dataTransfer?.files.length) addFiles(e.dataTransfer.files); });
+promptEl.addEventListener("paste", (e) => {
+  const items = e.clipboardData?.items;
+  if (!items) return;
+  const imageFiles: File[] = [];
+  for (const item of items) {
+    if (item.type.startsWith("image/")) { const f = item.getAsFile(); if (f) imageFiles.push(f); }
+  }
+  if (imageFiles.length > 0) { e.preventDefault(); addFiles(imageFiles); }
 });
 
 renderBtn.addEventListener("click", async () => {
@@ -296,9 +400,12 @@ wipeBtn.addEventListener("click", () => {
 
   Promise.all([wipeCache, wipeDb]).then(() => {
     resetTqCaches();
-    gen = null;
+    tokenizer = null; processor = null; model = null; modelReady = false;
     setCode("");
     currentCode = "";
+    attachments.forEach(a => URL.revokeObjectURL(a.objectUrl));
+    attachments.length = 0;
+    renderThumbnails();
     updateDiagram([]);
     statSpeed.textContent = "--";
     statKV.textContent = "KV: --";
