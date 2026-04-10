@@ -167,18 +167,55 @@ async function generate() {
     code = code.replace(/\n?```\s*$/i, "");
     setCode(code);
 
-    // Execute the generated code — get JSON directly, no upload API
-    statusEl.textContent = "Rendering diagram...";
-    const { result, error } = await executeCode(code);
+    // Execute — if it fails, feed the error back to the model and retry
+    const MAX_RETRIES = 3;
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      statusEl.textContent = attempt === 0 ? "Rendering diagram..." : `Retrying (${attempt}/${MAX_RETRIES})...`;
+      const { result, error } = await executeCode(code);
 
-    if (error) {
-      statusEl.textContent = `Code error: ${error}`;
-      statusEl.classList.add("error");
-    } else if (result.json) {
-      currentCode = code;
-      updateDiagram(result.json.elements || []);
-      statusEl.textContent = "Diagram ready";
-      statusEl.classList.remove("error");
+      if (!error && result.json) {
+        currentCode = code;
+        updateDiagram(result.json.elements || []);
+        statusEl.textContent = attempt === 0 ? "Diagram ready" : `Diagram ready (retry ${attempt})`;
+        statusEl.classList.remove("error");
+        break;
+      }
+
+      if (attempt === MAX_RETRIES) {
+        statusEl.textContent = `Code error after ${MAX_RETRIES} retries: ${error}`;
+        statusEl.classList.add("error");
+        break;
+      }
+
+      // Feed the error back to the model to get corrected code
+      generatedCode = "";
+      tokenCount = 0;
+      setCode("");
+      const retryMessages = [
+        { role: "system" as const, content: SYSTEM_PROMPT },
+        { role: "user" as const, content: prompt },
+        { role: "assistant" as const, content: code },
+        { role: "user" as const, content: `That code threw an error: ${error}\nRespond with ONLY the corrected code.` },
+      ];
+      const retryStreamer = new TextStreamer((gen as any).tokenizer, {
+        skip_prompt: true,
+        skip_special_tokens: true,
+        token_callback_function: () => { tokenCount++; },
+        callback_function: (chunk: string) => {
+          generatedCode += chunk;
+          appendCode(chunk);
+        },
+      });
+      await gen(retryMessages, {
+        max_new_tokens: 1024,
+        do_sample: false,
+        streamer: retryStreamer,
+        stopping_criteria: stopCriteria,
+      });
+      code = generatedCode.trim();
+      code = code.replace(/^```(?:javascript|js|typescript|ts)?\s*\n?/i, "");
+      code = code.replace(/\n?```\s*$/i, "");
+      setCode(code);
     }
   } catch (e) {
     statusEl.textContent = `Error: ${(e as Error).message}`;
