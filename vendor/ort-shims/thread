@@ -1,0 +1,29 @@
+#ifndef _LIBCPP_THREAD
+#define _LIBCPP_THREAD
+#include <functional>
+namespace std {
+  class thread {
+  public:
+    class id {};
+    thread() noexcept = default;
+    template<class F, class... A> explicit thread(F&&, A&&...) {}
+    bool joinable() const noexcept { return false; }
+    void join() {}
+    void detach() {}
+    id get_id() const noexcept { return {}; }
+    static unsigned hardware_concurrency() noexcept { return 1; }
+  };
+  inline bool operator==(thread::id, thread::id) { return true; }
+  inline bool operator<(thread::id, thread::id) { return false; }
+  namespace this_thread {
+    inline thread::id get_id() noexcept { return {}; }
+    inline void yield() noexcept {}
+    template<class Rep, class Period>
+    inline void sleep_for(const chrono::duration<Rep, Period>&) noexcept {}
+  }
+  template<> struct hash<thread::id> {
+    size_t operator()(thread::id) const noexcept { return 0; }
+  };
+}
+#endif
+#include <ostream>

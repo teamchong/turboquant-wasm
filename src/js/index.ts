@@ -48,6 +48,15 @@ interface TurboQuantExports {
   tq_free(ptr: number, len: number): void;
   tq_alloc_f32(count: number): number;
   tq_free_f32(ptr: number, count: number): void;
+  tq_stream_create(engineHandle: number, maxPositions: number): number;
+  tq_stream_destroy(handle: number): void;
+  tq_stream_append(handle: number, vectorPtr: number, dim: number): number;
+  tq_stream_append_batch(handle: number, vectorsPtr: number, dim: number, count: number): number;
+  tq_stream_get_compressed(handle: number, outLenPtr: number): number;
+  tq_stream_decode_position(handle: number, position: number, outPtr: number, dim: number): number;
+  tq_stream_rewind(handle: number, position: number): void;
+  tq_stream_length(handle: number): number;
+  tq_stream_bytes_per_vector(handle: number): number;
 }
 
 // --- Singleton WASM instance ---
@@ -360,6 +369,19 @@ export class TurboQuant {
     return rotated;
   }
 
+  /**
+   * Create a streaming compressed vector buffer.
+   * Vectors are TQ-compressed on append, decompressed buffer maintained for readback.
+   *
+   * @param maxPositions - Initial capacity (grows automatically)
+   */
+  createStream(maxPositions: number): TQStream {
+    const handle = this.#ex.tq_stream_create(this.#handle, maxPositions);
+    if (handle < 0) throw new Error("TurboQuant: failed to create TQStream");
+    const bpv = this.#ex.tq_stream_bytes_per_vector(handle);
+    return new TQStream(this.#ex, handle, this.dim, bpv);
+  }
+
   /** Release engine resources. Call when done. Safe to call multiple times. */
   destroy(): void {
     if (this.#handle < 0) return;
@@ -386,6 +408,110 @@ export class TurboQuant {
       this.#rotOutPtr = 0;
     }
     this.#ex.tq_engine_destroy(this.#handle);
+    this.#handle = -1;
+  }
+}
+
+/**
+ * Streaming compressed vector buffer. Compress-only storage.
+ * Use dotBatch on getCompressed() for scoring — never decompress for search.
+ * Use decodePosition() only when you need individual float values.
+ */
+export class TQStream {
+  readonly dim: number;
+  readonly bytesPerVector: number;
+  #handle: number;
+  #ex: TurboQuantExports;
+  #inputPtr: number = 0;
+  #inputLen: number = 0;
+
+  /** @internal — use TurboQuant.createStream() */
+  constructor(ex: TurboQuantExports, handle: number, dim: number, bpv: number) {
+    this.#ex = ex;
+    this.#handle = handle;
+    this.dim = dim;
+    this.bytesPerVector = bpv;
+  }
+
+  /** Append a single vector. Compresses and stores. No decompression. */
+  append(vector: Float32Array): void {
+    if (vector.length !== this.dim) {
+      throw new Error(`TQStream: expected ${this.dim} dims, got ${vector.length}`);
+    }
+    const ex = this.#ex;
+    if (this.#inputLen !== vector.byteLength) {
+      if (this.#inputPtr) ex.tq_free(this.#inputPtr, this.#inputLen);
+      this.#inputPtr = ex.tq_alloc(vector.byteLength);
+      if (!this.#inputPtr) throw new Error("TQStream: WASM alloc failed");
+      this.#inputLen = vector.byteLength;
+    }
+    new Float32Array(ex.memory.buffer, this.#inputPtr, vector.length).set(vector);
+    const rc = ex.tq_stream_append(this.#handle, this.#inputPtr, this.dim);
+    if (rc < 0) throw new Error("TQStream: append failed");
+  }
+
+  /** Append multiple vectors at once. */
+  appendBatch(vectors: Float32Array, count?: number): void {
+    const n = count ?? Math.floor(vectors.length / this.dim);
+    const ex = this.#ex;
+    const byteLen = n * this.dim * 4;
+    if (this.#inputLen !== byteLen) {
+      if (this.#inputPtr) ex.tq_free(this.#inputPtr, this.#inputLen);
+      this.#inputPtr = ex.tq_alloc(byteLen);
+      if (!this.#inputPtr) throw new Error("TQStream: WASM alloc failed");
+      this.#inputLen = byteLen;
+    }
+    new Float32Array(ex.memory.buffer, this.#inputPtr, n * this.dim).set(
+      vectors.subarray(0, n * this.dim),
+    );
+    const rc = ex.tq_stream_append_batch(this.#handle, this.#inputPtr, this.dim, n);
+    if (rc < 0) throw new Error("TQStream: appendBatch failed");
+  }
+
+  /** Get full compressed store as a copy. Use with dotBatch for scoring. */
+  getCompressed(): Uint8Array {
+    const ex = this.#ex;
+    const outLenPtr = wasmAllocU32(ex);
+    const ptr = ex.tq_stream_get_compressed(this.#handle, outLenPtr);
+    const len = wasmReadU32(ex, outLenPtr);
+    ex.tq_free(outLenPtr, 4);
+    if (!ptr) return new Uint8Array(0);
+    return new Uint8Array(ex.memory.buffer, ptr, len).slice();
+  }
+
+  /** Decode a single position. Only use when you need individual float values. */
+  decodePosition(position: number): Float32Array {
+    const ex = this.#ex;
+    const outPtr = ex.tq_alloc_f32(this.dim);
+    if (!outPtr) throw new Error("TQStream: WASM alloc failed");
+    const rc = ex.tq_stream_decode_position(this.#handle, position, outPtr, this.dim);
+    if (rc < 0) {
+      ex.tq_free_f32(outPtr, this.dim);
+      throw new Error(`TQStream: decodePosition(${position}) failed`);
+    }
+    const result = new Float32Array(ex.memory.buffer, outPtr, this.dim).slice();
+    ex.tq_free_f32(outPtr, this.dim);
+    return result;
+  }
+
+  /** Number of vectors currently stored. */
+  get length(): number {
+    return this.#ex.tq_stream_length(this.#handle);
+  }
+
+  /** Truncate stream to given position. */
+  rewind(position: number): void {
+    this.#ex.tq_stream_rewind(this.#handle, position);
+  }
+
+  /** Release resources. */
+  destroy(): void {
+    if (this.#handle < 0) return;
+    if (this.#inputPtr) {
+      this.#ex.tq_free(this.#inputPtr, this.#inputLen);
+      this.#inputPtr = 0;
+    }
+    this.#ex.tq_stream_destroy(this.#handle);
     this.#handle = -1;
   }
 }

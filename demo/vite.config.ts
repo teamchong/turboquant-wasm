@@ -1,8 +1,17 @@
 import { defineConfig } from "vite";
 import { resolve } from "path";
+import tqGqaPlugin from "./vite-plugin-tq-gqa";
 
 export default defineConfig(({ command }) => ({
+  plugins: [tqGqaPlugin()],
   base: command === "serve" ? "/" : "/turboquant-wasm/",
+  assetsInclude: ["**/*.wgsl"],
+  resolve: {
+    alias: {
+      // Use local source until TQStream is published to npm
+      "turboquant-wasm": resolve(__dirname, "../src/js/index.ts"),
+    },
+  },
   build: {
     outDir: "dist",
     emptyOutDir: true,
@@ -12,14 +21,22 @@ export default defineConfig(({ command }) => ({
         "3dgs": resolve(__dirname, "3dgs.html"),
         search: resolve(__dirname, "search.html"),
         images: resolve(__dirname, "images.html"),
+        draw: resolve(__dirname, "draw.html"),
       },
     },
   },
   server: {
     headers: {
       "Cross-Origin-Opener-Policy": "same-origin",
+      "Cross-Origin-Embedder-Policy": "require-corp",
+    },
+    fs: {
+      // Allow serving files from repo root (for dist/*.wasm)
+      allow: [resolve(__dirname, "..")],
     },
   },
+  // Serve repo-root dist/ as /dist/ so WASM files are accessible
+  publicDir: resolve(__dirname, "../dist"),
   optimizeDeps: {
     exclude: ["turboquant-wasm"],
   },

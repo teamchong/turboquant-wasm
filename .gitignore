@@ -36,3 +36,4 @@ demo/data/image_ids.json
 .vscode/
 *.swp
 *.swo
+.build-cache/

@@ -1,0 +1,14 @@
+#ifndef _LIBCPP_CONDITION_VARIABLE
+#define _LIBCPP_CONDITION_VARIABLE
+#include "mutex"
+namespace std {
+  enum class cv_status { no_timeout, timeout };
+  class condition_variable {
+  public:
+    void notify_one() noexcept {}
+    void notify_all() noexcept {}
+    void wait(unique_lock<mutex>&) {}
+    template<class P> void wait(unique_lock<mutex>&, P p) { while(!p()); }
+  };
+}
+#endif

@@ -1,0 +1,317 @@
+diff --git a/include/onnxruntime/core/session/environment.h b/include/onnxruntime/core/session/environment.h
+index 338dbf8..f21f122 100644
+--- a/include/onnxruntime/core/session/environment.h
++++ b/include/onnxruntime/core/session/environment.h
+@@ -8,7 +8,7 @@
+ #include <memory>
+ #include <optional>
+ #include <vector>
+-#include <shared_mutex>
++#include <mutex>
+ #include <string>
+ 
+ #include "core/common/common.h"
+@@ -304,7 +304,7 @@ class Environment {
+   // Application-specified environment configuration entries
+   // The environment may add or remove an entry on EP library registration and unregistration, respectively.
+   OrtKeyValuePairs config_entries_;
+-  mutable std::shared_mutex config_entries_mutex_;  // Should be locked when accessing config_entries_
++  mutable std::mutex config_entries_mutex_;  // Should be locked when accessing config_entries_
+ 
+   // Tracks the number of registered EP libraries that can create virtual devices.
+   // It is incremented when an EP library is registered with a name that ends in ".virtual".
+diff --git a/onnxruntime/contrib_ops/cpu/bert/gqa_attention_base.h b/onnxruntime/contrib_ops/cpu/bert/gqa_attention_base.h
+index 47397b4..803dbf1 100644
+--- a/onnxruntime/contrib_ops/cpu/bert/gqa_attention_base.h
++++ b/onnxruntime/contrib_ops/cpu/bert/gqa_attention_base.h
+@@ -8,6 +8,11 @@
+ #include "contrib_ops/cpu/bert/attention_helper.h"
+ #include "contrib_ops/cpu/bert/attention_parameters.h"
+ 
++#include "tq_kv_cache.h"
++#include <vector>
++#include <cmath>
++#include <algorithm>
++#include <cstring>
+ #include "core/common/common.h"
+ #include "core/common/safeint.h"
+ #include "core/framework/op_kernel.h"
+@@ -55,6 +60,12 @@ class GQAAttentionBase {
+ 
+   bool use_smooth_softmax_;
+ 
++  // TurboQuant compressed KV cache streams (one per kv_head)
++  mutable std::vector<int32_t> tq_k_streams_;  // stream IDs for K cache per kv_head
++  mutable std::vector<int32_t> tq_v_streams_;  // stream IDs for V cache per kv_head
++  mutable bool tq_initialized_ = false;
++
++
+   template <typename T>
+   Status ApplyAttention(const T* Q,                                 // Q data with shape BxNxSxH
+                         const T* K,                                 // K data with shape BxN_kvxSxH
+@@ -108,6 +119,94 @@ class GQAAttentionBase {
+ 
+     T* output_qk_buffer = output_qk != nullptr ? output_qk->MutableData<T>() : nullptr;
+ 
++
++    // === TurboQuant compressed KV path ===
++    // Initialize TQ streams lazily (one per kv_head for K and V)
++    if (!tq_initialized_) {
++      tq_k_streams_.resize(kv_num_heads_, -1);
++      tq_v_streams_.resize(kv_num_heads_, -1);
++      for (int h = 0; h < kv_num_heads_; h++) {
++        tq_k_streams_[h] = tq_kv_create(static_cast<uint32_t>(head_size), 8192);
++        tq_v_streams_[h] = tq_kv_create(static_cast<uint32_t>(head_size), 8192);
++      }
++      tq_initialized_ = true;
++    }
++
++    // Compress new K and V into TQStream
++    const T* k_new = packed_qkv ? Q + num_heads_ * sequence_length * head_size : K;
++    const T* v_new = packed_qkv ? Q + (num_heads_ + kv_num_heads_) * sequence_length * head_size : V;
++    for (int b = 0; b < batch_size; b++) {
++      for (int h = 0; h < kv_num_heads_; h++) {
++        for (int s = 0; s < sequence_length; s++) {
++          const T* k_vec = k_new + (b * kv_num_heads_ + h) * sequence_length * head_size + s * head_size;
++          const T* v_vec = v_new + (b * kv_num_heads_ + h) * sequence_length * head_size + s * head_size;
++          tq_kv_append(tq_k_streams_[h], reinterpret_cast<const float*>(k_vec), static_cast<uint32_t>(head_size));
++          tq_kv_append(tq_v_streams_[h], reinterpret_cast<const float*>(v_vec), static_cast<uint32_t>(head_size));
++        }
++      }
++    }
++
++    // Compute attention: Q x compressed_K via dotBatch, then weighted V decode
++    T* output_data = output->MutableData<T>();
++    const size_t kv_num_heads_factor = num_heads_ / kv_num_heads_;
++    const float scale = scale_ == 0.0f ? 1.0f / sqrtf(static_cast<float>(head_size)) : scale_;
++
++    for (int b = 0; b < batch_size; b++) {
++      for (int n = 0; n < num_heads_; n++) {
++        const int kv_head = n / static_cast<int>(kv_num_heads_factor);
++        const uint32_t total_k = tq_kv_length(tq_k_streams_[kv_head]);
++        if (total_k == 0) continue;
++
++        const T* q_head = Q + (b * num_heads_ + n) * sequence_length * head_size;
++
++        for (int s = 0; s < sequence_length; s++) {
++          // dotBatch: scores[t] = dot(q, K_compressed[t]) for all t
++          const float* q_vec = reinterpret_cast<const float*>(q_head + s * head_size);
++          std::vector<float> scores(total_k);
++          tq_kv_dot_batch(tq_k_streams_[kv_head], q_vec,
++                          static_cast<uint32_t>(head_size),
++                          scores.data(), total_k);
++
++          // Scale scores
++          for (uint32_t t = 0; t < total_k; t++) {
++            scores[t] *= scale;
++          }
++
++          // Softmax
++          float max_score = *std::max_element(scores.begin(), scores.end());
++          float sum_exp = 0.0f;
++          for (uint32_t t = 0; t < total_k; t++) {
++            scores[t] = expf(scores[t] - max_score);
++            sum_exp += scores[t];
++          }
++          for (uint32_t t = 0; t < total_k; t++) {
++            scores[t] /= sum_exp;
++          }
++
++          // Weighted V sum: decode V positions with non-trivial attention weight
++          T* out_head = output_data + (b * sequence_length + s) * hidden_size + n * head_size;
++          std::vector<float> v_decoded(head_size);
++          memset(out_head, 0, head_size * sizeof(T));
++
++          for (uint32_t t = 0; t < total_k; t++) {
++            if (scores[t] < 1e-6f) continue;  // skip near-zero weights
++            tq_kv_decode_position(tq_v_streams_[kv_head], t,
++                                  v_decoded.data(), static_cast<uint32_t>(head_size));
++            for (int d = 0; d < head_size; d++) {
++              reinterpret_cast<float*>(out_head)[d] += scores[t] * v_decoded[d];
++            }
++          }
++        }
++      }
++    }
++
++    // Write present_key/present_value as zeros (not used — TQStream is the cache)
++    if (present_key_data) memset(present_key_data, 0, present_key->SizeInBytes());
++    if (present_value_data) memset(present_value_data, 0, present_value->SizeInBytes());
++
++    return Status::OK();
++
++    // === Original ORT attention path (kept for reference, unreachable) ===
+     if (gqa_mlas_supported) {
+       ComputeAttentionProbs(static_cast<T*>(attention_probs), Q, k, head_sink, seqlens_k->Data<int32_t>(), attention_bias_data,
+                             batch_size, sequence_length, total_sequence_length, attention_bias_shape, seqlen_past_kv_cache,
+diff --git a/onnxruntime/core/providers/js/allocator.cc b/onnxruntime/core/providers/js/allocator.cc
+index d37346a..c1eb66d 100644
+--- a/onnxruntime/core/providers/js/allocator.cc
++++ b/onnxruntime/core/providers/js/allocator.cc
+@@ -14,7 +14,7 @@ void* WebGpuAllocator::Alloc(size_t size) {
+     return nullptr;
+   }
+ 
+-  void* p = EM_ASM_PTR({ return Module.jsepAlloc($0); }, size);
++  void* p = jsep_alloc(size);
+   stats_.num_allocs++;
+   stats_.bytes_in_use += size;
+   return p;
+@@ -22,7 +22,7 @@ void* WebGpuAllocator::Alloc(size_t size) {
+ 
+ void WebGpuAllocator::Free(void* p) {
+   if (p != nullptr) {
+-    size_t size = (size_t)(void*)EM_ASM_PTR({ return Module.jsepFree($0); }, p);
++    size_t size = jsep_free(p);
+     stats_.bytes_in_use -= size;
+   }
+ }
+diff --git a/onnxruntime/core/providers/js/data_transfer.cc b/onnxruntime/core/providers/js/data_transfer.cc
+index 3809df2..76c2ca1 100644
+--- a/onnxruntime/core/providers/js/data_transfer.cc
++++ b/onnxruntime/core/providers/js/data_transfer.cc
+@@ -30,10 +30,10 @@ common::Status DataTransfer::CopyTensor(const Tensor& src, Tensor& dst) const {
+     if (dst_device.Type() == OrtDevice::GPU) {
+       if (src_device.Type() == OrtDevice::GPU) {
+         // copy from GPU to GPU
+-        EM_ASM({ Module.jsepCopy(Number($0), Number($1), Number($2), true); }, src_data, dst_data, bytes);
++        jsep_copy(src_data, dst_data, bytes, 1);
+       } else {
+         // copy from CPU to GPU
+-        EM_ASM({ Module.jsepCopy(Number($0), Number($1), Number($2)); }, src_data, dst_data, bytes);
++        jsep_copy(src_data, dst_data, bytes, 0);
+       }
+     } else /* if (src_device.Type() == OrtDevice::GPU) */ {
+       // copy from GPU to CPU
+diff --git a/onnxruntime/core/providers/js/js_execution_provider.cc b/onnxruntime/core/providers/js/js_execution_provider.cc
+index 102ea53..3f96cd3 100644
+--- a/onnxruntime/core/providers/js/js_execution_provider.cc
++++ b/onnxruntime/core/providers/js/js_execution_provider.cc
+@@ -872,7 +872,7 @@ JsExecutionProvider::~JsExecutionProvider() {
+ Status JsExecutionProvider::OnRunStart(const onnxruntime::RunOptions& /*run_options*/) {
+   if (IsGraphCaptureEnabled() && IsGraphCaptureAllowed() && !IsGraphCaptured(0)) {
+     LOGS(*GetLogger(), INFO) << "Capturing the webgpu graph for this model";
+-    EM_ASM({ Module.jsepCaptureBegin(); });
++    jsep_capture_begin();
+   }
+   return Status::OK();
+ }
+@@ -880,7 +880,7 @@ Status JsExecutionProvider::OnRunStart(const onnxruntime::RunOptions& /*run_opti
+ Status JsExecutionProvider::OnRunEnd(bool sync_stream, const onnxruntime::RunOptions& /*run_options*/) {
+   if (IsGraphCaptureEnabled() && !IsGraphCaptured(0)) {
+     if (IsGraphCaptureAllowed()) {
+-      EM_ASM({ Module.jsepCaptureEnd(); });
++      jsep_capture_end();
+       is_graph_captured_ = true;
+     } else {
+       IncrementRegularRunCountBeforeGraphCapture();
+@@ -900,7 +900,7 @@ bool JsExecutionProvider::IsGraphCaptured(int) const {
+ 
+ Status JsExecutionProvider::ReplayGraph(int) {
+   ORT_ENFORCE(IsGraphCaptured(0));
+-  EM_ASM({ Module.jsepReplay(); });
++  jsep_replay();
+   return Status::OK();
+ }
+ 
+diff --git a/onnxruntime/core/providers/js/js_kernel.h b/onnxruntime/core/providers/js/js_kernel.h
+index 68d89c9..e0546ec 100644
+--- a/onnxruntime/core/providers/js/js_kernel.h
++++ b/onnxruntime/core/providers/js/js_kernel.h
+@@ -25,8 +25,8 @@ namespace js {
+ #define JS_ARROW =>
+ // clang-format on
+ 
+-#define JSEP_INIT_KERNEL(optype) EM_ASM({ Module.jsepCreateKernel(#optype, $0, undefined); }, this)
+-#define JSEP_INIT_KERNEL_ATTRIBUTE(optype, attr, ...) EM_ASM({ Module.jsepCreateKernel(#optype, $0, attr); }, this, __VA_ARGS__)
++#define JSEP_INIT_KERNEL(optype) jsep_create_kernel(#optype, this, nullptr)
++#define JSEP_INIT_KERNEL_ATTRIBUTE(optype, attr, ...) jsep_create_kernel(#optype, this, #attr)
+ 
+ #define JSEP_KERNEL_IMPL(classname, optype)                \
+   class classname : public JsKernel {                      \
+@@ -80,7 +80,7 @@ class JsKernel : public OpKernel {
+   explicit JsKernel(const OpKernelInfo& info)
+       : OpKernel(info) {}
+   ~JsKernel() override {
+-    EM_ASM({ Module.jsepReleaseKernel($0); }, this);
++    jsep_release_kernel(this);
+   }
+ 
+   Status SerializeKernelContext(OpKernelContext* context, AllocatorPtr alloc, void* custom_data_ptr, size_t custom_data_size, void** ptr) const {
+@@ -200,9 +200,7 @@ class JsKernel : public OpKernel {
+       return status;
+     }
+ 
+-    intptr_t status_code = EM_ASM_INT(
+-        { return Module.jsepRunKernel(Number($0), Number($1), Module.jsepSessionState.sessionHandle, Module.jsepSessionState.errors); },
+-        this, reinterpret_cast<intptr_t>(p_serialized_kernel_context));
++    intptr_t status_code = jsep_run((void*)this, context->InputCount(), nullptr, context->OutputCount(), nullptr, reinterpret_cast<void*>(p_serialized_kernel_context)); // replaced EM_ASM_INT
+ 
+     LOGS_DEFAULT(VERBOSE) << "outputs = " << context->OutputCount() << ". Y.data="
+                           << (size_t)(context->Output<Tensor>(0)->DataRaw()) << ".";
+diff --git a/onnxruntime/core/session/environment.cc b/onnxruntime/core/session/environment.cc
+index 2cf3af8..d0ee33d 100644
+--- a/onnxruntime/core/session/environment.cc
++++ b/onnxruntime/core/session/environment.cc
+@@ -498,17 +498,17 @@ Status Environment::GetSharedAllocator(const OrtMemoryInfo& mem_info, OrtAllocat
+ }
+ 
+ OrtKeyValuePairs Environment::GetConfigEntries() const {
+-  std::shared_lock<std::shared_mutex> lock{config_entries_mutex_};
++  std::lock_guard<std::mutex> lock{config_entries_mutex_};
+   return config_entries_;  // copy
+ }
+ 
+ void Environment::InsertOrAssignConfigEntry(std::string key, std::string value) {
+-  std::lock_guard<std::shared_mutex> lock{config_entries_mutex_};
++  std::lock_guard<std::mutex> lock{config_entries_mutex_};
+   config_entries_.Add(std::move(key), std::move(value));
+ }
+ 
+ void Environment::RemoveConfigEntry(const std::string& key) {
+-  std::lock_guard<std::shared_mutex> lock{config_entries_mutex_};
++  std::lock_guard<std::mutex> lock{config_entries_mutex_};
+   config_entries_.Remove(key.c_str());
+ }
+ 
+diff --git a/onnxruntime/core/session/ort_version_check.h b/onnxruntime/core/session/ort_version_check.h
+index 82fd757..8c9b39a 100644
+--- a/onnxruntime/core/session/ort_version_check.h
++++ b/onnxruntime/core/session/ort_version_check.h
+@@ -10,21 +10,21 @@
+ 
+ namespace onnxruntime::version_check {
+ 
+-// A simple consteval-friendly result type for ParseUint.
+-// std::optional triggers an internal compiler error in MSVC 14.44 when used with consteval.
++// A simple constexpr-friendly result type for ParseUint.
++// std::optional triggers an internal compiler error in MSVC 14.44 when used with constexpr.
+ struct ParseUintResult {
+   uint32_t value;
+   bool has_value;
+ 
+-  consteval bool operator==(uint32_t other) const { return has_value && value == other; }
+-  consteval bool operator!=(uint32_t other) const { return !(*this == other); }
++  constexpr bool operator==(uint32_t other) const { return has_value && value == other; }
++  constexpr bool operator!=(uint32_t other) const { return !(*this == other); }
+ };
+ 
+-inline consteval ParseUintResult ParseUintNone() { return {0, false}; }
++inline constexpr ParseUintResult ParseUintNone() { return {0, false}; }
+ 
+ // Parse a non-negative integer from a string_view without leading zeros.
+ // Returns a result with has_value == false on failure (empty, leading zero, non-digit, or overflow).
+-consteval ParseUintResult ParseUint(std::string_view str) {
++constexpr ParseUintResult ParseUint(std::string_view str) {
+   if (str.empty()) return ParseUintNone();
+   // Leading zeros are not allowed (except "0" itself).
+   if (str.size() > 1 && str[0] == '0') return ParseUintNone();
+@@ -42,7 +42,7 @@ consteval ParseUintResult ParseUint(std::string_view str) {
+ //   - Major version is 1
+ //   - Y and Z are non-negative integers without leading zeros
+ //   - Y (minor version) must equal expected_api_version (defaults to ORT_API_VERSION)
+-consteval bool IsOrtVersionValid(std::string_view version, uint32_t expected_api_version = ORT_API_VERSION) {
++constexpr bool IsOrtVersionValid(std::string_view version, uint32_t expected_api_version = ORT_API_VERSION) {
+   size_t first_dot = version.find('.');
+   if (first_dot == std::string_view::npos) return false;
+   size_t second_dot = version.find('.', first_dot + 1);

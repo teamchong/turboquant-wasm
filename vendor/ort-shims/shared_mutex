@@ -1,0 +1,17 @@
+#ifndef _LIBCPP_SHARED_MUTEX
+#define _LIBCPP_SHARED_MUTEX
+#include "mutex"
+namespace std {
+  class shared_mutex {
+  public:
+    void lock() {} void unlock() {}
+    void lock_shared() {} void unlock_shared() {}
+  };
+  template<class M> class shared_lock {
+    M& m_;
+  public:
+    explicit shared_lock(M& m) : m_(m) { m_.lock_shared(); }
+    ~shared_lock() { m_.unlock_shared(); }
+  };
+}
+#endif

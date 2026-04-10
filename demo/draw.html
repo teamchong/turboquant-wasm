@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Prompt → Diagram</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; background: #0d1117; color: #e6edf3; height: 100vh; display: flex; flex-direction: column; }
+    #header { padding: 16px 24px; border-bottom: 1px solid #30363d; text-align: center; }
+    #header h1 { font-size: 20px; font-weight: 600; margin-bottom: 4px; }
+    #header .dim { color: #7d8590; font-weight: 400; }
+    .subtitle { font-size: 14px; color: #e6edf3; margin-bottom: 4px; }
+    .note { font-size: 12px; color: #7d8590; margin-bottom: 6px; }
+    .demo-nav { font-size: 12px; color: #7d8590; margin-bottom: 6px; }
+    .demo-nav a { color: #58a6ff; text-decoration: none; }
+    .demo-nav a:hover { text-decoration: underline; }
+    #status { font-size: 12px; color: #7d8590; }
+    #status.ready { color: #3fb950; }
+    #status.error { color: #f85149; }
+    .spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 4px; }
+    #status .spinner { border-color: #7d8590; border-top-color: #58a6ff; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #main { flex: 1; display: flex; overflow: hidden; }
+    #left-panel { width: 360px; min-width: 280px; display: flex; flex-direction: column; border-right: 1px solid #30363d; }
+    #prompt-area { padding: 12px; }
+    #prompt { width: 100%; height: 80px; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-family: inherit; font-size: 14px; padding: 8px 12px; resize: vertical; }
+    #prompt:focus { outline: none; border-color: #58a6ff; }
+    button { border: none; border-radius: 6px; color: #fff; cursor: pointer; font-size: 14px; padding: 8px; transition: filter 0.15s; }
+    button:hover { filter: brightness(1.2); }
+    button:active { filter: brightness(0.9); }
+    #generate { background: #238636; }
+    #render { background: #1f6feb; font-size: 13px; padding: 6px; }
+    #wipe { background: #da3633; font-size: 12px; padding: 4px 12px; display: none; }
+    #code-area { flex: 1; overflow: auto; padding: 12px; border-top: 1px solid #30363d; }
+    #code-output { font-family: 'SF Mono', 'Cascadia Code', monospace; font-size: 12px; line-height: 1.5; color: #79c0ff; white-space: pre-wrap; word-break: break-all; }
+    #diagram-container { flex: 1; background: #fff; position: relative; min-height: 400px; }
+    #stats-bar { padding: 6px 16px; border-top: 1px solid #30363d; display: flex; gap: 16px; font-size: 11px; color: #7d8590; }
+    .hint { font-size: 11px; color: #7d8590; margin-top: 4px; }
+    .suggestion { background: #21262d; color: #7d8590; font-size: 11px; padding: 3px 8px; border-radius: 12px; }
+    .suggestion:hover { color: #e6edf3; background: #30363d; }
+    #attach-row { display: flex; align-items: flex-start; gap: 6px; margin-top: 6px; }
+    #attach-btn { width: 32px; height: 32px; padding: 0; background: #21262d; border: 1px solid #30363d; border-radius: 6px; color: #7d8590; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+    #attach-btn:hover { color: #e6edf3; }
+    #thumbnails { display: flex; flex-wrap: wrap; gap: 4px; flex: 1; min-height: 0; }
+    .thumb { position: relative; width: 48px; height: 48px; border-radius: 4px; overflow: visible; border: 1px solid #30363d; flex-shrink: 0; }
+    .thumb img { width: 100%; height: 100%; object-fit: cover; border-radius: 3px; }
+    .thumb-x { position: absolute; top: -6px; right: -6px; width: 16px; height: 16px; background: #da3633; border-radius: 50%; color: #fff; font-size: 10px; line-height: 16px; text-align: center; cursor: pointer; border: none; padding: 0; z-index: 1; }
+    .thumb-x:hover { background: #f85149; }
+    .pdf-badge { position: absolute; bottom: 2px; left: 2px; background: rgba(0,0,0,0.7); color: #e6edf3; font-size: 8px; padding: 1px 3px; border-radius: 2px; }
+    #prompt-area.drag-over { outline: 2px dashed #58a6ff; outline-offset: -2px; border-radius: 6px; }
+  </style>
+</head>
+<body>
+  <div id="header">
+    <h1>TurboQuant <span class="dim">Prompt → Diagram</span></h1>
+    <p class="subtitle">Describe any diagram, Gemma 4 E2B generates it as Excalidraw — entirely in your browser.</p>
+    <p class="note">The LLM outputs compact code (~50 tokens) instead of raw Excalidraw JSON (~5,000 tokens). TQ compresses the KV cache ~3.3x so longer conversations fit in GPU memory.</p>
+    <nav class="demo-nav"><a href="./">All demos</a> · <a href="https://www.npmjs.com/package/turboquant-wasm">npm</a> · <a href="https://github.com/teamchong/turboquant-wasm">GitHub</a></nav>
+    <div style="display:flex;align-items:center;justify-content:center;gap:12px;margin-top:4px;">
+      <span id="status"><span class="spinner"></span> Loading model...</span>
+      <button id="wipe">Stop + Wipe All Data</button>
+    </div>
+  </div>
+  <div id="main">
+    <div id="left-panel">
+      <div id="prompt-area">
+        <textarea id="prompt">What happens when you type a URL into your browser? Include every network layer</textarea>
+        <input type="file" id="file-input" multiple accept="image/png,image/jpeg,image/gif,image/webp,application/pdf" style="display:none">
+        <div id="attach-row">
+          <button id="attach-btn" type="button" title="Attach images or PDF"><svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"><path d="M14 8.5l-5.5 5.5a3.5 3.5 0 01-5-5L9 3.5a2.5 2.5 0 013.5 3.5l-5.5 5a1.5 1.5 0 01-2-2L10.5 4.5"/></svg></button>
+          <div id="thumbnails"></div>
+        </div>
+        <div id="suggestions" style="display:flex;flex-wrap:wrap;gap:4px;margin-top:6px;">
+          <button class="suggestion" data-prompt="Sequence diagram: how MCP tools connect Claude to external APIs">MCP tools</button>
+          <button class="suggestion" data-prompt="Architecture diagram: Astro app with Cloudflare Workers, D1, R2">Full-stack app</button>
+          <button class="suggestion" data-prompt="Flowchart: CI/CD pipeline from git push to production deploy with rollback">CI/CD pipeline</button>
+          <button class="suggestion" data-prompt="OAuth 2.0 authorization code flow with PKCE as a sequence diagram">OAuth flow</button>
+          <button class="suggestion" data-prompt="What happens when you type a URL into your browser? Include every network layer">URL to page</button>
+        </div>
+        <button id="generate" style="margin-top:8px;width:100%;">Generate Diagram</button>
+        <div class="hint">Cmd+Enter to generate</div>
+      </div>
+      <div id="code-area"></div>
+      <div style="padding:8px 12px;border-top:1px solid #30363d;">
+        <button id="render" style="width:100%;">Render Code</button>
+      </div>
+    </div>
+    <div id="diagram-container"></div>
+  </div>
+  <div id="stats-bar">
+    <span id="stat-speed">--</span>
+    <span id="stat-kv">KV: --</span>
+  </div>
+  <script type="module" src="./src/draw/main.ts"></script>
+</body>
+</html>

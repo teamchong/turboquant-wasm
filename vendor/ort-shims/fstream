@@ -1,0 +1,47 @@
+#define _LIBCPP___FWD_FSTREAM_H
+#ifndef _LIBCPP_FSTREAM
+#define _LIBCPP_FSTREAM
+// Prevent system <fstream> from being included.
+// Provide no-op ofstream/ifstream for WASM.
+#include <sstream>
+#include <string>
+namespace std {
+
+class ofstream : public ostringstream {
+public:
+  ofstream() = default;
+  explicit ofstream(const char*, ios_base::openmode = ios_base::out) {}
+  explicit ofstream(const string&, ios_base::openmode = ios_base::out) {}
+  template<class P> explicit ofstream(const P&, ios_base::openmode m = ios_base::out) {}
+  bool is_open() const { return false; }
+  template<class T> void open(const T&, ios_base::openmode = ios_base::out) {}
+  void close() {}
+  ofstream& flush() { return *this; }
+  explicit operator bool() const { return false; }
+  bool operator!() const { return true; }
+};
+
+class fstream : public stringstream {
+public:
+  fstream() = default;
+  explicit fstream(const char*, ios_base::openmode = ios_base::in | ios_base::out) {}
+  explicit fstream(const string&, ios_base::openmode = ios_base::in | ios_base::out) {}
+  template<class P> explicit fstream(const P&, ios_base::openmode m = ios_base::in | ios_base::out) {}
+  bool is_open() const { return false; }
+  template<class T> void open(const T&, ios_base::openmode = ios_base::in | ios_base::out) {}
+  void close() {}
+};
+
+class ifstream : public istringstream {
+public:
+  ifstream() = default;
+  explicit ifstream(const char*, ios_base::openmode = ios_base::in) {}
+  explicit ifstream(const string&, ios_base::openmode = ios_base::in) {}
+  template<class P> explicit ifstream(const P&, ios_base::openmode m = ios_base::in) {}
+  bool is_open() const { return false; }
+  template<class T> void open(const T&, ios_base::openmode = ios_base::in) {}
+  void close() {}
+};
+
+} // namespace std
+#endif
