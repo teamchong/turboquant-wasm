@@ -250,30 +250,23 @@ renderBtn.addEventListener("click", async () => {
 });
 
 wipeBtn.addEventListener("click", () => {
-  if (busy) {
-    stopCriteria.interrupt();
-  }
-  resetTqCaches();
-  setCode("");
-  currentCode = "";
-  updateDiagram([]);
-  statSpeed.textContent = "--";
-  statKV.textContent = "KV: --";
-  statusEl.textContent = "All data wiped";
-  statusEl.classList.remove("ready", "error");
+  if (busy) stopCriteria.interrupt();
+  statusEl.textContent = "Wiping all data...";
+  wipeBtn.disabled = true;
 
-  // Clear caches — model weights, KV, everything
-  if ("caches" in window) {
-    caches.keys().then(names => names.forEach(n => caches.delete(n)));
-  }
-  const dbs = indexedDB.databases ? indexedDB.databases() : Promise.resolve([]);
-  dbs.then(list => list.forEach(db => { if (db.name) indexedDB.deleteDatabase(db.name); }));
+  // Delete cached model weights from Cache API and IndexedDB
+  const wipeCache = "caches" in window
+    ? caches.keys().then(names => Promise.all(names.map(n => caches.delete(n))))
+    : Promise.resolve();
+  const wipeDb = indexedDB.databases
+    ? indexedDB.databases().then(list => list.forEach(db => { if (db.name) indexedDB.deleteDatabase(db.name); }))
+    : Promise.resolve();
 
-  gen = null;
-  setTimeout(() => { statusEl.textContent = "Wiped. Reload to start fresh."; }, 500);
+  // Wipe storage, then reload to kill all in-flight downloads and free GPU memory
+  Promise.all([wipeCache, wipeDb]).then(() => location.reload());
 });
 
-main();
+// Show wipe button immediately
+wipeBtn.style.display = "inline-block";
 
-// Show wipe button once model starts loading
-setTimeout(() => { wipeBtn.style.display = "inline-block"; }, 1000);
+main();
