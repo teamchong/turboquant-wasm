@@ -3,31 +3,55 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>TurboQuant — Burner AI</title>
-  <link rel="stylesheet" href="./src/llm/style.css">
+  <title>Prompt → Diagram</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; background: #0d1117; color: #e6edf3; height: 100vh; display: flex; flex-direction: column; }
+    #header { padding: 12px 16px; border-bottom: 1px solid #30363d; display: flex; align-items: center; gap: 12px; }
+    #header h1 { font-size: 16px; font-weight: 600; }
+    #header .dim { color: #7d8590; font-weight: 400; }
+    #status { font-size: 12px; color: #7d8590; }
+    #status.ready { color: #3fb950; }
+    #status.error { color: #f85149; }
+    #main { flex: 1; display: flex; overflow: hidden; }
+    #left-panel { width: 400px; min-width: 300px; display: flex; flex-direction: column; border-right: 1px solid #30363d; }
+    #prompt-area { padding: 12px; }
+    #prompt { width: 100%; height: 80px; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-family: inherit; font-size: 14px; padding: 8px 12px; resize: vertical; }
+    #prompt:focus { outline: none; border-color: #58a6ff; }
+    #generate { margin-top: 8px; width: 100%; padding: 8px; background: #238636; color: #fff; border: none; border-radius: 6px; font-size: 14px; cursor: pointer; }
+    #generate:hover { background: #2ea043; }
+    #generate:disabled { background: #21262d; color: #7d8590; cursor: not-allowed; }
+    #code-area { flex: 1; overflow: auto; padding: 12px; border-top: 1px solid #30363d; }
+    #code-output { font-family: 'SF Mono', 'Cascadia Code', monospace; font-size: 12px; line-height: 1.5; color: #79c0ff; white-space: pre-wrap; word-break: break-all; min-height: 100px; }
+    #right-panel { flex: 1; display: flex; flex-direction: column; }
+    #diagram-frame { flex: 1; border: none; background: #fff; }
+    #stats-bar { padding: 6px 16px; border-top: 1px solid #30363d; display: flex; gap: 16px; font-size: 11px; color: #7d8590; }
+    .hint { font-size: 11px; color: #7d8590; margin-top: 4px; }
+  </style>
 </head>
 <body>
-  <div id="app">
-    <div id="header">
-      <h1>Burner AI <span class="dim">— Gemma · WebGPU · TQ</span></h1>
-      <span class="status" id="status">Initializing...</span>
+  <div id="header">
+    <h1>Prompt → Diagram <span class="dim">Gemma 4 E2B · WebGPU · TQ</span></h1>
+    <span id="status">Initializing...</span>
+  </div>
+  <div id="main">
+    <div id="left-panel">
+      <div id="prompt-area">
+        <textarea id="prompt">microservices with API gateway, auth service, user service, and PostgreSQL</textarea>
+        <button id="generate" disabled>Generate Diagram</button>
+        <div class="hint">Cmd+Enter to generate</div>
+      </div>
+      <div id="code-area">
+        <pre id="code-output"></pre>
+      </div>
     </div>
-    <div id="messages"></div>
-    <div id="input-bar">
-      <input type="text" id="input" aria-label="Message">
-      <button id="send">Send</button>
-      <button id="fill-long">Fill Long Context</button>
+    <div id="right-panel">
+      <iframe id="diagram-frame" src="about:blank"></iframe>
     </div>
-    <div id="stats-bar">
-      <span id="stat-speed">--</span>
-      <span id="stat-ctx">--</span>
-      <span id="stat-kv">KV: --</span>
-      <label id="tq-toggle-label">
-        <input type="checkbox" id="tq-toggle" checked>
-        TQ KV Cache
-      </label>
-      <span id="stat-model">Gemma · WebGPU</span>
-    </div>
+  </div>
+  <div id="stats-bar">
+    <span id="stat-speed">--</span>
+    <span id="stat-kv">KV: --</span>
   </div>
   <script type="module" src="./src/llm/main.ts"></script>
 </body>
