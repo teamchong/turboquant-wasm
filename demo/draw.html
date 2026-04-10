@@ -37,6 +37,8 @@
     #diagram-container { flex: 1; background: #fff; position: relative; min-height: 400px; }
     #stats-bar { padding: 6px 16px; border-top: 1px solid #30363d; display: flex; gap: 16px; font-size: 11px; color: #7d8590; }
     .hint { font-size: 11px; color: #7d8590; margin-top: 4px; }
+    .suggestion { background: #21262d; color: #7d8590; font-size: 11px; padding: 3px 8px; border-radius: 12px; }
+    .suggestion:hover { color: #e6edf3; background: #30363d; }
   </style>
 </head>
 <body>
@@ -53,7 +55,15 @@
   <div id="main">
     <div id="left-panel">
       <div id="prompt-area">
-        <textarea id="prompt">What happens when you type a URL into your browser? Include every network layers</textarea>
+        <textarea id="prompt">What happens when you type a URL into your browser? Include every network layer</textarea>
+        <div id="suggestions" style="display:flex;flex-wrap:wrap;gap:4px;margin-top:6px;">
+          <button class="suggestion" data-prompt="Sequence diagram: how MCP tools connect Claude to external APIs">MCP tools</button>
+          <button class="suggestion" data-prompt="Architecture diagram: Astro app with Cloudflare Workers, D1, R2">Full-stack app</button>
+          <button class="suggestion" data-prompt="Flowchart: CI/CD pipeline from git push to production deploy with rollback">CI/CD pipeline</button>
+          <button class="suggestion" data-prompt="OAuth 2.0 authorization code flow with PKCE as a sequence diagram">OAuth flow</button>
+          <button class="suggestion" data-prompt="Architecture: browser LLM inference with WebGPU, TQ KV cache compression, and Excalidraw rendering">This demo</button>
+          <button class="suggestion" data-prompt="What happens when you type a URL into your browser? Include every network layer">URL to page</button>
+        </div>
         <button id="generate" style="margin-top:8px;width:100%;">Generate Diagram</button>
         <div class="hint">Cmd+Enter to generate</div>
       </div>

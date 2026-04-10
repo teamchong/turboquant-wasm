@@ -31,13 +31,18 @@ export async function mountExcalidraw(container: HTMLElement) {
 
 export function updateDiagram(elements: readonly any[]) {
   if (!excalidrawAPI) return;
-  // Reset scene completely then set new elements
-  excalidrawAPI.resetScene();
   excalidrawAPI.updateScene({
     elements,
     appState: { viewModeEnabled: true, zenModeEnabled: true },
   });
-  setTimeout(() => {
-    excalidrawAPI.scrollToContent(undefined, { fitToContent: true });
-  }, 200);
+}
+
+export function fitToScreen() {
+  if (!excalidrawAPI) return;
+  excalidrawAPI.scrollToContent(undefined, { fitToContent: true });
+}
+
+export function resetDiagram() {
+  if (!excalidrawAPI) return;
+  excalidrawAPI.resetScene();
 }

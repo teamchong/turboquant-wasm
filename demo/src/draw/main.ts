@@ -6,7 +6,7 @@ import { executeCode } from "./drawmode/executor.js";
 import { SDK_TYPES } from "./drawmode/sdk-types.js";
 import { loadWasm } from "./drawmode/layout.js";
 import drawmodeWasm from "./drawmode/drawmode-wasm.js";
-import { mountExcalidraw, updateDiagram } from "./excalidraw-viewer.js";
+import { mountExcalidraw, updateDiagram, resetDiagram, fitToScreen } from "./excalidraw-viewer.js";
 import { createEditor, setCode, appendCode, getCode } from "./code-editor.js";
 
 env.backends.onnx.wasm!.numThreads = 1;
@@ -27,67 +27,29 @@ const statKV = $("#stat-kv") as HTMLElement;
 let gen: TextGenerationPipeline | null = null;
 let busy = false;
 let currentCode = "";
+let lastStmtCount = 0;
 const stopCriteria = new InterruptableStoppingCriteria();
 
-const SYSTEM_PROMPT = `You generate Excalidraw diagrams by writing JavaScript code using the Diagram API. Respond with ONLY code, no markdown fences, no explanation.
+const SYSTEM_PROMPT = `Output a complete Diagram script. No markdown, no comments, no helpers. One statement per line. Assign every node to a const, use those consts in connect/addGroup.
 
-${SDK_TYPES}
-
-The code must end with: return d.render()
-
-Use row/col for grid layout. Use color presets for visual clarity. Use icons, groups, diamonds, ellipses, dashed connections — whatever fits the diagram. Labels support \\n for line breaks.
-
-Themes: "default", "sketch", "blueprint", "minimal"
-Directions: "TB" (top-bottom), "LR" (left-right)
-Diagram types: "architecture" (default), "sequence"
-
-Example — architecture:
+Format:
 const d = new Diagram({ direction: "TB" });
-const user = d.addEllipse("Users", { row: 0, col: 1, color: "users", icon: "users" });
-const cdn = d.addBox("CDN", { row: 1, col: 0, color: "external", icon: "globe" });
-const gw = d.addBox("API Gateway", { row: 1, col: 1, color: "frontend", icon: "api" });
-const auth = d.addBox("Auth Service", { row: 2, col: 0, color: "backend", icon: "lock" });
-const api = d.addBox("Core API", { row: 2, col: 1, color: "backend", icon: "server" });
-const cache = d.addBox("Redis", { row: 2, col: 2, color: "cache", icon: "cache" });
-const db = d.addBox("PostgreSQL", { row: 3, col: 1, color: "database", icon: "database" });
-const queue = d.addBox("Message Queue", { row: 3, col: 2, color: "queue", icon: "queue" });
-const worker = d.addBox("Worker", { row: 4, col: 2, color: "backend", icon: "server" });
-d.connect(user, cdn, "static assets");
-d.connect(user, gw, "API calls");
-d.connect(gw, auth, "verify");
-d.connect(gw, api, "route");
-d.connect(api, cache, "read/write");
-d.connect(api, db, "query");
-d.connect(api, queue, "publish");
-d.connect(queue, worker, "consume");
-d.addGroup("Backend", [auth, api, cache]);
-d.addGroup("Data", [db, queue, worker]);
+const api = d.addBox("API Server\\n(Node.js)", { row: 1, col: 2, color: "backend", icon: "server" });
+d.connect(api, db, "TCP :5432");
+d.addGroup("Backend", [api, auth, cache]);
 return d.render();
 
-Example — sequence:
-const d = new Diagram({ type: "sequence" });
-const client = d.addActor("Client");
-const server = d.addActor("Server");
-const db = d.addActor("Database");
-d.message(client, server, "POST /login");
-d.message(server, db, "SELECT user");
-d.message(db, server, "user row");
-d.message(server, client, "JWT token");
-return d.render();
+Rules:
+- Think about what each component ACTUALLY DOES before generating. Do not create separate nodes for the same thing (e.g. "Cloudflare Worker" IS the API — don't add a separate "API Endpoint" node). Each node must represent a distinct real component.
+- Use d.addBox for ALL nodes. NEVER use d.addText — it causes overlaps.
+- EVERY node needs row, col, color, icon. Nothing else — no width, height, fillStyle, strokeColor.
+- Spread nodes across multiple columns (col 0-4), not a single column.
+- color: "frontend"|"backend"|"database"|"cache"|"queue"|"external"|"orchestration"|"users"|"storage"|"ai"
+- icon: "server"|"database"|"lock"|"globe"|"users"|"api"|"cache"|"queue"|"cloud"|"code"|"shield"|"search"
+- d.connect(from, to, "label") — string label only, no options object, no hex colors.
+- Detailed labels with \\n. 15+ nodes. 4+ groups.
 
-Example — flowchart with decisions:
-const d = new Diagram();
-const start = d.addEllipse("Start", { row: 0, col: 1, color: "frontend" });
-const check = d.addDiamond("Valid?", { row: 1, col: 1, color: "orchestration" });
-const yes = d.addBox("Process", { row: 2, col: 0, color: "backend" });
-const no = d.addBox("Reject", { row: 2, col: 2, color: "external" });
-const end = d.addEllipse("End", { row: 3, col: 1, color: "frontend" });
-d.connect(start, check);
-d.connect(check, yes, "yes");
-d.connect(check, no, "no");
-d.connect(yes, end);
-d.connect(no, end);
-return d.render();`;
+${SDK_TYPES}`;
 
 async function generate() {
   const prompt = promptEl.value.trim();
@@ -110,11 +72,14 @@ async function generate() {
   }
   generateBtn.innerHTML = '<span class="spinner"></span> Generating...';
   setCode("");
+  resetDiagram();
   statusEl.textContent = "Generating diagram code...";
 
   const startTime = performance.now();
   let tokenCount = 0;
   let generatedCode = "";
+
+  lastStmtCount = 0;
 
   try {
     // Always read latest from editor (user may have edited manually)
@@ -143,6 +108,26 @@ async function generate() {
           const rawKB = (tq.uncompressedBytes / 1024).toFixed(0);
           statKV.textContent = `KV: ${compKB}KB / ${rawKB}KB (${tq.ratio.toFixed(1)}x) · ${tq.contextLength} pos · ${tq.layers} layers`;
         }
+        // Streaming render on each new complete statement
+        const stmts = (generatedCode.match(/;\s*\n/g) || []).length;
+        if (stmts > lastStmtCount) {
+          lastStmtCount = stmts;
+          let partial = generatedCode.trim();
+          partial = partial.replace(/^```(?:javascript|js|typescript|ts)?\s*\n?/i, "");
+          const lastSemi = partial.lastIndexOf(";");
+          if (lastSemi >= 0) {
+            partial = partial.substring(0, lastSemi + 1);
+            if (!partial.includes("new Diagram")) {
+              partial = `const d = new Diagram({ direction: "TB" });\n${partial}`;
+            }
+            if (!partial.includes("d.render()")) {
+              partial = `${partial}\nreturn d.render();`;
+            }
+            executeCode(partial).then(({ result, error }) => {
+              if (!error && result.json) updateDiagram(result.json.elements || []);
+            });
+          }
+        }
       },
     });
 
@@ -153,6 +138,7 @@ async function generate() {
       stopping_criteria: stopCriteria,
     });
 
+
     const elapsed = (performance.now() - startTime) / 1000;
     statSpeed.textContent = `${(tokenCount / elapsed).toFixed(1)} tok/s · ${tokenCount} tok · ${elapsed.toFixed(1)}s`;
 
@@ -161,7 +147,6 @@ async function generate() {
     const rawKB = (tqFinal.uncompressedBytes / 1024).toFixed(0);
     statKV.textContent = `KV: ${compKB}KB / ${rawKB}KB (${tqFinal.ratio.toFixed(1)}x) · ${tqFinal.contextLength} pos · ${tqFinal.layers} layers`;
 
-    // Strip markdown code fences if present
     let code = generatedCode.trim();
     code = code.replace(/^```(?:javascript|js|typescript|ts)?\s*\n?/i, "");
     code = code.replace(/\n?```\s*$/i, "");
@@ -176,6 +161,7 @@ async function generate() {
       if (!error && result.json) {
         currentCode = code;
         updateDiagram(result.json.elements || []);
+        fitToScreen();
         statusEl.textContent = attempt === 0 ? "Diagram ready" : `Diagram ready (retry ${attempt})`;
         statusEl.classList.remove("error");
         break;
@@ -271,6 +257,13 @@ promptEl.addEventListener("keydown", (e) => {
   if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) generate();
 });
 
+document.querySelectorAll(".suggestion").forEach(btn => {
+  btn.addEventListener("click", () => {
+    promptEl.value = (btn as HTMLElement).dataset.prompt!;
+    promptEl.focus();
+  });
+});
+
 renderBtn.addEventListener("click", async () => {
   const code = getCode();
   if (!code) return;
@@ -281,6 +274,7 @@ renderBtn.addEventListener("click", async () => {
     statusEl.classList.add("error");
   } else if (result.json) {
     updateDiagram(result.json.elements || []);
+    fitToScreen();
     statusEl.textContent = "Diagram ready";
     statusEl.classList.remove("error");
   }
