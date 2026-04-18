@@ -1,6 +1,12 @@
 // TQ Encode: compress a K or V vector into polar + QJL format on GPU.
 // 256 threads per vector. Both Phase 1 (rotation) and Phase 4a (QJL
 // projection) use FWHT instead of explicit dim×dim matrix multiply.
+// Phase 2's max_r reduction uses the subgroup-butterfly pattern (order-
+// invariant, same as argmax); phases 4/4b keep shared-memory sum trees
+// because FP sum reordering changes the compressed output slightly and
+// compounds across 35 layers' worth of encodes.
+
+enable subgroups;
 
 /*@POLAR_CONFIG@*/
 
@@ -93,7 +99,7 @@ fn encode(
   }
   workgroupBarrier();
 
-  // Phase 2: max_r reduction.
+  // Phase 2: max_r reduction. Subgroup butterfly — max is order-invariant.
   var local_max = 0.0f;
   var p = tid;
   while (p < num_pairs) {
@@ -102,16 +108,20 @@ fn encode(
     local_max = max(local_max, sqrt(x * x + y * y));
     p += 256u;
   }
-  s_reduce[tid] = local_max;
+  local_max = max(local_max, subgroupShuffleXor(local_max, 1u));
+  local_max = max(local_max, subgroupShuffleXor(local_max, 2u));
+  local_max = max(local_max, subgroupShuffleXor(local_max, 4u));
+  local_max = max(local_max, subgroupShuffleXor(local_max, 8u));
+  local_max = max(local_max, subgroupShuffleXor(local_max, 16u));
+  if ((tid & 31u) == 0u) { s_reduce[tid >> 5u] = local_max; }
   workgroupBarrier();
-  var stride = 128u;
-  while (stride > 0u) {
-    if (tid < stride) { s_reduce[tid] = max(s_reduce[tid], s_reduce[tid + stride]); }
-    stride /= 2u;
-    workgroupBarrier();
-  }
+  var cross_max = 0.0f;
+  if (tid < 8u) { cross_max = s_reduce[tid]; }
+  cross_max = max(cross_max, subgroupShuffleXor(cross_max, 1u));
+  cross_max = max(cross_max, subgroupShuffleXor(cross_max, 2u));
+  cross_max = max(cross_max, subgroupShuffleXor(cross_max, 4u));
   if (tid == 0u) {
-    s_max_r = select(s_reduce[0], 1.0, s_reduce[0] < 1e-10);
+    s_max_r = select(cross_max, 1.0, cross_max < 1e-10);
     max_r_out[out_idx] = s_max_r;
   }
   workgroupBarrier();
@@ -195,11 +205,13 @@ fn encode(
   // Reduce sumsq → sigma.
   s_reduce[tid] = local_sumsq;
   workgroupBarrier();
-  stride = 128u;
-  while (stride > 0u) {
-    if (tid < stride) { s_reduce[tid] += s_reduce[tid + stride]; }
-    stride /= 2u;
-    workgroupBarrier();
+  {
+    var st = 128u;
+    while (st > 0u) {
+      if (tid < st) { s_reduce[tid] += s_reduce[tid + st]; }
+      st /= 2u;
+      workgroupBarrier();
+    }
   }
   if (tid == 0u) {
     s_sigma = sqrt(s_reduce[0] / f32(dim));
@@ -228,22 +240,26 @@ fn encode(
   // Reduce num then den.
   s_reduce[tid] = local_num;
   workgroupBarrier();
-  stride = 128u;
-  while (stride > 0u) {
-    if (tid < stride) { s_reduce[tid] += s_reduce[tid + stride]; }
-    stride /= 2u;
-    workgroupBarrier();
+  {
+    var st = 128u;
+    while (st > 0u) {
+      if (tid < st) { s_reduce[tid] += s_reduce[tid + st]; }
+      st /= 2u;
+      workgroupBarrier();
+    }
   }
   if (tid == 0u) { s_num = s_reduce[0]; }
   workgroupBarrier();
 
   s_reduce[tid] = local_den;
   workgroupBarrier();
-  stride = 128u;
-  while (stride > 0u) {
-    if (tid < stride) { s_reduce[tid] += s_reduce[tid + stride]; }
-    stride /= 2u;
-    workgroupBarrier();
+  {
+    var st = 128u;
+    while (st > 0u) {
+      if (tid < st) { s_reduce[tid] += s_reduce[tid + st]; }
+      st /= 2u;
+      workgroupBarrier();
+    }
   }
   if (tid == 0u) {
     gamma_out[out_idx] = s_num / s_reduce[0];
