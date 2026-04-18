@@ -256,7 +256,12 @@ export default defineConfig(({ command }) => ({
       allow: [resolve(__dirname, "..")],
     },
   },
-  publicDir: resolve(__dirname, "../dist"),
+  // Use default `demo/public/` — everything vite needs to ship to the
+  // browser lives here (gguf-parser.wasm, system-cache.bin, etc). This
+  // used to point at `../dist/` back when the root npm-package build's
+  // turboquant.wasm was imported via a vite alias, but that alias was
+  // removed — demo now consumes the published npm package from
+  // node_modules, so there's no reason to peek at the root dist.
   optimizeDeps: {
     exclude: ["turboquant-wasm"],
   },
