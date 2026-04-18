@@ -28,6 +28,18 @@ demo/data/image_ids.json
 # Search + image demo data are small enough to commit (~11MB)
 # so GitHub Pages deployment works without external hosting.
 
+# Model files
+models/
+
+# Build artifacts (root — committed copy is in demo/public/)
+/gguf-parser.wasm
+
+# Playwright
+demo/test-results/
+test-results/
+demo/.playwright-data/
+demo/tests/.playwright-data/
+
 # OS
 .DS_Store
 
@@ -36,3 +48,9 @@ demo/data/image_ids.json
 .vscode/
 *.swp
 *.swo
+.build-cache/
+
+# Draw demo wasm build artifacts (source is committed in demo/src/draw/wasm/)
+demo/src/draw/wasm/.zig-cache/
+demo/src/draw/wasm/zig-out/
+demo/src/draw/wasm/.build-hash

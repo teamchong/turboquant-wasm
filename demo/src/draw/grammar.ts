@@ -1,0 +1,211 @@
+/**
+ * Constrained decoding grammar for the draw DSL.
+ *
+ * The model tends to emit broken code like:
+ *   connect(User Input, DNS Lookup, "DNS Query");
+ *   connect(HTTP Request", "Server", "Send Request");
+ *
+ * Two failure modes we catch:
+ *
+ *   (a) Identifier-with-space inside a call arg: `User Input` — the model
+ *       tries to use a multi-word label as a variable reference, which is
+ *       invalid JS. Fix: once an identifier starts inside `(...)`, mask
+ *       any `letter` that follows a ` ` (without a separator in between).
+ *
+ *   (b) Unclosed string literal: a `"` that never closes before `\n` or a
+ *       structural char. Fix: inside `"..."`, mask tokens containing
+ *       `\n`, `,`, `;`, `)`, etc. before a closing `"`.
+ *
+ * The state machine tracks three contexts (statement / paren-call / object)
+ * plus in-string sub-states. Object-literal contexts deliberately relax
+ * identifier rules — `{ row: 1, col: 2 }` has spaces and colons that would
+ * false-positive the identifier-space rule.
+ *
+ * State bytes (fits in u8):
+ *   0 FREE              — outside parens/strings/objects (statement level)
+ *   1 STRING_FREE       — "..." opened from FREE
+ *   2 PAREN_NEUTRAL     — inside (...), arg-slot empty or just after `,`
+ *   3 PAREN_IDENT       — inside (...), mid-identifier
+ *   4 PAREN_IDENT_SPACE — inside (...), ident emitted then ` ` seen
+ *   5 STRING_PAREN      — "..." opened from inside (...)
+ *   6 OBJECT            — inside {...}, relaxed rules
+ *   7 STRING_OBJECT     — "..." opened from inside {...}
+ */
+
+export const NUM_STATES = 9;
+export const S_FREE = 0;
+export const S_STRING_FREE = 1;
+export const S_PAREN_NEUTRAL = 2;
+export const S_PAREN_IDENT = 3;
+export const S_PAREN_IDENT_SPACE = 4;
+export const S_STRING_PAREN = 5;
+export const S_OBJECT = 6;
+export const S_STRING_OBJECT = 7;
+// Thinking-mode pass-through. Gemma 4 E2B's thinking channel emits free
+// natural-language reasoning before the actual code. The JS-syntax grammar
+// would mask all of it — so during the thinking phase we pass every token
+// and only transition to S_FREE when the close-channel marker appears in
+// the decoded text.
+export const S_IN_THINK = 8;
+
+// Alias kept so existing imports (engine-worker) resolve.
+export const STATE_FREE = S_FREE;
+
+// Close-of-thinking marker. When a token's decoded text contains this
+// substring, we leave S_IN_THINK and enter S_FREE (code-writing mode).
+const CHANNEL_CLOSE = "<channel|>";
+
+// Chars that would break an in-flight JS string literal. Tokens inside a
+// string must NOT contain any of these before the closing `"`.
+const BREAK_CHARS_IN_STRING = new Set(["\n", "\r", "\t", ",", ";", "(", ")", "{", "}"]);
+
+function isIdentStart(c: string): boolean {
+  return (c >= "A" && c <= "Z") || (c >= "a" && c <= "z") || c === "_" || c === "$";
+}
+
+function isIdentCont(c: string): boolean {
+  return isIdentStart(c) || (c >= "0" && c <= "9");
+}
+
+function isBlank(c: string): boolean {
+  return c === " " || c === "\t";
+}
+
+function simulateToken(startState: number, text: string): { allowed: boolean; endState: number } {
+  let state = startState;
+  if (text.length === 0) return { allowed: true, endState: state };
+
+  // Thinking-mode pass-through: accept every token without JS-syntax checks.
+  // Flip to S_FREE (code mode) as soon as a token decodes to text containing
+  // the close-channel marker — the subsequent tokens are real diagram code
+  // and should be validated normally.
+  if (state === S_IN_THINK) {
+    if (text.includes(CHANNEL_CLOSE)) {
+      return { allowed: true, endState: S_FREE };
+    }
+    return { allowed: true, endState: S_IN_THINK };
+  }
+
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    const escaped = i > 0 && text[i - 1] === "\\";
+
+    switch (state) {
+      case S_FREE:
+        if (c === '"' && !escaped) state = S_STRING_FREE;
+        else if (c === "(") state = S_PAREN_NEUTRAL;
+        // Everything else stays in FREE — `const foo = bar` should pass.
+        break;
+
+      case S_STRING_FREE:
+        if (c === '"' && !escaped) state = S_FREE;
+        else if (BREAK_CHARS_IN_STRING.has(c)) return { allowed: false, endState: startState };
+        break;
+
+      case S_PAREN_NEUTRAL:
+        if (c === ")") state = S_FREE;
+        else if (c === ",") state = S_PAREN_NEUTRAL;
+        else if (c === '"' && !escaped) state = S_STRING_PAREN;
+        else if (c === "{") state = S_OBJECT;
+        else if (c === "(") state = S_PAREN_NEUTRAL;
+        else if (isIdentStart(c)) state = S_PAREN_IDENT;
+        // Whitespace / digits / operators: stay neutral.
+        break;
+
+      case S_PAREN_IDENT:
+        if (c === ")") state = S_FREE;
+        else if (c === ",") state = S_PAREN_NEUTRAL;
+        else if (isBlank(c)) state = S_PAREN_IDENT_SPACE;
+        else if (isIdentCont(c)) state = S_PAREN_IDENT;
+        else if (c === '"' && !escaped) state = S_STRING_PAREN;
+        else if (c === "(") state = S_PAREN_NEUTRAL;
+        else if (c === "{") state = S_OBJECT;
+        else state = S_PAREN_NEUTRAL;
+        break;
+
+      case S_PAREN_IDENT_SPACE:
+        if (c === ")") state = S_FREE;
+        else if (c === ",") state = S_PAREN_NEUTRAL;
+        else if (isBlank(c)) state = S_PAREN_IDENT_SPACE;
+        // Identifier continuation after space means the model started a
+        // second word in the same arg — this is the `User Input` bug.
+        else if (isIdentCont(c)) return { allowed: false, endState: startState };
+        else if (c === '"' && !escaped) state = S_STRING_PAREN;
+        else if (c === "(") state = S_PAREN_NEUTRAL;
+        else if (c === "{") state = S_OBJECT;
+        else state = S_PAREN_NEUTRAL;
+        break;
+
+      case S_STRING_PAREN:
+        if (c === '"' && !escaped) state = S_PAREN_NEUTRAL;
+        else if (BREAK_CHARS_IN_STRING.has(c)) return { allowed: false, endState: startState };
+        break;
+
+      case S_OBJECT:
+        if (c === "}") state = S_PAREN_NEUTRAL;
+        else if (c === '"' && !escaped) state = S_STRING_OBJECT;
+        // Inside objects we deliberately relax identifier tracking —
+        // `{ row: 1, col: 2 }` has spaces and colons that would otherwise
+        // false-positive the ident-space rule.
+        break;
+
+      case S_STRING_OBJECT:
+        if (c === '"' && !escaped) state = S_OBJECT;
+        else if (BREAK_CHARS_IN_STRING.has(c)) return { allowed: false, endState: startState };
+        break;
+    }
+  }
+  return { allowed: true, endState: state };
+}
+
+/**
+ * Precompute grammar bitmaps + per-(state, token) transition table.
+ *
+ * Yields to the browser every `chunkSize` tokens so the vocab-scale decode
+ * doesn't freeze the UI. For Gemma 4 E2B (vocab=262144, NUM_STATES=8) the
+ * build produces ~256 KB of bitmaps + 2 MB of transitions.
+ */
+export async function buildGrammar(
+  decode: (id: number) => string,
+  vocabSize: number,
+  chunkSize = 4096,
+): Promise<{ masks: Uint32Array; transitions: Uint8Array }> {
+  const words = Math.ceil(vocabSize / 32);
+  const masks = new Uint32Array(NUM_STATES * words);
+  const transitions = new Uint8Array(NUM_STATES * vocabSize);
+
+  for (let base = 0; base < vocabSize; base += chunkSize) {
+    const end = Math.min(base + chunkSize, vocabSize);
+    for (let id = base; id < end; id++) {
+      let text = "";
+      try {
+        text = decode(id);
+      } catch {
+        // Some ids (reserved/unused) fail to decode — treat as empty.
+      }
+
+      for (let s = 0; s < NUM_STATES; s++) {
+        const { allowed, endState } = simulateToken(s, text);
+        if (allowed) {
+          masks[s * words + (id >>> 5)] |= (1 << (id & 31));
+        }
+        transitions[s * vocabSize + id] = endState;
+      }
+    }
+    await new Promise((r) => setTimeout(r, 0));
+  }
+  return { masks, transitions };
+}
+
+/** Runtime state holder that advances via the precomputed transition table. */
+export class GrammarState {
+  state: number = S_FREE;
+
+  constructor(private transitions: Uint8Array, private vocabSize: number) {}
+
+  reset(): void { this.state = S_FREE; }
+
+  advance(tokenId: number): void {
+    this.state = this.transitions[this.state * this.vocabSize + tokenId];
+  }
+}

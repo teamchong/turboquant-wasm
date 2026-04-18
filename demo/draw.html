@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Prompt → Diagram · in-browser LLM with TurboQuant KV cache</title>
+  <meta name="description" content="Gemma 4 E2B generating Excalidraw diagrams from text prompts, running entirely in your browser via WebGPU. KV cache compressed 2.4× using TurboQuant's polar+QJL algorithm reimplemented in WGSL compute shaders.">
+  <meta property="og:title" content="Prompt → Diagram — in-browser LLM with TurboQuant KV cache">
+  <meta property="og:description" content="Gemma 4 E2B runs locally in your browser. KV cache compressed 2.4× via WGSL compute shaders. 30+ tok/s on M1, no server, no API key.">
+  <meta property="og:type" content="website">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Prompt → Diagram — in-browser LLM with TurboQuant KV cache">
+  <meta name="twitter:description" content="Gemma 4 E2B runs locally in your browser. KV cache compressed 2.4× via WGSL compute shaders. 30+ tok/s on M1, no server, no API key.">
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; background: #0d1117; color: #e6edf3; height: 100vh; display: flex; flex-direction: column; }
+    #header { padding: 16px 24px; border-bottom: 1px solid #30363d; text-align: center; }
+    #header h1 { font-size: 20px; font-weight: 600; margin-bottom: 4px; }
+    #header .dim { color: #7d8590; font-weight: 400; }
+    .subtitle { font-size: 14px; color: #e6edf3; margin-bottom: 4px; }
+    .note { font-size: 12px; color: #7d8590; margin-bottom: 6px; }
+    .demo-nav { font-size: 12px; color: #7d8590; margin-bottom: 6px; }
+    .demo-nav a { color: #58a6ff; text-decoration: none; }
+    .demo-nav a:hover { text-decoration: underline; }
+    #status { font-size: 12px; color: #7d8590; }
+    #status.ready { color: #3fb950; }
+    #status.error { color: #f85149; }
+    .spinner { display: inline-block; width: 12px; height: 12px; border: 2px solid rgba(255,255,255,0.3); border-top-color: #fff; border-radius: 50%; animation: spin 0.8s linear infinite; vertical-align: middle; margin-right: 4px; }
+    #status .spinner { border-color: #7d8590; border-top-color: #58a6ff; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+    #main { flex: 1; display: flex; overflow: hidden; }
+    #left-panel { width: 360px; min-width: 280px; display: flex; flex-direction: column; border-right: 1px solid #30363d; }
+    #prompt-area { padding: 12px; }
+    #prompt { width: 100%; height: 80px; background: #161b22; border: 1px solid #30363d; border-radius: 6px; color: #e6edf3; font-family: inherit; font-size: 14px; padding: 8px 12px; resize: vertical; }
+    #prompt:focus { outline: none; border-color: #58a6ff; }
+    button { border: none; border-radius: 6px; color: #fff; cursor: pointer; font-size: 14px; padding: 8px; transition: filter 0.15s; }
+    button:hover { filter: brightness(1.2); }
+    button:active { filter: brightness(0.9); }
+    #generate { background: #238636; }
+    #render { background: #1f6feb; font-size: 13px; padding: 6px; }
+    #wipe { background: #da3633; font-size: 12px; padding: 4px 12px; display: none; }
+    #code-area { flex: 1; overflow: auto; padding: 12px; border-top: 1px solid #30363d; }
+    #code-output { font-family: 'SF Mono', 'Cascadia Code', monospace; font-size: 12px; line-height: 1.5; color: #79c0ff; white-space: pre-wrap; word-break: break-all; }
+    #diagram-container { flex: 1; background: #fff; position: relative; min-height: 400px; }
+    #stats-bar { padding: 8px 16px; border-top: 1px solid #30363d; display: flex; gap: 20px; font-size: 13px; color: #c9d1d9; font-family: 'SF Mono', 'Cascadia Code', monospace; }
+    #stats-bar .label { color: #7d8590; font-family: inherit; }
+    #stat-speed { color: #3fb950; font-weight: 600; }
+    #stat-kv { color: #58a6ff; }
+    .hint { font-size: 11px; color: #7d8590; margin-top: 4px; }
+    .suggestion { background: #21262d; color: #7d8590; font-size: 11px; padding: 3px 8px; border-radius: 12px; }
+    .suggestion:hover { color: #e6edf3; background: #30363d; }
+  </style>
+</head>
+<body>
+  <div id="header">
+    <h1>TurboQuant <span class="dim">Prompt → Diagram</span></h1>
+    <p class="subtitle">Describe any diagram, Gemma 4 E2B generates it as Excalidraw — entirely in your browser.</p>
+    <p class="note">The LLM outputs compact code (~50 tokens) instead of raw Excalidraw JSON (~5,000 tokens). The TurboQuant algorithm (polar + QJL) compresses the KV cache ~2.4× so longer conversations fit in GPU memory.</p>
+    <p class="note" style="font-size:11px;opacity:0.8;">This demo reimplements the TurboQuant algorithm in WGSL compute shaders so it runs on the GPU at 30+&nbsp;tok/s. The sibling <a href="https://www.npmjs.com/package/turboquant-wasm" style="color:#58a6ff;">turboquant-wasm</a> npm package implements the same algorithm in WASM+SIMD for CPU-side vector search.</p>
+    <nav class="demo-nav"><a href="./">All demos</a> · <a href="https://www.npmjs.com/package/turboquant-wasm">npm</a> · <a href="https://github.com/teamchong/turboquant-wasm">GitHub</a></nav>
+    <div style="display:flex;align-items:center;justify-content:center;gap:12px;margin-top:4px;">
+      <span id="status"><span class="spinner"></span> Loading model...</span>
+      <button id="wipe">Stop + Wipe All Data</button>
+    </div>
+  </div>
+  <div id="main">
+    <div id="left-panel">
+      <div id="prompt-area">
+        <textarea id="prompt">OAuth 2.0 authorization code flow with PKCE as a sequence diagram — user, browser, app server, auth server, API</textarea>
+        <div id="suggestions" style="display:flex;flex-wrap:wrap;gap:4px;margin-top:6px;">
+          <button class="suggestion" data-prompt="Architecture diagram: Astro app with Cloudflare Workers, D1, R2 and a queue for background jobs">Full-stack app</button>
+          <button class="suggestion" data-prompt="OAuth 2.0 authorization code flow with PKCE as a sequence diagram — user, browser, app server, auth server, API">OAuth flow</button>
+          <button class="suggestion" data-prompt="Flowchart: CI/CD pipeline from git push through lint, test, build, deploy with rollback on failure">CI/CD pipeline</button>
+          <button class="suggestion" data-prompt="TCP connection state machine: CLOSED, LISTEN, SYN_SENT, SYN_RECEIVED, ESTABLISHED, FIN_WAIT_1, FIN_WAIT_2, CLOSE_WAIT, LAST_ACK, TIME_WAIT. Label every transition with the event that triggers it.">TCP state machine</button>
+          <button class="suggestion" data-prompt="Engineering org chart: VP Engineering at the top, with frontend, backend, infra, and data platform leads, each managing their teams">Engineering org</button>
+          <button class="suggestion" data-prompt="ER diagram for an e-commerce database: users, products, categories, orders, order_items, payments tables with foreign key relationships">E-commerce schema</button>
+          <button class="suggestion" data-prompt="UML class diagram: Payment abstract class with CreditCard, PayPal, ApplePay, BankTransfer subclasses; each has process() and refund() methods and an amount attribute">Payment classes</button>
+          <button class="suggestion" data-prompt="Swimlane activity diagram: user checkout flow with Customer, Web App, Payment Service, Inventory Service, Email Service lanes. Show validate cart, authorize payment, reserve inventory, capture payment, send receipt.">Checkout swimlane</button>
+        </div>
+        <button id="generate" style="margin-top:8px;width:100%;">Generate Diagram</button>
+        <div class="hint">Cmd+Enter to generate</div>
+      </div>
+      <div id="code-area"></div>
+      <div style="padding:8px 12px;border-top:1px solid #30363d;">
+        <button id="render" style="width:100%;">Render Code</button>
+      </div>
+    </div>
+    <div id="diagram-container-wrap" style="position:relative;flex:1;min-width:0;">
+      <div id="diagram-container" style="width:100%;height:100%;"></div>
+      <button id="edit-diagram" style="position:absolute;top:12px;right:12px;background:#1f6feb;font-size:12px;padding:6px 12px;display:none;z-index:10;">Edit</button>
+    </div>
+  </div>
+  <div id="stats-bar">
+    <span id="stat-speed">--</span>
+    <span id="stat-kv">KV: --</span>
+  </div>
+  <script type="module" src="./src/draw/main.ts"></script>
+</body>
+</html>

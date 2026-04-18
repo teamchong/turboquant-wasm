@@ -3,7 +3,12 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>TurboQuant WASM — Demos</title>
+  <title>TurboQuant WASM — in-browser vector compression + LLM demos</title>
+  <meta name="description" content="TurboQuant (Google Research, ICLR 2026) implemented in WASM+SIMD for CPU vector search and in WGSL compute shaders for GPU LLM KV cache. Demos run entirely in your browser.">
+  <meta property="og:title" content="TurboQuant WASM — in-browser vector compression + LLM demos">
+  <meta property="og:description" content="Vector compression (6×) on CPU via WASM+SIMD and LLM KV cache compression (2.4×) on GPU via WGSL. Includes a Gemma 4 E2B in-browser demo at 30+ tok/s.">
+  <meta property="og:type" content="website">
+  <meta name="twitter:card" content="summary_large_image">
   <link rel="stylesheet" href="./src/landing/style.css" />
 </head>
 <body>
@@ -49,6 +54,17 @@
           Spherical harmonic coefficients compressed — geometry stays intact.
         </div>
         <span class="demo-tag poc">Proof of concept</span>
+      </a>
+
+      <a href="draw.html" class="demo-card">
+        <div class="demo-icon">&#x270F;</div>
+        <div class="demo-title">Prompt → Diagram</div>
+        <div class="demo-desc">
+          Describe a diagram in plain text, Gemma 4 E2B generates it as Excalidraw — entirely in your browser,
+          no server, no API key. KV cache is TurboQuant-compressed (2.4&times;) via WGSL shaders at 30+&nbsp;tok/s.
+        </div>
+        <span class="demo-tag warning">&#x26A0; 3.1 GB download (LLM weights)</span>
+        <span class="demo-tag primary">In-browser LLM</span>
       </a>
     </div>
 

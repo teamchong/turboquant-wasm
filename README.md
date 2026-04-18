@@ -9,7 +9,15 @@ Experimental WASM + relaxed SIMD build of [botirk38/turboquant](https://github.c
 
 Based on the paper ["TurboQuant: Online Vector Quantization with Near-optimal Distortion Rate"](https://arxiv.org/abs/2504.19874) (Google Research, ICLR 2026).
 
-**[Live Demo](https://teamchong.github.io/turboquant-wasm/)** — vector search, image similarity, and 3D Gaussian Splatting compression running in the browser.
+**[Live Demo](https://teamchong.github.io/turboquant-wasm/)** — vector search, image similarity, 3D Gaussian Splatting compression, **and a Gemma 4 E2B in-browser LLM whose KV cache is TurboQuant-compressed** — all in the browser.
+
+## Two substrates, one algorithm
+
+Most of this repo is **TurboQuant in WASM**: a Zig → WASM build with relaxed SIMD that encodes / decodes / scores vectors on the CPU. That's what the `turboquant-wasm` npm package ships — the vector-search, image-similarity, and 3DGS demos all load this module and call into it.
+
+The **Prompt → Diagram demo is different**: it re-implements the same TurboQuant math (polar + QJL rotation) directly in WGSL compute shaders. An LLM KV cache is 140 layers × 35 heads × 30 tok/s worth of encode/decode/dot calls — only a GPU-native path hits real-time. So that demo is a showcase of the *algorithm*, not a consumer of the *package*.
+
+Same math, two substrates: WASM for CPU vector-search workloads, WGSL for GPU LLM workloads. If you're looking for "what does TurboQuant compression look like on GPU", the draw demo's WGSL shaders in [`demo/src/draw/shaders/`](demo/src/draw/shaders/) are the reference.
 
 ## Why TurboQuant?
 

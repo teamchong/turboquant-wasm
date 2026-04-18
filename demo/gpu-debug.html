@@ -1,0 +1,673 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>GPU Debug — Tensor Inspector + Step Verification</title>
+<style>
+  body { font-family: monospace; margin: 20px; background: #111; color: #eee; }
+  .pass { color: #4f4; } .fail { color: #f44; } .info { color: #88f; } .warn { color: #ff4; }
+  pre { margin: 2px 0; }
+</style>
+</head>
+<body>
+<h2>GPU Debug — Real Model Tensor Inspector</h2>
+<div id="log"></div>
+<script type="module">
+import { fetchGGUF, parseGGUF, uploadTensorsToGPU } from "/src/draw/model-loader.ts";
+
+const log = document.getElementById("log");
+let passed = 0, failed = 0;
+function out(cls, msg) { const el = document.createElement("pre"); el.className = cls; el.textContent = msg; log.appendChild(el); }
+function info(msg) { out("info", msg); }
+function warn(msg) { out("warn", msg); }
+function pass(name) { out("pass", "PASS  " + name); passed++; }
+function fail(name, d) { out("fail", "FAIL  " + name + ": " + d); failed++; }
+
+// ===== Load model from OPFS =====
+info("Loading model from OPFS...");
+let model;
+try {
+  const root = await navigator.storage.getDirectory();
+  const handle = await root.getFileHandle("gemma-4-E2B-it-Q4_K_M.gguf");
+  const file = await handle.getFile();
+  if (file.size < 1e9) throw new Error("File too small: " + file.size);
+  info("OPFS file: " + (file.size / 1e9).toFixed(2) + " GB");
+  model = await parseGGUF(file);
+  info("Parsed: " + model.metadata.architecture + ", " + model.metadata.nLayers + " layers, " + model.tensors.size + " tensors");
+  pass("GGUF parse from OPFS");
+} catch (e) {
+  fail("Load model", e.message);
+  out("warn", "Model not in OPFS. Run the integration test first to download it.");
+  out("info", "\nResults: 0 passed, 1 failed");
+  throw e;
+}
+
+// ===== Section 1: Tensor Shape Inspector =====
+info("\n========== TENSOR SHAPES ==========");
+
+const KEY_TENSORS = [
+  "token_embd.weight",
+  "output_norm.weight",
+  "blk.0.attn_norm.weight",
+  "blk.0.attn_q.weight",
+  "blk.0.attn_k.weight",
+  "blk.0.attn_v.weight",
+  "blk.0.attn_q_norm.weight",
+  "blk.0.attn_k_norm.weight",
+  "blk.0.attn_output.weight",
+  "blk.0.post_attention_norm.weight",
+  "blk.0.ffn_norm.weight",
+  "blk.0.ffn_gate.weight",
+  "blk.0.ffn_up.weight",
+  "blk.0.ffn_down.weight",
+  "blk.0.post_ffw_norm.weight",
+  // Check "global" layer — does it have different dimensions?
+  "blk.5.attn_q.weight",
+  "blk.5.attn_k.weight",
+  "blk.5.attn_q_norm.weight",
+  // KV-shared layer
+  "blk.15.ffn_gate.weight",
+  "blk.15.attn_q.weight",
+  // Last layer
+  "blk.34.attn_q.weight",
+];
+
+const GGML_TYPE_NAMES = { 0:"f32", 1:"f16", 2:"q4_0", 8:"q8_0", 12:"q4_k", 13:"q5_k", 14:"q6_k", 30:"bf16" };
+
+for (const name of KEY_TENSORS) {
+  const t = model.tensors.get(name);
+  if (!t) {
+    warn("MISSING: " + name);
+    continue;
+  }
+  const typeName = GGML_TYPE_NAMES[t.type] || ("type_" + t.type);
+  info(`  ${name.padEnd(40)} ${typeName.padEnd(6)} [${t.dims.join(", ")}]  (${(t.size/1024).toFixed(0)} KB)`);
+}
+
+// Derive actual head_dim from Q weight shape
+const q0 = model.tensors.get("blk.0.attn_q.weight");
+const k0 = model.tensors.get("blk.0.attn_k.weight");
+const q5 = model.tensors.get("blk.5.attn_q.weight");
+if (q0 && k0) {
+  const qSize0 = q0.dims[0]; // GGUF: ne0 = output dim (contiguous)
+  const kvSize0 = k0.dims[0];
+  const headDim0 = qSize0 / 8; // 8 Q heads
+  info("\n--- Derived dimensions (layer 0) ---");
+  info("  Q output dim (qSize): " + qSize0 + " → head_dim = " + headDim0);
+  info("  K output dim (kvSize): " + kvSize0 + " → kv_head_dim = " + kvSize0);
+  if (q5) {
+    const qSize5 = q5.dims[0];
+    const headDim5 = qSize5 / 8;
+    info("  Q output dim layer 5: " + qSize5 + " → head_dim = " + headDim5);
+    if (qSize5 !== qSize0) warn("  *** DIFFERENT head_dim between layer 0 and 5! ***");
+    else info("  Layer 0 and 5 have SAME head_dim — no dual head_dim");
+  }
+}
+
+// Check which layers exist and if shapes vary
+info("\n--- Layer Q-weight shapes (all layers) ---");
+let layerShapes = new Map();
+for (let i = 0; i < model.metadata.nLayers; i++) {
+  const t = model.tensors.get("blk." + i + ".attn_q.weight");
+  if (t) {
+    const key = t.dims.join(",");
+    if (!layerShapes.has(key)) layerShapes.set(key, []);
+    layerShapes.get(key).push(i);
+  }
+}
+for (const [shape, layers] of layerShapes) {
+  info("  Shape [" + shape + "]: layers " + (layers.length > 10 ? layers.slice(0,5).join(",") + "..." + layers.slice(-2).join(",") + " (" + layers.length + " total)" : layers.join(",")));
+}
+
+// ===== Section 2: GPU Step-by-Step Verification =====
+info("\n========== GPU STEP VERIFICATION ==========");
+
+const adapter = await navigator.gpu?.requestAdapter();
+if (!adapter) { fail("WebGPU", "No adapter"); throw "no gpu"; }
+const hasF16 = adapter.features.has("shader-f16");
+const device = await adapter.requestDevice({
+  requiredFeatures: hasF16 ? ["shader-f16"] : [],
+  requiredLimits: {
+    maxBufferSize: adapter.limits.maxBufferSize,
+    maxStorageBufferBindingSize: adapter.limits.maxStorageBufferBindingSize,
+  },
+});
+info("GPU device ready (shader-f16: " + hasF16 + ")");
+
+// Upload only the tensors we need for layer 0
+const neededTensors = new Set([
+  "token_embd.weight", "output_norm.weight",
+  "blk.0.attn_norm.weight", "blk.0.attn_q.weight", "blk.0.attn_k.weight", "blk.0.attn_v.weight",
+  "blk.0.attn_q_norm.weight", "blk.0.attn_k_norm.weight", "blk.0.attn_output.weight",
+  "blk.0.post_attention_norm.weight", "blk.0.ffn_norm.weight",
+  "blk.0.ffn_gate.weight", "blk.0.ffn_up.weight", "blk.0.ffn_down.weight",
+  "blk.0.post_ffw_norm.weight",
+]);
+info("Uploading " + neededTensors.size + " tensors for layer 0...");
+await uploadTensorsToGPU(device, model, (n, total) => {}, (name) => neededTensors.has(name));
+info("Tensors uploaded");
+
+// Helpers
+const ALL = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+function mkEmpty(bytes) { return device.createBuffer({ size: bytes, usage: ALL }); }
+function mkUniform(data) {
+  const buf = device.createBuffer({ size: data.byteLength, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST | ALL });
+  device.queue.writeBuffer(buf, 0, data);
+  return buf;
+}
+async function readBuf(buf, bytes) {
+  const staging = device.createBuffer({ size: bytes, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  const enc = device.createCommandEncoder();
+  enc.copyBufferToBuffer(buf, 0, staging, 0, bytes);
+  device.queue.submit([enc.finish()]);
+  await staging.mapAsync(GPUMapMode.READ);
+  const r = new Float32Array(staging.getMappedRange().slice(0));
+  staging.unmap(); staging.destroy();
+  return r;
+}
+function weight(name) {
+  const t = model.tensors.get(name);
+  if (!t?.gpuBuffer) throw new Error("No GPU buffer: " + name);
+  return t.gpuBuffer;
+}
+
+// Load shaders
+const shaders = {};
+for (const name of ["rms-norm", "gelu", "matmul-q4k", "matmul-q6k", "get-rows-q4k", "rope", "softmax", "residual-add", "tq-encode", "tq-attention", "tq-weighted-sum", "tq-rotate", "tq-inverse-rotate"]) {
+  const resp = await fetch("/src/draw/shaders/" + name + ".wgsl");
+  shaders[name] = await resp.text();
+}
+
+function mkPipeline(code, entry) {
+  device.pushErrorScope("validation");
+  const pl = device.createComputePipeline({ layout: "auto", compute: { module: device.createShaderModule({ code }), entryPoint: entry } });
+  device.popErrorScope().then(err => { if (err) fail("Pipeline " + entry, err.message); });
+  return pl;
+}
+async function dispatchAndRead(pl, entries, wgX, outBuf, readBytes, wgY = 1) {
+  device.pushErrorScope("validation");
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginComputePass();
+  pass.setPipeline(pl);
+  pass.setBindGroup(0, device.createBindGroup({ layout: pl.getBindGroupLayout(0), entries }));
+  pass.dispatchWorkgroups(wgX, wgY);
+  pass.end();
+  device.queue.submit([enc.finish()]);
+  const err = await device.popErrorScope();
+  if (err) throw new Error("GPU validation: " + err.message);
+  return readBuf(outBuf, readBytes);
+}
+
+function summarize(arr, label, n = 8) {
+  const slice = Array.from(arr.slice(0, n)).map(v => v.toFixed(4));
+  const hasNaN = arr.some(v => isNaN(v));
+  const allZero = arr.every(v => v === 0);
+  const min = Math.min(...arr);
+  const max = Math.max(...arr);
+  info(`  ${label}: [${slice.join(", ")}${arr.length > n ? ", ..." : ""}]`);
+  info(`  range: [${min.toFixed(4)}, ${max.toFixed(4)}], NaN: ${hasNaN}, allZero: ${allZero}`);
+  return { hasNaN, allZero, min, max };
+}
+
+if (!hasF16) {
+  warn("No shader-f16 — skipping GPU steps (Q4_K requires it)");
+} else {
+  const HIDDEN = 1536;
+  const plEmbed = mkPipeline(shaders["get-rows-q4k"], "get_rows_q4k");
+  const plNorm = mkPipeline(shaders["rms-norm"], "rms_norm");
+  const plMat = mkPipeline(shaders["matmul-q4k"], "matmul_q4k");
+
+  // Step 1: Embedding lookup — token 2 (<bos>)
+  info("\n--- Step 1: Embed token 2 ---");
+  try {
+    const embBuf = mkEmpty(HIDDEN * 4);
+    const r = await dispatchAndRead(plEmbed, [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array([2, HIDDEN, 0, 0])) } },
+      { binding: 1, resource: { buffer: weight("token_embd.weight") } },
+      { binding: 2, resource: { buffer: embBuf } },
+    ], Math.ceil(HIDDEN / 256), embBuf, HIDDEN * 4);
+    const s = summarize(r, "embedding");
+    s.hasNaN ? fail("Embed", "has NaN") : s.allZero ? fail("Embed", "all zero") : pass("Embed token 2: non-zero, no NaN");
+
+    // Step 2: RMSNorm
+    info("\n--- Step 2: RMSNorm(embedding, attn_norm.weight) ---");
+    const normedBuf = mkEmpty(HIDDEN * 4);
+    const normP = new ArrayBuffer(16);
+    new Uint32Array(normP)[0] = HIDDEN;
+    new Float32Array(normP)[1] = 1e-6;
+    const r2 = await dispatchAndRead(plNorm, [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array(normP)) } },
+      { binding: 1, resource: { buffer: embBuf } },
+      { binding: 2, resource: { buffer: weight("blk.0.attn_norm.weight") } },
+      { binding: 3, resource: { buffer: normedBuf } },
+    ], 1, normedBuf, HIDDEN * 4);
+    const s2 = summarize(r2, "normed");
+    s2.hasNaN ? fail("RMSNorm", "has NaN") : s2.allZero ? fail("RMSNorm", "all zero") : pass("RMSNorm: non-zero, no NaN");
+
+    // Step 3: Q Matmul — GGUF dims are [ne0=nCols, ne1=nRows]
+    info("\n--- Step 3: MatMul(normed, attn_q.weight) ---");
+    const qWeight = model.tensors.get("blk.0.attn_q.weight");
+    const qCols = qWeight.dims[0]; // ne0 = input cols (contiguous)
+    const qSize = qWeight.dims[1]; // ne1 = output rows
+    info("  Q weight shape: [" + qWeight.dims.join(", ") + "] → nRows=" + qSize + " (ne1), nCols=" + qCols + " (ne0)");
+    const qBuf = mkEmpty(qSize * 4);
+    const maxWG = 65535;
+    const r3 = await dispatchAndRead(plMat, [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array([qSize, qCols, 0, 0])) } },
+      { binding: 1, resource: { buffer: weight("blk.0.attn_q.weight") } },
+      { binding: 2, resource: { buffer: normedBuf } },
+      { binding: 3, resource: { buffer: qBuf } },
+    ], Math.min(qSize, maxWG), qBuf, Math.min(qSize, 32) * 4, Math.ceil(qSize / maxWG));
+    const s3 = summarize(r3, "Q projection (first " + Math.min(qSize, 32) + " values)");
+    s3.hasNaN ? fail("Q MatMul", "has NaN") : s3.allZero ? fail("Q MatMul", "all zero") : pass("Q MatMul: non-zero, no NaN, range reasonable");
+
+    // Step 4: K Matmul — nRows=ne1, nCols=ne0
+    info("\n--- Step 4: MatMul(normed, attn_k.weight) ---");
+    const kWeight = model.tensors.get("blk.0.attn_k.weight");
+    const kvCols = kWeight.dims[0]; // ne0 = input cols
+    const kvSize = kWeight.dims[1]; // ne1 = output rows
+    info("  K weight shape: [" + kWeight.dims.join(", ") + "] → nRows=" + kvSize + " (ne1), nCols=" + kvCols + " (ne0)");
+    const kBuf = mkEmpty(kvSize * 4);
+    const r4 = await dispatchAndRead(plMat, [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array([kvSize, kvCols, 0, 0])) } },
+      { binding: 1, resource: { buffer: weight("blk.0.attn_k.weight") } },
+      { binding: 2, resource: { buffer: normedBuf } },
+      { binding: 3, resource: { buffer: kBuf } },
+    ], kvSize, kBuf, kvSize * 4);
+    const s4 = summarize(r4, "K projection");
+    s4.hasNaN ? fail("K MatMul", "has NaN") : s4.allZero ? fail("K MatMul", "all zero") : pass("K MatMul: non-zero, no NaN");
+
+    // Step 5: V MatMul (q6_k)
+    info("\n--- Step 5: MatMul_Q6K(normed, attn_v.weight) ---");
+    const vWeight = model.tensors.get("blk.0.attn_v.weight");
+    const vCols = vWeight.dims[0]; // ne0 = input cols
+    const vSize = vWeight.dims[1]; // ne1 = output rows
+    info("  V weight shape: [" + vWeight.dims.join(", ") + "] type=" + vWeight.type + " → nRows=" + vSize + " nCols=" + vCols);
+    const plMatQ6k = mkPipeline(shaders["matmul-q6k"], "matmul_q6k");
+    const vBuf = mkEmpty(vSize * 4);
+    const r5 = await dispatchAndRead(plMatQ6k, [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array([vSize, vCols, 0, 0])) } },
+      { binding: 1, resource: { buffer: weight("blk.0.attn_v.weight") } },
+      { binding: 2, resource: { buffer: normedBuf } },
+      { binding: 3, resource: { buffer: vBuf } },
+    ], vSize, vBuf, vSize * 4);
+    const s5 = summarize(r5, "V projection");
+    s5.hasNaN ? fail("V MatMul", "has NaN") : s5.allZero ? fail("V MatMul", "all zero") : pass("V MatMul Q6K: non-zero, no NaN");
+
+    // Step 6: QK-norm on Q
+    info("\n--- Step 6: QK-norm on Q ---");
+    const headDim = qSize / 8; // qSize (ne1) / NUM_HEADS
+    info("  head_dim=" + headDim + " NUM_HEADS=8");
+    const qNormedBuf = mkEmpty(qSize * 4);
+    const qNormP = new ArrayBuffer(16);
+    new Uint32Array(qNormP)[0] = headDim;
+    new Float32Array(qNormP)[1] = 1e-6;
+    const r6 = await dispatchAndRead(plNorm, [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array(qNormP)) } },
+      { binding: 1, resource: { buffer: qBuf } },
+      { binding: 2, resource: { buffer: weight("blk.0.attn_q_norm.weight") } },
+      { binding: 3, resource: { buffer: qNormedBuf } },
+    ], 8, qNormedBuf, Math.min(qSize, 32) * 4); // 8 heads = 8 rows
+    const s6 = summarize(r6, "Q after QK-norm (first 32)");
+    s6.hasNaN ? fail("QK-norm Q", "has NaN") : s6.allZero ? fail("QK-norm Q", "all zero") : pass("QK-norm Q: non-zero, no NaN");
+
+    // Step 7: RoPE on Q
+    info("\n--- Step 7: RoPE on QK-normed Q ---");
+    const ropeP = new ArrayBuffer(32);
+    const ropeU = new Uint32Array(ropeP);
+    new Float32Array(ropeP)[2] = 10000.0;
+    ropeU[0] = headDim; ropeU[1] = 0; ropeU[3] = headDim; ropeU[4] = 8; ropeU[5] = 1;
+    const plRope = mkPipeline(shaders["rope"], "rope");
+    // RoPE is in-place
+    const enc7 = device.createCommandEncoder();
+    const pass7 = enc7.beginComputePass();
+    pass7.setPipeline(plRope);
+    pass7.setBindGroup(0, device.createBindGroup({ layout: plRope.getBindGroupLayout(0), entries: [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array(ropeP)) } },
+      { binding: 1, resource: { buffer: qNormedBuf } },
+    ] }));
+    pass7.dispatchWorkgroups(Math.ceil(8 * headDim / 2 / 256));
+    pass7.end();
+    device.queue.submit([enc7.finish()]);
+    const r7 = await readBuf(qNormedBuf, Math.min(qSize, 32) * 4);
+    const s7 = summarize(r7, "Q after RoPE (first 32)");
+    s7.hasNaN ? fail("RoPE Q", "has NaN") : pass("RoPE Q: no NaN");
+
+    // Step 8: TQ encode K + compute attention score
+    info("\n--- Step 8: TQ encode K + attention ---");
+    const polarWords = Math.ceil((headDim / 2) * 7 / 32);
+    const qjlWords = headDim / 32;
+
+    // Generate rotation matrix
+    function generateRotMat(dim) {
+      const mat = new Float32Array(dim * dim);
+      function nextRng(s) { s.v = BigInt.asUintN(64, s.v * 1103515245n + 12345n); return s.v; }
+      function randF32(s) { const v = Number(nextRng(s) % (1n << 31n)) / 2147483648; return v === 0 ? 0.00001 : v; }
+      function randGaussian(s) { return Math.sqrt(-2 * Math.log(randF32(s))) * Math.cos(2 * Math.PI * randF32(s)); }
+      for (let row = 0; row < dim; row++)
+        for (let col = 0; col < dim; col++)
+          mat[row * dim + col] = randGaussian({ v: BigInt(42) + BigInt(row * 31 + col) });
+      for (let i = 0; i < dim; i++) {
+        for (let j = 0; j < i; j++) {
+          let dot = 0;
+          for (let k = 0; k < dim; k++) dot += mat[i * dim + k] * mat[j * dim + k];
+          for (let k = 0; k < dim; k++) mat[i * dim + k] -= dot * mat[j * dim + k];
+        }
+        let norm = 0;
+        for (let k = 0; k < dim; k++) norm += mat[i * dim + k] * mat[i * dim + k];
+        norm = Math.sqrt(norm); if (norm > 1e-10) for (let k = 0; k < dim; k++) mat[i * dim + k] /= norm;
+      }
+      return mat;
+    }
+    const rotMat = generateRotMat(headDim);
+    const rotBuf = device.createBuffer({ size: rotMat.byteLength, usage: ALL, mappedAtCreation: true });
+    new Float32Array(rotBuf.getMappedRange()).set(rotMat);
+    rotBuf.unmap();
+
+    // K norm (using K from step 4, normed with k_norm weight)
+    const kNormedBuf = mkEmpty(kvSize * 4);
+    const rKN = await dispatchAndRead(plNorm, [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array(qNormP)) } },
+      { binding: 1, resource: { buffer: kBuf } },
+      { binding: 2, resource: { buffer: weight("blk.0.attn_k_norm.weight") } },
+      { binding: 3, resource: { buffer: kNormedBuf } },
+    ], 1, kNormedBuf, kvSize * 4); // 1 KV head
+    summarize(rKN, "K normed (TQ encode input)");
+
+    // Verify rotation matrix
+    const rotCheck = await readBuf(rotBuf, 32);
+    info("  Rotation matrix first 8: [" + Array.from(rotCheck).map(v=>v.toFixed(4)).join(", ") + "]");
+
+    const plEncode = mkPipeline(shaders["tq-encode"], "encode");
+
+    // Step 8a: RoPE on K (in-place — engine applies RoPE before TQ encode)
+    info("\n--- Step 8a: RoPE on K ---");
+    const ropeKP = new ArrayBuffer(32);
+    const ropeKU = new Uint32Array(ropeKP);
+    new Float32Array(ropeKP)[2] = 10000.0;
+    ropeKU[0] = headDim; ropeKU[1] = 0; ropeKU[3] = headDim; ropeKU[4] = 1; ropeKU[5] = 1;
+    {
+      const enc = device.createCommandEncoder();
+      const p = enc.beginComputePass();
+      p.setPipeline(plRope);
+      p.setBindGroup(0, device.createBindGroup({ layout: plRope.getBindGroupLayout(0), entries: [
+        { binding: 0, resource: { buffer: mkUniform(new Uint32Array(ropeKP)) } },
+        { binding: 1, resource: { buffer: kNormedBuf } },
+      ] }));
+      p.dispatchWorkgroups(Math.ceil(headDim / 2 / 256));
+      p.end();
+      device.queue.submit([enc.finish()]);
+    }
+    const r8a = await readBuf(kNormedBuf, kvSize * 4);
+    const s8a = summarize(r8a, "K after RoPE");
+    s8a.hasNaN ? fail("RoPE K", "NaN") : pass("RoPE K: no NaN");
+
+    // Step 8b: TQ encode K (with RoPE'd K — matches engine)
+    info("\n--- Step 8b: TQ encode K (RoPE'd) ---");
+    const kPolar = mkEmpty(polarWords * 4);
+    const kQjl = mkEmpty(qjlWords * 4);
+    const kMaxR = mkEmpty(4);
+    const kGamma = mkEmpty(4);
+    {
+      const enc = device.createCommandEncoder();
+      const p = enc.beginComputePass();
+      p.setPipeline(plEncode);
+      p.setBindGroup(0, device.createBindGroup({ layout: plEncode.getBindGroupLayout(0), entries: [
+        { binding: 0, resource: { buffer: mkUniform(new Uint32Array([headDim, 1, polarWords, qjlWords, 0, 0, 0, 0])) } },
+        { binding: 1, resource: { buffer: kNormedBuf } },
+        { binding: 2, resource: { buffer: rotBuf } },
+        { binding: 3, resource: { buffer: kPolar } }, { binding: 4, resource: { buffer: kQjl } },
+        { binding: 5, resource: { buffer: kMaxR } }, { binding: 6, resource: { buffer: kGamma } },
+      ] }));
+      p.dispatchWorkgroups(1);
+      p.end();
+      device.queue.submit([enc.finish()]);
+    }
+    const maxRVal = await readBuf(kMaxR, 4);
+    const gammaVal = await readBuf(kGamma, 4);
+    info("  TQ encode K: max_r=" + maxRVal[0].toFixed(4) + " gamma=" + gammaVal[0].toFixed(4));
+    (!isNaN(maxRVal[0]) && !isNaN(gammaVal[0]) && maxRVal[0] > 0)
+      ? pass("TQ encode K: max_r=" + maxRVal[0].toFixed(2) + " gamma=" + gammaVal[0].toFixed(2))
+      : fail("TQ encode K", "max_r=" + maxRVal[0] + " gamma=" + gammaVal[0]);
+
+    // Step 9: TQ encode V (raw V projection — no RoPE/norm, matches engine)
+    info("\n--- Step 9: TQ encode V ---");
+    const vPolar = mkEmpty(polarWords * 4);
+    const vQjl = mkEmpty(qjlWords * 4);
+    const vMaxR = mkEmpty(4);
+    const vGammaB = mkEmpty(4);
+    {
+      const enc = device.createCommandEncoder();
+      const p = enc.beginComputePass();
+      p.setPipeline(plEncode);
+      p.setBindGroup(0, device.createBindGroup({ layout: plEncode.getBindGroupLayout(0), entries: [
+        { binding: 0, resource: { buffer: mkUniform(new Uint32Array([headDim, 1, polarWords, qjlWords, 0, 0, 0, 0])) } },
+        { binding: 1, resource: { buffer: vBuf } },
+        { binding: 2, resource: { buffer: rotBuf } },
+        { binding: 3, resource: { buffer: vPolar } }, { binding: 4, resource: { buffer: vQjl } },
+        { binding: 5, resource: { buffer: vMaxR } }, { binding: 6, resource: { buffer: vGammaB } },
+      ] }));
+      p.dispatchWorkgroups(1);
+      p.end();
+      device.queue.submit([enc.finish()]);
+    }
+    const vMR = await readBuf(vMaxR, 4);
+    const vGM = await readBuf(vGammaB, 4);
+    info("  TQ encode V: max_r=" + vMR[0].toFixed(4) + " gamma=" + vGM[0].toFixed(4));
+    (!isNaN(vMR[0]) && !isNaN(vGM[0]) && vMR[0] > 0)
+      ? pass("TQ encode V: max_r=" + vMR[0].toFixed(2) + " gamma=" + vGM[0].toFixed(2))
+      : fail("TQ encode V", "max_r=" + vMR[0] + " gamma=" + vGM[0]);
+
+    // Step 10: TQ rotate Q (head 0)
+    info("\n--- Step 10: TQ rotate Q (head 0) ---");
+    const plRotate = mkPipeline(shaders["tq-rotate"], "rotate");
+    const qSlice = mkEmpty(headDim * 4);
+    {
+      const enc = device.createCommandEncoder();
+      enc.copyBufferToBuffer(qNormedBuf, 0, qSlice, 0, headDim * 4);
+      device.queue.submit([enc.finish()]);
+    }
+    const rotQ = mkEmpty(headDim * 4);
+    const dimP = mkUniform(new Uint32Array([headDim, 0, 0, 0]));
+    const r10 = await dispatchAndRead(plRotate, [
+      { binding: 0, resource: { buffer: dimP } },
+      { binding: 1, resource: { buffer: qSlice } },
+      { binding: 2, resource: { buffer: rotBuf } },
+      { binding: 3, resource: { buffer: rotQ } },
+    ], Math.ceil(headDim / 256), rotQ, Math.min(headDim, 32) * 4);
+    const s10 = summarize(r10, "Rotated Q (head 0)");
+    s10.hasNaN ? fail("TQ rotate Q", "NaN") : pass("TQ rotate Q: no NaN");
+
+    // Step 11: TQ attention scores (Q·compressed_K)
+    info("\n--- Step 11: TQ attention score ---");
+    const plAttn = mkPipeline(shaders["tq-attention"], "compute_scores");
+    const scoresBuf = mkEmpty(4);
+    const attnP = mkUniform(new Uint32Array([headDim, 1, polarWords, qjlWords]));
+    const r11 = await dispatchAndRead(plAttn, [
+      { binding: 0, resource: { buffer: attnP } },
+      { binding: 1, resource: { buffer: rotQ } },
+      { binding: 2, resource: { buffer: kPolar } }, { binding: 3, resource: { buffer: kQjl } },
+      { binding: 4, resource: { buffer: kMaxR } }, { binding: 5, resource: { buffer: kGamma } },
+      { binding: 6, resource: { buffer: scoresBuf } },
+    ], 1, scoresBuf, 4);
+    info("  Score: " + r11[0].toFixed(4));
+    isNaN(r11[0]) ? fail("TQ attention", "score is NaN") : pass("TQ attention: score=" + r11[0].toFixed(4));
+
+    // Step 12: Softmax (1 position → expect 1.0)
+    info("\n--- Step 12: Softmax ---");
+    const plSoftmax = mkPipeline(shaders["softmax"], "softmax");
+    const r12 = await dispatchAndRead(plSoftmax, [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array([1, 0, 0, 0])) } },
+      { binding: 1, resource: { buffer: scoresBuf } },
+    ], 1, scoresBuf, 4);
+    info("  Softmax: " + r12[0].toFixed(6) + " (expect 1.0)");
+    (Math.abs(r12[0] - 1.0) < 0.001) ? pass("Softmax: 1.0") :
+      isNaN(r12[0]) ? fail("Softmax", "NaN") : fail("Softmax", "got " + r12[0]);
+
+    // Step 13: TQ weighted sum (most complex shader)
+    info("\n--- Step 13: TQ weighted sum ---");
+    const plWeightedSum = mkPipeline(shaders["tq-weighted-sum"], "weighted_sum");
+    const rotOutBuf = mkEmpty(headDim * 4);
+    const r13 = await dispatchAndRead(plWeightedSum, [
+      { binding: 0, resource: { buffer: attnP } },
+      { binding: 1, resource: { buffer: scoresBuf } },
+      { binding: 2, resource: { buffer: vPolar } }, { binding: 3, resource: { buffer: vQjl } },
+      { binding: 4, resource: { buffer: vMaxR } }, { binding: 5, resource: { buffer: vGammaB } },
+      { binding: 6, resource: { buffer: rotBuf } },
+      { binding: 7, resource: { buffer: rotOutBuf } },
+    ], 1, rotOutBuf, Math.min(headDim, 32) * 4);
+    const s13 = summarize(r13, "Weighted sum (rotated)");
+    s13.hasNaN ? fail("TQ weighted sum", "NaN") : pass("TQ weighted sum: no NaN");
+
+    // Step 14: TQ inverse rotate
+    info("\n--- Step 14: TQ inverse rotate ---");
+    const plInvRot = mkPipeline(shaders["tq-inverse-rotate"], "inverse_rotate");
+    const headOutBuf = mkEmpty(headDim * 4);
+    const r14 = await dispatchAndRead(plInvRot, [
+      { binding: 0, resource: { buffer: dimP } },
+      { binding: 1, resource: { buffer: rotOutBuf } },
+      { binding: 2, resource: { buffer: rotBuf } },
+      { binding: 3, resource: { buffer: headOutBuf } },
+    ], Math.ceil(headDim / 256), headOutBuf, Math.min(headDim, 32) * 4);
+    const s14 = summarize(r14, "Head 0 output");
+    s14.hasNaN ? fail("TQ inverse rotate", "NaN") : pass("TQ inverse rotate: no NaN");
+
+    // Step 15: Assemble attnOut (copy head 0 to all 8 heads for dimension test)
+    info("\n--- Step 15: Output projection ---");
+    const attnOutBuf = mkEmpty(qSize * 4);
+    {
+      const enc = device.createCommandEncoder();
+      for (let h = 0; h < 8; h++) enc.copyBufferToBuffer(headOutBuf, 0, attnOutBuf, h * headDim * 4, headDim * 4);
+      device.queue.submit([enc.finish()]);
+    }
+    const attnProjBuf = mkEmpty(HIDDEN * 4);
+    const r15 = await dispatchAndRead(plMat, [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array([HIDDEN, qSize, 0, 0])) } },
+      { binding: 1, resource: { buffer: weight("blk.0.attn_output.weight") } },
+      { binding: 2, resource: { buffer: attnOutBuf } },
+      { binding: 3, resource: { buffer: attnProjBuf } },
+    ], Math.min(HIDDEN, 65535), attnProjBuf, Math.min(HIDDEN, 32) * 4, Math.ceil(HIDDEN / 65535));
+    const s15 = summarize(r15, "Output proj");
+    s15.hasNaN ? fail("Output proj", "NaN") : pass("Output proj: no NaN");
+
+    // Step 16: Post-attention norm
+    info("\n--- Step 16: Post-attention norm ---");
+    const attnPostBuf = mkEmpty(HIDDEN * 4);
+    const r16 = await dispatchAndRead(plNorm, [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array(normP)) } },
+      { binding: 1, resource: { buffer: attnProjBuf } },
+      { binding: 2, resource: { buffer: weight("blk.0.post_attention_norm.weight") } },
+      { binding: 3, resource: { buffer: attnPostBuf } },
+    ], 1, attnPostBuf, Math.min(HIDDEN, 32) * 4);
+    const s16 = summarize(r16, "Post-attn normed");
+    s16.hasNaN ? fail("Post-attn norm", "NaN") : pass("Post-attn norm: no NaN");
+
+    // Step 17: Attention residual (embedding + post_normed_attn)
+    info("\n--- Step 17: Attention residual ---");
+    const plResidual = mkPipeline(shaders["residual-add"], "residual_add");
+    const hidden1Buf = mkEmpty(HIDDEN * 4);
+    const r17 = await dispatchAndRead(plResidual, [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array([HIDDEN, 0, 0, 0])) } },
+      { binding: 1, resource: { buffer: embBuf } },
+      { binding: 2, resource: { buffer: attnPostBuf } },
+      { binding: 3, resource: { buffer: hidden1Buf } },
+    ], Math.ceil(HIDDEN / 256), hidden1Buf, Math.min(HIDDEN, 32) * 4);
+    const s17 = summarize(r17, "After attn residual");
+    s17.hasNaN ? fail("Attn residual", "NaN") : pass("Attn residual: no NaN");
+
+    // Step 18: Pre-FFN norm
+    info("\n--- Step 18: Pre-FFN norm ---");
+    const mlpNormedBuf = mkEmpty(HIDDEN * 4);
+    const r18 = await dispatchAndRead(plNorm, [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array(normP)) } },
+      { binding: 1, resource: { buffer: hidden1Buf } },
+      { binding: 2, resource: { buffer: weight("blk.0.ffn_norm.weight") } },
+      { binding: 3, resource: { buffer: mlpNormedBuf } },
+    ], 1, mlpNormedBuf, Math.min(HIDDEN, 32) * 4);
+    const s18 = summarize(r18, "FFN normed");
+    s18.hasNaN ? fail("FFN norm", "NaN") : pass("FFN norm: no NaN");
+
+    // Step 19: FFN gate + up
+    info("\n--- Step 19: FFN gate + up ---");
+    const ffnW = model.tensors.get("blk.0.ffn_gate.weight");
+    const ffnSize = ffnW.dims[1]; // ne1 = output rows
+    info("  ffn_gate: [" + ffnW.dims.join(",") + "] ffnSize=" + ffnSize);
+    const gateBuf = mkEmpty(ffnSize * 4);
+    const upBuf2 = mkEmpty(ffnSize * 4);
+    const r19a = await dispatchAndRead(plMat, [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array([ffnSize, HIDDEN, 0, 0])) } },
+      { binding: 1, resource: { buffer: weight("blk.0.ffn_gate.weight") } },
+      { binding: 2, resource: { buffer: mlpNormedBuf } },
+      { binding: 3, resource: { buffer: gateBuf } },
+    ], Math.min(ffnSize, 65535), gateBuf, 64, Math.ceil(ffnSize / 65535));
+    const r19b = await dispatchAndRead(plMat, [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array([ffnSize, HIDDEN, 0, 0])) } },
+      { binding: 1, resource: { buffer: weight("blk.0.ffn_up.weight") } },
+      { binding: 2, resource: { buffer: mlpNormedBuf } },
+      { binding: 3, resource: { buffer: upBuf2 } },
+    ], Math.min(ffnSize, 65535), upBuf2, 64, Math.ceil(ffnSize / 65535));
+    const gateNaN = r19a.some(v => isNaN(v));
+    const upNaN = r19b.some(v => isNaN(v));
+    info("  gate: [" + Array.from(r19a.slice(0,4)).map(v=>v.toFixed(4)).join(", ") + "] NaN=" + gateNaN);
+    info("  up:   [" + Array.from(r19b.slice(0,4)).map(v=>v.toFixed(4)).join(", ") + "] NaN=" + upNaN);
+    (gateNaN || upNaN) ? fail("FFN gate/up", "NaN") : pass("FFN gate + up: no NaN");
+
+    // Step 20: GELU(gate) * up
+    info("\n--- Step 20: GELU ---");
+    const plGelu = mkPipeline(shaders["gelu"], "gelu_gate");
+    const geluBuf = mkEmpty(ffnSize * 4);
+    const r20 = await dispatchAndRead(plGelu, [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array([ffnSize, 0, 0, 0])) } },
+      { binding: 1, resource: { buffer: gateBuf } },
+      { binding: 2, resource: { buffer: upBuf2 } },
+      { binding: 3, resource: { buffer: geluBuf } },
+    ], Math.ceil(ffnSize / 256), geluBuf, 64);
+    const s20 = summarize(r20.slice(0, 16), "GELU output");
+    s20.hasNaN ? fail("GELU", "NaN") : pass("GELU: no NaN");
+
+    // Step 21: FFN down (q6_k)
+    info("\n--- Step 21: FFN down (Q6K) ---");
+    const mlpOutBuf = mkEmpty(HIDDEN * 4);
+    const r21 = await dispatchAndRead(plMatQ6k, [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array([HIDDEN, ffnSize, 0, 0])) } },
+      { binding: 1, resource: { buffer: weight("blk.0.ffn_down.weight") } },
+      { binding: 2, resource: { buffer: geluBuf } },
+      { binding: 3, resource: { buffer: mlpOutBuf } },
+    ], Math.min(HIDDEN, 65535), mlpOutBuf, Math.min(HIDDEN, 32) * 4, Math.ceil(HIDDEN / 65535));
+    const s21 = summarize(r21, "FFN down");
+    s21.hasNaN ? fail("FFN down Q6K", "NaN") : pass("FFN down Q6K: no NaN");
+
+    // Step 22: Post-FFN norm
+    info("\n--- Step 22: Post-FFN norm ---");
+    const mlpPostBuf = mkEmpty(HIDDEN * 4);
+    const r22 = await dispatchAndRead(plNorm, [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array(normP)) } },
+      { binding: 1, resource: { buffer: mlpOutBuf } },
+      { binding: 2, resource: { buffer: weight("blk.0.post_ffw_norm.weight") } },
+      { binding: 3, resource: { buffer: mlpPostBuf } },
+    ], 1, mlpPostBuf, Math.min(HIDDEN, 32) * 4);
+    const s22 = summarize(r22, "Post-FFN normed");
+    s22.hasNaN ? fail("Post-FFN norm", "NaN") : pass("Post-FFN norm: no NaN");
+
+    // Step 23: Final residual (hidden1 + post_normed_mlp)
+    info("\n--- Step 23: Final residual (layer 0 output) ---");
+    const outputBuf = mkEmpty(HIDDEN * 4);
+    const r23 = await dispatchAndRead(plResidual, [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array([HIDDEN, 0, 0, 0])) } },
+      { binding: 1, resource: { buffer: hidden1Buf } },
+      { binding: 2, resource: { buffer: mlpPostBuf } },
+      { binding: 3, resource: { buffer: outputBuf } },
+    ], Math.ceil(HIDDEN / 256), outputBuf, Math.min(HIDDEN, 32) * 4);
+    const s23 = summarize(r23, "Layer 0 output");
+    s23.hasNaN ? fail("Layer 0 output", "NaN") : pass("LAYER 0 COMPLETE: no NaN, range [" + s23.min.toFixed(2) + ", " + s23.max.toFixed(2) + "]");
+
+  } catch (e) { fail("GPU step", e.message); console.error(e); }
+}
+
+// ===== Summary =====
+info("\n===========================");
+info("Results: " + passed + " passed, " + failed + " failed");
+if (failed === 0) out("pass", "ALL TESTS PASSED");
+</script>
+</body>
+</html>

@@ -47,7 +47,7 @@ h1 .dim {
 
 .demos {
   display: grid;
-  grid-template-columns: repeat(3, 1fr);
+  grid-template-columns: repeat(2, 1fr);
   gap: 16px;
   margin-bottom: 40px;
 }
@@ -98,6 +98,11 @@ h1 .dim {
 .demo-tag.poc {
   background: rgba(255, 167, 38, 0.12);
   color: #ffa726;
+}
+
+.demo-tag.warning {
+  background: rgba(244, 67, 54, 0.12);
+  color: #ef5350;
 }
 
 .demo-tag.primary {
