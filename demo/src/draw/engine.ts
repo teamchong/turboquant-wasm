@@ -1387,63 +1387,93 @@ export class InferenceEngine {
     this.rmsNorm(enc, inputBuf, this.weight(L + "attn_norm.weight"), s.normed, HIDDEN_SIZE);
     if (dumpL0) this.dumpForDebug(enc, s.normed, HIDDEN_SIZE, "attn_norm-0");
 
-    // 2. Q/K/V projections — merged into single pass (independent: all read normed)
+    // 2. Q/K/V projections. Shared-KV layers (15..34 in Gemma 4 E2B)
+    //    discard their K/V outputs — the cache was populated by the source
+    //    layer (13/14) and step 5 below guards tq_encode with `reuseLayer
+    //    < 0`. Skip the K and V matmuls here too. Each is ~1/4 of Q's
+    //    compute (kvSize=512 vs qSize=2048); saving 40 of them per step
+    //    (20 shared layers × 2 projections) takes a measurable slice out
+    //    of the matmul budget.
     const vTensor = this.model.tensors.get(L + "attn_v.weight")!;
-    this.multiDispatch(enc, "matmul", [
-      this.matmulOp(this.weight(L + "attn_q.weight"), s.normed, s.q, qSize, HIDDEN_SIZE),
-      this.matmulOp(this.weight(L + "attn_k.weight"), s.normed, s.k, kvSize, HIDDEN_SIZE),
-      this.matmulOp(vTensor.gpuBuffer!, s.normed, s.v, kvSize, HIDDEN_SIZE, vTensor.type === GGML_Q6_K),
-    ]);
+    if (reuseLayer < 0) {
+      this.multiDispatch(enc, "matmul", [
+        this.matmulOp(this.weight(L + "attn_q.weight"), s.normed, s.q, qSize, HIDDEN_SIZE),
+        this.matmulOp(this.weight(L + "attn_k.weight"), s.normed, s.k, kvSize, HIDDEN_SIZE),
+        this.matmulOp(vTensor.gpuBuffer!, s.normed, s.v, kvSize, HIDDEN_SIZE, vTensor.type === GGML_Q6_K),
+      ]);
+    } else {
+      this.matmul(enc, this.weight(L + "attn_q.weight"), s.normed, s.q, qSize, HIDDEN_SIZE);
+    }
     if (dumpL0) {
       this.dumpForDebug(enc, s.q, qSize, "Qcur-0");
-      this.dumpForDebug(enc, s.k, kvSize, "Kcur-0");
-      this.dumpForDebug(enc, s.v, kvSize, "Vcur-0");
+      if (reuseLayer < 0) {
+        this.dumpForDebug(enc, s.k, kvSize, "Kcur-0");
+        this.dumpForDebug(enc, s.v, kvSize, "Vcur-0");
+      }
     }
 
-    // 3. QK-norm + V-norm — merged (all three independent)
-    //    Gemma 4 normalizes V with unweighted RMS (ggml_rms_norm without weight),
-    //    so we pass a buffer of ones as the "weight".
+    // 3. QK-norm + V-norm. Shared-KV layers skip K-norm and V-norm.
+    //    Gemma 4 normalizes V with unweighted RMS (ggml_rms_norm without
+    //    weight), so we pass a buffer of ones as the "weight".
     {
       const normP = new ArrayBuffer(16);
       new Uint32Array(normP)[0] = dim;
       new Float32Array(normP)[1] = RMS_NORM_EPS;
-      this.multiDispatch(enc, "norm", [
-        { pl: this.pipelines.rmsNorm, wgX: NUM_HEADS, entries: [
+      if (reuseLayer < 0) {
+        this.multiDispatch(enc, "norm", [
+          { pl: this.pipelines.rmsNorm, wgX: NUM_HEADS, entries: [
+            this.u16(new Uint32Array(normP)),
+            { binding: 1, resource: { buffer: s.q } }, { binding: 2, resource: { buffer: this.weight(L + "attn_q_norm.weight") } },
+            { binding: 3, resource: { buffer: s.qNormed } },
+          ]},
+          { pl: this.pipelines.rmsNorm, wgX: NUM_KV_HEADS, entries: [
+            this.u16(new Uint32Array(normP)),
+            { binding: 1, resource: { buffer: s.k } }, { binding: 2, resource: { buffer: this.weight(L + "attn_k_norm.weight") } },
+            { binding: 3, resource: { buffer: s.kNormed } },
+          ]},
+          { pl: this.pipelines.rmsNorm, wgX: NUM_KV_HEADS, entries: [
+            this.u16(new Uint32Array(normP)),
+            { binding: 1, resource: { buffer: s.v } }, { binding: 2, resource: { buffer: s.onesWeight } },
+            { binding: 3, resource: { buffer: s.vNormed } },
+          ]},
+        ]);
+      } else {
+        this.dispatch(enc, this.pipelines.rmsNorm, [
           this.u16(new Uint32Array(normP)),
           { binding: 1, resource: { buffer: s.q } }, { binding: 2, resource: { buffer: this.weight(L + "attn_q_norm.weight") } },
           { binding: 3, resource: { buffer: s.qNormed } },
-        ]},
-        { pl: this.pipelines.rmsNorm, wgX: NUM_KV_HEADS, entries: [
-          this.u16(new Uint32Array(normP)),
-          { binding: 1, resource: { buffer: s.k } }, { binding: 2, resource: { buffer: this.weight(L + "attn_k_norm.weight") } },
-          { binding: 3, resource: { buffer: s.kNormed } },
-        ]},
-        { pl: this.pipelines.rmsNorm, wgX: NUM_KV_HEADS, entries: [
-          this.u16(new Uint32Array(normP)),
-          { binding: 1, resource: { buffer: s.v } }, { binding: 2, resource: { buffer: s.onesWeight } },
-          { binding: 3, resource: { buffer: s.vNormed } },
-        ]},
-      ]);
+        ], NUM_HEADS);
+      }
     }
     if (dumpL0) {
       this.dumpForDebug(enc, s.qNormed, qSize, "Qcur_normed-0");
-      this.dumpForDebug(enc, s.kNormed, kvSize, "Kcur_normed-0");
-      this.dumpForDebug(enc, s.vNormed, kvSize, "Vcur_normed-0");
+      if (reuseLayer < 0) {
+        this.dumpForDebug(enc, s.kNormed, kvSize, "Kcur_normed-0");
+        this.dumpForDebug(enc, s.vNormed, kvSize, "Vcur_normed-0");
+      }
     }
 
-    // 4. RoPE Q/K — merged (independent: in-place on qNormed, kNormed)
-    this.multiDispatch(enc, "rope", [
-      { pl: this.pipelines.rope, wgX: Math.ceil(NUM_HEADS * dim / 2 / 256), entries: [
+    // 4. RoPE Q (and K if own-KV). Shared-KV layers skip K RoPE.
+    if (reuseLayer < 0) {
+      this.multiDispatch(enc, "rope", [
+        { pl: this.pipelines.rope, wgX: Math.ceil(NUM_HEADS * dim / 2 / 256), entries: [
+          this.u32(mkRopeParams(NUM_HEADS)),
+          { binding: 1, resource: { buffer: s.qNormed } },
+          { binding: 2, resource: { buffer: ropeFreqsBuf } },
+        ]},
+        { pl: this.pipelines.rope, wgX: Math.ceil(NUM_KV_HEADS * dim / 2 / 256), entries: [
+          this.u32(mkRopeParams(NUM_KV_HEADS)),
+          { binding: 1, resource: { buffer: s.kNormed } },
+          { binding: 2, resource: { buffer: ropeFreqsBuf } },
+        ]},
+      ]);
+    } else {
+      this.dispatch(enc, this.pipelines.rope, [
         this.u32(mkRopeParams(NUM_HEADS)),
         { binding: 1, resource: { buffer: s.qNormed } },
         { binding: 2, resource: { buffer: ropeFreqsBuf } },
-      ]},
-      { pl: this.pipelines.rope, wgX: Math.ceil(NUM_KV_HEADS * dim / 2 / 256), entries: [
-        this.u32(mkRopeParams(NUM_KV_HEADS)),
-        { binding: 1, resource: { buffer: s.kNormed } },
-        { binding: 2, resource: { buffer: ropeFreqsBuf } },
-      ]},
-    ]);
+      ], Math.ceil(NUM_HEADS * dim / 2 / 256));
+    }
     if (dumpL0) {
       this.dumpForDebug(enc, s.qNormed, qSize, "Qcur_pos-0");
       this.dumpForDebug(enc, s.kNormed, kvSize, "Kcur_pos-0");
