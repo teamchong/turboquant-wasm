@@ -7,6 +7,8 @@
 // loop in a single GPU thread per head — for a 2400-position cache that was
 // burning ~20 ms/token doing nothing while every other lane sat idle.
 
+enable subgroups;
+
 struct Params {
   n_cols: u32,        // packed stride (usually the cache length)
   window_start: u32,  // positions < ws are masked to -inf (sliding window floor)
