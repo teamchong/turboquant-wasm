@@ -164,6 +164,15 @@ class UniformMega {
   private nextOffset = 0;
   private align: number;
   private device: GPUDevice;
+  // Deduplication cache: exact-content string key → existing offset. Per
+  // WeInfer (ICLR '26 WebGPU paper), many dispatches within a single
+  // decode step post identical uniform blocks — rms-norm's [dim, eps, 0, 0]
+  // is identical across all 35 layers on the same width; matmul's
+  // [n_rows, n_cols] repeats for every Q/K/V/attn_out in a layer and
+  // across layers with matching shapes. Keying by exact byte content
+  // (not a hash — collisions would silently return another dispatch's
+  // slot) lets repeats share one slot + one writeBuffer byte range.
+  private cache: Map<string, number> = new Map();
 
   constructor(device: GPUDevice, maxSlots: number) {
     this.device = device;
@@ -173,21 +182,34 @@ class UniformMega {
     this.cpu = new Uint8Array(size);
   }
 
-  reset(): void { this.nextOffset = 0; }
+  reset(): void { this.nextOffset = 0; this.cache.clear(); }
 
-  /** Write 16 bytes, return binding 0 entry. */
+  /** Write 16 bytes, return binding 0 entry. Deduplicates by exact value. */
   get16(data: Uint32Array): GPUBindGroupEntry {
+    const key = `16|${data[0]}|${data[1]}|${data[2]}|${data[3]}`;
+    const cached = this.cache.get(key);
+    if (cached !== undefined) {
+      return { binding: 0, resource: { buffer: this.buf, offset: cached, size: 16 } };
+    }
     const offset = this.nextOffset;
     this.nextOffset += this.align;
     new Uint32Array(this.cpu.buffer, offset, 4).set(data);
+    this.cache.set(key, offset);
     return { binding: 0, resource: { buffer: this.buf, offset, size: 16 } };
   }
 
-  /** Write 32 bytes, return binding 0 entry. */
+  /** Write 32 bytes, return binding 0 entry. Deduplicates by exact value. */
   get32(data: ArrayBuffer): GPUBindGroupEntry {
+    const u = new Uint32Array(data, 0, 8);
+    const key = `32|${u[0]}|${u[1]}|${u[2]}|${u[3]}|${u[4]}|${u[5]}|${u[6]}|${u[7]}`;
+    const cached = this.cache.get(key);
+    if (cached !== undefined) {
+      return { binding: 0, resource: { buffer: this.buf, offset: cached, size: 32 } };
+    }
     const offset = this.nextOffset;
     this.nextOffset += this.align;
     new Uint8Array(this.cpu.buffer, offset, 32).set(new Uint8Array(data, 0, 32));
+    this.cache.set(key, offset);
     return { binding: 0, resource: { buffer: this.buf, offset, size: 32 } };
   }
 
