@@ -93,8 +93,14 @@ let currentAttemptPrefilled: number[] | null = null;
 // `systemCacheEnd + lcpLen`.
 let systemCacheEnd = 0;
 // Minimum shared prefix length to use the rollback fast-path. Below this the
-// savings don't outweigh the rollback/suffix-prefill overhead.
-const PREFIX_REUSE_MIN = 32;
+// savings don't outweigh the rollback (worker round-trip ~1-2ms) + suffix-
+// prefill overhead. Set to 8: the rollbackKV worker call is one postMessage
+// round-trip (~1ms) and each token in the reused prefix saves ~0.8ms of
+// prefill work, so 8 tokens is roughly breakeven and anything above is pure
+// win. Lowered from the original 32 after the retry-LCP change — short user
+// prompts (<32 tokens) were missing the retry fast-path despite having 25+
+// tokens of reusable prefix.
+const PREFIX_REUSE_MIN = 8;
 
 const SYSTEM_PROMPT = `Reply with JavaScript SDK calls only. Start with the first call, end with the last call.
 
