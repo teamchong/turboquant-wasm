@@ -1,0 +1,29 @@
+
+# prompt> make
+# builds everything and links in test program test_rb
+
+SRCS = test_red_black_tree.c red_black_tree.c
+
+HDRS = red_black_tree.h
+
+OBJS = red_black_tree.o test_red_black_tree.o
+
+CC = gcc
+
+CFLAGS = -g -Wall -pedantic
+
+PROGRAM = test_rb
+
+.PHONY:	clean
+
+all: $(PROGRAM)
+
+$(PROGRAM): 	$(OBJS)
+		$(CC) $(CFLAGS) $(OBJS) -o $(PROGRAM)
+
+test_red_black_tree.o:	test_red_black_tree.c red_black_tree.c red_black_tree.h
+
+red_black_tree.o:	red_black_tree.h red_black_tree.c
+
+clean:			
+	rm -f *.o *~ $(PROGRAM)

@@ -1,0 +1,103 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>WebLLM baseline vs our TQ engine</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { font-size: 1.3rem; }
+    pre { background: #f6f8fa; padding: 12px; border-radius: 6px; white-space: pre-wrap; word-break: break-word; font-size: 12px; }
+    #status { min-height: 3em; }
+    .hint { color: #6a737d; font-size: 13px; }
+  </style>
+</head>
+<body>
+  <h1>WebLLM baseline — ground-truth tok/s for our WebGPU target</h1>
+  <p class="hint">
+    Loads <code>@mlc-ai/web-llm</code> from the esm.run CDN, downloads a model
+    (first run only; cached in IndexedDB afterward), runs a fixed URL prompt,
+    and reports prefill time, decode tok/s, and WebLLM's own runtime stats.
+  </p>
+  <pre id="status">Loading WebLLM module…</pre>
+  <pre id="result"></pre>
+
+  <script type="module">
+    import * as webllm from "https://esm.run/@mlc-ai/web-llm";
+
+    const statusEl = document.getElementById("status");
+    const resultEl = document.getElementById("result");
+    const log = (msg) => { statusEl.textContent = msg; console.log(msg); };
+
+    // Expose the module so tests / devtools can query the model registry.
+    window.__webllm = webllm;
+    window.__modelIds = (webllm.prebuiltAppConfig?.model_list ?? []).map(m => m.model_id);
+
+    /**
+     * Run a full prefill + decode benchmark for a given model id.
+     *
+     * @param modelId   e.g. "Phi-3.5-mini-instruct-q4f16_1-MLC"
+     * @param prompt    user text for the chat completion
+     * @param maxTokens max new tokens to generate
+     * @returns { modelId, prefillMs, decodeMs, totalMs, tokenCount, tokPerSec, stats }
+     */
+    window.__runBench = async function(modelId, prompt, maxTokens) {
+      log(`Creating engine for ${modelId}…`);
+      const engine = await webllm.CreateMLCEngine(modelId, {
+        initProgressCallback: (p) => {
+          // p.progress is 0..1 during model download/compile.
+          log(`${modelId}: ${p.text ?? ""} (${((p.progress ?? 0) * 100).toFixed(1)}%)`);
+        },
+      });
+
+      log(`${modelId}: running benchmark…`);
+      const tStart = performance.now();
+      let firstTokenMs = 0;
+      let tokenCount = 0;
+      // OpenAI-compatible streaming completion. stream_options includes the
+      // token usage in the final chunk so we don't have to guess counts.
+      const chunks = await engine.chat.completions.create({
+        messages: [{ role: "user", content: prompt }],
+        max_tokens: maxTokens,
+        temperature: 0,
+        stream: true,
+        stream_options: { include_usage: true },
+      });
+
+      for await (const chunk of chunks) {
+        const delta = chunk.choices?.[0]?.delta?.content;
+        if (delta !== undefined && delta !== null) {
+          if (tokenCount === 0) firstTokenMs = performance.now() - tStart;
+          // Count raw streaming deltas as our proxy for token count. The
+          // stream_options.include_usage chunk at the end gives the exact
+          // completion_tokens which we prefer when present.
+          tokenCount++;
+        }
+        if (chunk.usage?.completion_tokens) {
+          tokenCount = chunk.usage.completion_tokens;
+        }
+      }
+
+      const totalMs = performance.now() - tStart;
+      const decodeMs = totalMs - firstTokenMs;
+      const tokPerSec = tokenCount / (decodeMs / 1000);
+
+      // WebLLM's own runtime-stats string — has prefill tok/s and decode tok/s
+      // computed their way, useful as a cross-check against our wall-clock
+      // numbers. Formats like "prefill: 12.3 tokens/sec, decode: 45.6 tokens/sec".
+      let stats = "";
+      try { stats = await engine.runtimeStatsText(); } catch { /* older api */ }
+
+      const result = { modelId, prefillMs: firstTokenMs, decodeMs, totalMs, tokenCount, tokPerSec, stats };
+      log(`${modelId}: done — ${tokPerSec.toFixed(1)} tok/s (${tokenCount} tokens in ${(decodeMs/1000).toFixed(1)}s)`);
+      resultEl.textContent = JSON.stringify(result, null, 2);
+      // Keep the engine around in case someone wants to run more prompts.
+      window.__engine = engine;
+      return result;
+    };
+
+    // Signal readiness to any harness waiting on window.__ready.
+    window.__ready = true;
+    log("Ready. Call window.__runBench(modelId, prompt, maxTokens) from devtools or Playwright.");
+  </script>
+</body>
+</html>

@@ -64,6 +64,46 @@ pub fn encodeWithWorkspace(
     return result;
 }
 
+/// Encode QJL sign bits directly into a pre-allocated output buffer.
+/// `out` must have length >= qjlBytesNeeded(dim).
+/// Returns the number of bytes written.
+pub fn encodeIntoWithWorkspace(
+    out: []u8,
+    residual: []const f32,
+    rot_op: *const rotation.RotationOperator,
+    workspace: *Workspace,
+) error{InvalidDimension}!usize {
+    const d = residual.len;
+    if (d == 0) return QjlError.InvalidDimension;
+
+    rot_op.matVecMul(residual, workspace.projected);
+
+    const bits_bytes = (d + 7) / 8;
+    @memset(out[0..bits_bytes], 0);
+
+    var i: usize = 0;
+    while (i + 8 <= d) : (i += 8) {
+        var byte: u8 = 0;
+        inline for (0..8) |bit| {
+            if (workspace.projected[i + bit] > 0) {
+                byte |= @as(u8, 1) << bit;
+            }
+        }
+        out[i / 8] = byte;
+    }
+    while (i < d) : (i += 1) {
+        if (workspace.projected[i] > 0) {
+            out[i / 8] |= @as(u8, 1) << @intCast(i % 8);
+        }
+    }
+    return bits_bytes;
+}
+
+/// Returns the number of bytes needed for QJL encoding of a given dimension.
+pub fn qjlBytesNeeded(dim: usize) usize {
+    return (dim + 7) / 8;
+}
+
 pub fn decodeInto(
     out: []f32,
     qjl_bits: []const u8,

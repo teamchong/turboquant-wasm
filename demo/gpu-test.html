@@ -1,0 +1,794 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>GPU Shader Tests</title>
+<style>
+  body { font-family: monospace; margin: 20px; background: #111; color: #eee; }
+  .pass { color: #4f4; } .fail { color: #f44; } .info { color: #88f; }
+  pre { margin: 2px 0; }
+  #log { white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<h2>GPU Shader Tests — Custom Inference Engine</h2>
+<div id="log"></div>
+<script type="module">
+const log = document.getElementById("log");
+let passed = 0, failed = 0;
+
+function out(cls, msg) {
+  const el = document.createElement("pre");
+  el.className = cls;
+  el.textContent = msg;
+  log.appendChild(el);
+}
+function info(msg) { out("info", msg); }
+function pass(name) { out("pass", "PASS  " + name); passed++; }
+function fail(name, detail) { out("fail", "FAIL  " + name + ": " + detail); failed++; }
+function close(a, b, eps = 1e-4) { return Math.abs(a - b) < eps; }
+
+// ===== WebGPU Setup =====
+if (!navigator.gpu) { fail("WebGPU", "Not supported"); throw "no webgpu"; }
+const adapter = await navigator.gpu.requestAdapter();
+if (!adapter) { fail("Adapter", "No adapter"); throw "no adapter"; }
+
+const hasF16 = adapter.features.has("shader-f16");
+const device = await adapter.requestDevice({
+  requiredFeatures: hasF16 ? ["shader-f16"] : [],
+});
+info("Device: " + (hasF16 ? "shader-f16 enabled" : "NO shader-f16 — Q4_K tests will skip"));
+
+// ===== Helpers =====
+// ALL buffers get STORAGE | COPY_SRC | COPY_DST so they can be read back
+const ALL_USAGE = GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST;
+function mkBuf(data, extraUsage = 0) {
+  const buf = device.createBuffer({ size: data.byteLength, usage: ALL_USAGE | extraUsage, mappedAtCreation: true });
+  new Uint8Array(buf.getMappedRange()).set(new Uint8Array(data.buffer, data.byteOffset, data.byteLength));
+  buf.unmap();
+  return buf;
+}
+function mkEmpty(bytes) {
+  return device.createBuffer({ size: bytes, usage: ALL_USAGE });
+}
+function mkUniform(data) {
+  return mkBuf(data, GPUBufferUsage.UNIFORM);
+}
+async function readBuf(buf, size) {
+  const staging = device.createBuffer({ size, usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST });
+  const enc = device.createCommandEncoder();
+  enc.copyBufferToBuffer(buf, 0, staging, 0, size);
+  device.queue.submit([enc.finish()]);
+  await staging.mapAsync(GPUMapMode.READ);
+  const result = new Float32Array(staging.getMappedRange().slice(0));
+  staging.unmap(); staging.destroy();
+  return result;
+}
+function mkPipeline(code, entry) {
+  device.pushErrorScope("validation");
+  const pl = device.createComputePipeline({
+    layout: "auto",
+    compute: { module: device.createShaderModule({ code }), entryPoint: entry },
+  });
+  device.popErrorScope().then(err => { if (err) fail("Pipeline " + entry, err.message); });
+  return pl;
+}
+async function dispatchAndWait(pipeline, entries, wgX, wgY = 1) {
+  device.pushErrorScope("validation");
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries }));
+  pass.dispatchWorkgroups(wgX, wgY);
+  pass.end();
+  device.queue.submit([enc.finish()]);
+  const err = await device.popErrorScope();
+  if (err) throw new Error("GPU validation: " + err.message);
+}
+// Keep sync version for backward compat
+function dispatch(pipeline, entries, wgX, wgY = 1) {
+  const enc = device.createCommandEncoder();
+  const pass = enc.beginComputePass();
+  pass.setPipeline(pipeline);
+  pass.setBindGroup(0, device.createBindGroup({ layout: pipeline.getBindGroupLayout(0), entries }));
+  pass.dispatchWorkgroups(wgX, wgY);
+  pass.end();
+  device.queue.submit([enc.finish()]);
+}
+
+// Load shaders
+const shaders = {};
+for (const name of ["rms-norm", "gelu", "rope", "softmax", "softcap", "residual-add", "get-rows-q4k", "matmul-q4k", "matmul-q6k", "batch-matmul-q4k", "batch-matmul-q6k", "batch-tq-attention", "batch-softmax", "batch-tq-weighted-sum", "tq-encode", "tq-attention", "tq-weighted-sum", "tq-rotate", "tq-inverse-rotate"]) {
+  try {
+    const resp = await fetch("/src/draw/shaders/" + name + ".wgsl");
+    shaders[name] = await resp.text();
+  } catch (e) { info("Skip shader " + name + ": " + e.message); }
+}
+
+// ===== Test 1: RMSNorm =====
+info("\n--- RMSNorm ---");
+try {
+  const pl = mkPipeline(shaders["rms-norm"], "rms_norm");
+  // input = [1, 2, 3, 4], weight = [0, 0, 0, 0] (Gemma: output = x * rms * (1+w))
+  const input = mkBuf(new Float32Array([1, 2, 3, 4]));
+  const weight = mkBuf(new Float32Array([0, 0, 0, 0])); // (1+0)=1
+  const output = mkEmpty(16);
+  const params = new ArrayBuffer(16);
+  new Uint32Array(params)[0] = 4; // n
+  new Float32Array(params, 4)[0] = 1e-6; // eps
+  await dispatchAndWait(pl, [
+    { binding: 0, resource: { buffer: mkUniform(new Uint32Array(params)) } },
+    { binding: 1, resource: { buffer: input } },
+    { binding: 2, resource: { buffer: weight } },
+    { binding: 3, resource: { buffer: output } },
+  ], 1);
+  const r = await readBuf(output, 16);
+  // rms = 1/sqrt(mean([1,4,9,16]) + 1e-6) = 1/sqrt(7.5) = 0.3651
+  const expected_rms = 1 / Math.sqrt((1+4+9+16)/4 + 1e-6);
+  const ok = close(r[0], 1*expected_rms) && close(r[1], 2*expected_rms) && close(r[2], 3*expected_rms) && close(r[3], 4*expected_rms);
+  ok ? pass("RMSNorm basic") : fail("RMSNorm basic", `got [${r[0].toFixed(4)}, ${r[1].toFixed(4)}, ${r[2].toFixed(4)}, ${r[3].toFixed(4)}]`);
+} catch (e) { fail("RMSNorm", e.message); }
+
+// ===== Test 2: GELU+gate =====
+info("\n--- GELU Gate ---");
+try {
+  const pl = mkPipeline(shaders["gelu"], "gelu_gate");
+  const gate = mkBuf(new Float32Array([0, 1, -1, 2]));
+  const up = mkBuf(new Float32Array([1, 1, 1, 1]));
+  const output = mkEmpty(16);
+  dispatch(pl, [
+    { binding: 0, resource: { buffer: mkUniform(new Uint32Array([4, 0, 0, 0])) } },
+    { binding: 1, resource: { buffer: gate } },
+    { binding: 2, resource: { buffer: up } },
+    { binding: 3, resource: { buffer: output } },
+  ], 1);
+  const r = await readBuf(output, 16);
+  // gelu(0)*1 = 0, gelu(1)*1 ≈ 0.8412, gelu(-1)*1 ≈ -0.1588, gelu(2)*1 ≈ 1.9545
+  const ok = close(r[0], 0, 0.01) && close(r[1], 0.8412, 0.01) && close(r[2], -0.1588, 0.01) && close(r[3], 1.9545, 0.01);
+  ok ? pass("GELU gate") : fail("GELU gate", `got [${r.slice(0,4).map(v=>v.toFixed(4)).join(", ")}]`);
+} catch (e) { fail("GELU gate", e.message); }
+
+// ===== Test 3: Softmax =====
+info("\n--- Softmax ---");
+try {
+  const pl = mkPipeline(shaders["softmax"], "softmax");
+  const data = mkBuf(new Float32Array([1, 2, 3, 4]));
+  dispatch(pl, [
+    { binding: 0, resource: { buffer: mkUniform(new Uint32Array([4, 0, 0, 0])) } },
+    { binding: 1, resource: { buffer: data } },
+  ], 1);
+  const r = await readBuf(data, 16);
+  const sum = r[0] + r[1] + r[2] + r[3];
+  const ok = close(sum, 1.0) && r[3] > r[2] && r[2] > r[1] && r[1] > r[0];
+  ok ? pass("Softmax sums to 1, ordered") : fail("Softmax", `sum=${sum.toFixed(4)} vals=[${r.slice(0,4).map(v=>v.toFixed(4)).join(",")}]`);
+} catch (e) { fail("Softmax", e.message); }
+
+// ===== Test 4: Softmax with sliding window =====
+info("\n--- Softmax sliding window ---");
+try {
+  const pl = mkPipeline(shaders["softmax"], "softmax");
+  const data = mkBuf(new Float32Array([10, 10, 1, 2]));
+  dispatch(pl, [
+    { binding: 0, resource: { buffer: mkUniform(new Uint32Array([4, 2, 0, 0])) } }, // window_start=2
+    { binding: 1, resource: { buffer: data } },
+  ], 1);
+  const r = await readBuf(data, 16);
+  // positions 0,1 should be ~0 (masked), positions 2,3 should sum to ~1
+  const ok = r[0] < 1e-6 && r[1] < 1e-6 && close(r[2] + r[3], 1.0);
+  ok ? pass("Softmax sliding window masks early positions") : fail("Softmax window", `[${r.slice(0,4).map(v=>v.toFixed(4)).join(",")}]`);
+} catch (e) { fail("Softmax window", e.message); }
+
+// ===== Test 5: Residual Add =====
+info("\n--- Residual Add ---");
+try {
+  const pl = mkPipeline(shaders["residual-add"], "residual_add");
+  const a = mkBuf(new Float32Array([1, 2, 3, 4]));
+  const b = mkBuf(new Float32Array([10, 20, 30, 40]));
+  const output = mkEmpty(16);
+  dispatch(pl, [
+    { binding: 0, resource: { buffer: mkUniform(new Uint32Array([4, 0, 0, 0])) } },
+    { binding: 1, resource: { buffer: a } },
+    { binding: 2, resource: { buffer: b } },
+    { binding: 3, resource: { buffer: output } },
+  ], 1);
+  const r = await readBuf(output, 16);
+  const ok = close(r[0],11) && close(r[1],22) && close(r[2],33) && close(r[3],44);
+  ok ? pass("Residual add") : fail("Residual add", `got [${r.slice(0,4).join(",")}]`);
+} catch (e) { fail("Residual add", e.message); }
+
+// ===== Test 6: Softcap =====
+info("\n--- Softcap ---");
+try {
+  const pl = mkPipeline(shaders["softcap"], "softcap");
+  const p = new ArrayBuffer(16);
+  new Uint32Array(p)[0] = 4;
+  new Float32Array(p, 4)[0] = 30.0;
+  const data = mkBuf(new Float32Array([0, 30, -30, 100]));
+  dispatch(pl, [
+    { binding: 0, resource: { buffer: mkUniform(new Uint32Array(p)) } },
+    { binding: 1, resource: { buffer: data } },
+  ], 1);
+  const r = await readBuf(data, 16);
+  // softcap(0, 30) = 0, softcap(30, 30) = 30*tanh(1) ≈ 22.85, softcap(100, 30) ≈ 30
+  const ok = close(r[0], 0, 0.01) && close(r[1], 30*Math.tanh(1), 0.1) && close(r[2], -30*Math.tanh(1), 0.1) && close(r[3], 30, 0.5);
+  ok ? pass("Softcap") : fail("Softcap", `got [${r.slice(0,4).map(v=>v.toFixed(4)).join(",")}]`);
+} catch (e) { fail("Softcap", e.message); }
+
+// ===== Test 7: RoPE =====
+info("\n--- RoPE ---");
+try {
+  const pl = mkPipeline(shaders["rope"], "rope");
+  // 1 head, dim=4, position=1, theta=10000, rope_dims=4
+  const data = mkBuf(new Float32Array([1, 0, 1, 0]));
+  const p = new ArrayBuffer(32);
+  const pu = new Uint32Array(p);
+  const pf = new Float32Array(p);
+  pu[0] = 4; pu[1] = 1; pf[2] = 10000.0; pu[3] = 4; pu[4] = 1; pu[5] = 1;
+  dispatch(pl, [
+    { binding: 0, resource: { buffer: mkUniform(new Uint32Array(p)) } },
+    { binding: 1, resource: { buffer: data } },
+  ], 1);
+  const r = await readBuf(data, 16);
+  // Pair 0: freq = 1/10000^(0/4) = 1.0, angle = 1*1 = 1 rad
+  // x0=1, x1=0 → (cos(1), sin(1)) ≈ (0.5403, 0.8415)
+  // Pair 1: freq = 1/10000^(2/4) = 0.01, angle = 0.01 rad
+  // x0=1, x1=0 → (cos(0.01), sin(0.01)) ≈ (0.99995, 0.01)
+  const ok = close(r[0], Math.cos(1), 0.001) && close(r[1], Math.sin(1), 0.001);
+  ok ? pass("RoPE position encoding") : fail("RoPE", `pair0=[${r[0].toFixed(4)}, ${r[1].toFixed(4)}] expected [${Math.cos(1).toFixed(4)}, ${Math.sin(1).toFixed(4)}]`);
+} catch (e) { fail("RoPE", e.message); }
+
+// ===== Test 8: TQ Encode + Attention roundtrip =====
+info("\n--- TQ Encode + Attention ---");
+try {
+  const dim = 32; // small dim for test
+  const polarWords = Math.ceil((dim/2) * 7 / 32);
+  const qjlWords = dim / 32;
+
+  // Generate a simple rotation matrix (identity-like for small dim)
+  const rotMat = new Float32Array(dim * dim);
+  for (let i = 0; i < dim; i++) rotMat[i * dim + i] = 1.0; // identity
+
+  const rotBuf = mkBuf(rotMat);
+
+  // Create a known K vector
+  const kVec = new Float32Array(dim);
+  for (let i = 0; i < dim; i++) kVec[i] = (i + 1) / dim; // [1/32, 2/32, ..., 1.0]
+  const kBuf = mkBuf(kVec);
+
+  // Encode K
+  const kPolar = mkEmpty(polarWords * 4);
+  const kQjl = mkEmpty(qjlWords * 4);
+  const kMaxR = mkEmpty(4);
+  const kGamma = mkEmpty(4);
+
+  const encPl = mkPipeline(shaders["tq-encode"], "encode");
+  const encParams = mkUniform(new Uint32Array([dim, 1, polarWords, qjlWords, 0, 0, 0, 0]));
+  dispatch(encPl, [
+    { binding: 0, resource: { buffer: encParams } }, { binding: 1, resource: { buffer: kBuf } },
+    { binding: 2, resource: { buffer: rotBuf } }, { binding: 3, resource: { buffer: kPolar } },
+    { binding: 4, resource: { buffer: kQjl } }, { binding: 5, resource: { buffer: kMaxR } },
+    { binding: 6, resource: { buffer: kGamma } },
+  ], 1);
+
+  // Query = same as K → dot product should be ≈ ||K||²
+  const qBuf = mkBuf(kVec);
+  const rotPl = mkPipeline(shaders["tq-rotate"], "rotate");
+  const rotQ = mkEmpty(dim * 4);
+  dispatch(rotPl, [
+    { binding: 0, resource: { buffer: mkUniform(new Uint32Array([dim, 0, 0, 0])) } },
+    { binding: 1, resource: { buffer: qBuf } }, { binding: 2, resource: { buffer: rotBuf } },
+    { binding: 3, resource: { buffer: rotQ } },
+  ], 1);
+
+  const scoreBuf = mkEmpty(4);
+  const attnPl = mkPipeline(shaders["tq-attention"], "compute_scores");
+  dispatch(attnPl, [
+    { binding: 0, resource: { buffer: mkUniform(new Uint32Array([dim, 1, polarWords, qjlWords])) } },
+    { binding: 1, resource: { buffer: rotQ } },
+    { binding: 2, resource: { buffer: kPolar } }, { binding: 3, resource: { buffer: kQjl } },
+    { binding: 4, resource: { buffer: kMaxR } }, { binding: 5, resource: { buffer: kGamma } },
+    { binding: 6, resource: { buffer: scoreBuf } },
+  ], 1);
+
+  const score = await readBuf(scoreBuf, 4);
+  const expectedDot = kVec.reduce((s, v) => s + v * v, 0); // ||K||²
+  // TQ is lossy (~3.3 bits/dim), so expect ~10-20% error
+  const relError = Math.abs(score[0] - expectedDot) / expectedDot;
+  relError < 0.3 ? pass("TQ encode+attention (relErr=" + (relError*100).toFixed(1) + "%)") :
+    fail("TQ encode+attention", `score=${score[0].toFixed(4)} expected≈${expectedDot.toFixed(4)} relErr=${(relError*100).toFixed(1)}%`);
+} catch (e) { fail("TQ encode+attention", e.message); }
+
+// ===== Test 9: Q4_K dequant (get-rows) =====
+if (hasF16) {
+  info("\n--- Q4_K Get Rows ---");
+  try {
+    const pl = mkPipeline(shaders["get-rows-q4k"], "get_rows_q4k");
+    // Create a minimal Q4_K block (256 weights, 144 bytes = 36 u32)
+    // All zeros = all weights decode to: (0 * d * scale) - (dmin * min) = -dmin*min
+    // Set d=1.0 (f16), dmin=0.0 (f16), all scales=0, all qs=0
+    // → all weights should be 0
+    const block = new Uint32Array(36);
+    // d=f16(1.0)=0x3C00, dmin=f16(0.0)=0x0000
+    // Pack as two f16 in first u32: low=d, high=dmin
+    const dView = new DataView(block.buffer);
+    dView.setUint16(0, 0x3C00, true);  // d = 1.0 in f16
+    dView.setUint16(2, 0x0000, true);  // dmin = 0.0 in f16
+    // scales all zero, qs all zero → weight = 0 * 1.0 * 0 - 0.0 * 0 = 0
+
+    const wBuf = mkBuf(new Uint8Array(block.buffer));
+    const output = mkEmpty(256 * 4);
+    dispatch(pl, [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array([0, 256, 0, 0])) } },
+      { binding: 1, resource: { buffer: wBuf } },
+      { binding: 2, resource: { buffer: output } },
+    ], 1);
+    const r = await readBuf(output, 256 * 4);
+    const allZero = r.every(v => close(v, 0, 0.01));
+    allZero ? pass("Q4_K get_rows (all-zero block)") : fail("Q4_K get_rows", `first vals: [${r.slice(0,8).map(v=>v.toFixed(4)).join(",")}]`);
+  } catch (e) { fail("Q4_K get_rows", e.message); }
+
+  // Test with non-trivial values
+  info("\n--- Q4_K Get Rows (non-zero) ---");
+  try {
+    const pl = mkPipeline(shaders["get-rows-q4k"], "get_rows_q4k");
+    const block = new Uint32Array(36);
+    const dView = new DataView(block.buffer);
+    dView.setUint16(0, 0x3C00, true);  // d = 1.0 in f16
+    dView.setUint16(2, 0x0000, true);  // dmin = 0.0 in f16
+    // Set scale[0]=1 (6-bit in packed format), all others 0
+    // scales are 12 bytes = 3 u32, starting at byte 4
+    block[1] = 1; // scales[0]: first sub-block scale=1, min=0
+    // Set qs: first 32 nibbles = all 0x5 (value 5)
+    // qs start at byte 16 = u32[4]
+    block[4] = 0x55555555; // 8 bytes of 0x55 = nibbles all 5
+    block[5] = 0x55555555;
+    block[6] = 0x55555555;
+    block[7] = 0x55555555;
+
+    const wBuf = mkBuf(new Uint8Array(block.buffer));
+    const output = mkEmpty(256 * 4);
+    dispatch(pl, [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array([0, 256, 0, 0])) } },
+      { binding: 1, resource: { buffer: wBuf } },
+      { binding: 2, resource: { buffer: output } },
+    ], 1);
+    const r = await readBuf(output, 256 * 4);
+    // Sub-block 0 (cols 0-31, low nibble): d=1.0, scale=1 → val = 5 * 1.0 * 1 - 0 = 5.0
+    const firstOk = close(r[0], 5.0, 0.1);
+    firstOk ? pass("Q4_K get_rows (value=5, scale=1)") : fail("Q4_K get_rows non-zero", `r[0]=${r[0].toFixed(4)} expected 5.0, first 8: [${r.slice(0,8).map(v=>v.toFixed(4)).join(",")}]`);
+  } catch (e) { fail("Q4_K get_rows non-zero", e.message); }
+} else {
+  info("\n--- Q4_K tests SKIPPED (no shader-f16) ---");
+}
+
+// ===== Test 10: Q4_K matmul (full dot product + reduction) =====
+if (hasF16) {
+  info("\n--- Q4_K MatMul ---");
+  try {
+    const pl = mkPipeline(shaders["matmul-q4k"], "matmul_q4k");
+    // 2 rows × 256 cols = 2 Q4_K blocks (1 block per row, 256 weights/block)
+    // Each block: d=1.0f16, dmin=0.0f16, scale[0]=1, all qs nibbles=5
+    // With input=all 1.0 → output[row] = 32 * 5.0 = 160.0
+    const nRows = 2, nCols = 256;
+    const bytesPerBlock = 144;
+    const blocks = new Uint8Array(nRows * bytesPerBlock);
+    for (let row = 0; row < nRows; row++) {
+      const dv = new DataView(blocks.buffer, row * bytesPerBlock);
+      dv.setUint16(0, 0x3C00, true);  // d = 1.0 f16
+      dv.setUint16(2, 0x0000, true);  // dmin = 0.0 f16
+      // scales: byte 4-15 (12 bytes = 3 u32s). Set byte 4 = 1 (sub-block 0 scale=1)
+      blocks[row * bytesPerBlock + 4] = 1;
+      // qs: bytes 16-143 (128 bytes). All 0x55 → low nibble=5, high nibble=5
+      for (let j = 16; j < bytesPerBlock; j++) blocks[row * bytesPerBlock + j] = 0x55;
+    }
+
+    const inputVec = new Float32Array(nCols);
+    inputVec.fill(1.0);
+
+    const wBuf = mkBuf(blocks);
+    const iBuf = mkBuf(inputVec);
+    const oBuf = mkEmpty(nRows * 4);
+
+    await dispatchAndWait(pl, [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array([nRows, nCols, 0, 0])) } },
+      { binding: 1, resource: { buffer: wBuf } },
+      { binding: 2, resource: { buffer: iBuf } },
+      { binding: 3, resource: { buffer: oBuf } },
+    ], nRows);
+
+    const r = await readBuf(oBuf, nRows * 4);
+    // Sub-block 0 (32 cols, low nibble=5): 32 * 5.0 * 1.0 * 1.0 = 160.0
+    // Sub-block 1 (32 cols, high nibble=5, scale=0): 0.0
+    // Other sub-blocks: scale=0 → 0.0
+    const ok = close(r[0], 160.0, 1.0) && close(r[1], 160.0, 1.0);
+    ok ? pass(`Q4_K matmul (2 rows, expected 160, got [${r[0].toFixed(1)}, ${r[1].toFixed(1)}])`) :
+      fail("Q4_K matmul", `got [${r[0].toFixed(4)}, ${r[1].toFixed(4)}] expected [160, 160]`);
+  } catch (e) { fail("Q4_K matmul", e.message); }
+
+  // Test with varying input
+  info("\n--- Q4_K MatMul (varying input) ---");
+  try {
+    const pl = mkPipeline(shaders["matmul-q4k"], "matmul_q4k");
+    const nRows = 1, nCols = 256;
+    const bytesPerBlock = 144;
+    const blocks = new Uint8Array(bytesPerBlock);
+    const dv = new DataView(blocks.buffer);
+    dv.setUint16(0, 0x3C00, true);  // d = 1.0 f16
+    dv.setUint16(2, 0x0000, true);  // dmin = 0.0 f16
+    blocks[4] = 1; // scale[0]=1
+    for (let j = 16; j < bytesPerBlock; j++) blocks[j] = 0x55; // all nibbles=5
+
+    // Input: [1, 2, 3, ..., 256]
+    const inputVec = new Float32Array(nCols);
+    for (let i = 0; i < nCols; i++) inputVec[i] = i + 1;
+
+    const wBuf = mkBuf(blocks);
+    const iBuf = mkBuf(inputVec);
+    const oBuf = mkEmpty(4);
+
+    await dispatchAndWait(pl, [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array([nRows, nCols, 0, 0])) } },
+      { binding: 1, resource: { buffer: wBuf } },
+      { binding: 2, resource: { buffer: iBuf } },
+      { binding: 3, resource: { buffer: oBuf } },
+    ], nRows);
+
+    const r = await readBuf(oBuf, 4);
+    // Sub-block 0 (cols 0-31, weight=5): sum = 5 * (1+2+...+32) = 5 * 528 = 2640
+    const expected = 5.0 * (32 * 33 / 2);
+    const ok = close(r[0], expected, 5.0);
+    ok ? pass(`Q4_K matmul varying input (expected ${expected}, got ${r[0].toFixed(1)})`) :
+      fail("Q4_K matmul varying", `got ${r[0].toFixed(4)} expected ${expected}`);
+  } catch (e) { fail("Q4_K matmul varying", e.message); }
+} else {
+  info("\n--- Q4_K matmul SKIPPED (no shader-f16) ---");
+}
+
+// ===== Test 11: TQ Weighted Sum (full pipeline) =====
+info("\n--- TQ Weighted Sum ---");
+try {
+  const dim = 32;
+  const polarWords = Math.ceil((dim/2) * 7 / 32);
+  const qjlWords = dim / 32;
+  const numPos = 2;
+
+  // Identity rotation matrix
+  const rotMat = new Float32Array(dim * dim);
+  for (let i = 0; i < dim; i++) rotMat[i * dim + i] = 1.0;
+  const rotBuf = mkBuf(rotMat);
+
+  // Encode 2 V vectors
+  const v1 = new Float32Array(dim), v2 = new Float32Array(dim);
+  for (let i = 0; i < dim; i++) { v1[i] = 1.0; v2[i] = 3.0; }
+
+  const vPolar = mkEmpty(numPos * polarWords * 4);
+  const vQjl = mkEmpty(numPos * qjlWords * 4);
+  const vMaxR = mkEmpty(numPos * 4);
+  const vGamma = mkEmpty(numPos * 4);
+
+  const encPl = mkPipeline(shaders["tq-encode"], "encode");
+  // Encode v1 at position 0
+  dispatch(encPl, [
+    { binding: 0, resource: { buffer: mkUniform(new Uint32Array([dim, 1, polarWords, qjlWords, 0, 0, 0, 0])) } },
+    { binding: 1, resource: { buffer: mkBuf(v1) } }, { binding: 2, resource: { buffer: rotBuf } },
+    { binding: 3, resource: { buffer: vPolar } }, { binding: 4, resource: { buffer: vQjl } },
+    { binding: 5, resource: { buffer: vMaxR } }, { binding: 6, resource: { buffer: vGamma } },
+  ], 1);
+  // Encode v2 at position 1
+  dispatch(encPl, [
+    { binding: 0, resource: { buffer: mkUniform(new Uint32Array([dim, 1, polarWords, qjlWords, 1, 0, 0, 0])) } },
+    { binding: 1, resource: { buffer: mkBuf(v2) } }, { binding: 2, resource: { buffer: rotBuf } },
+    { binding: 3, resource: { buffer: vPolar } }, { binding: 4, resource: { buffer: vQjl } },
+    { binding: 5, resource: { buffer: vMaxR } }, { binding: 6, resource: { buffer: vGamma } },
+  ], 1);
+
+  // Weights: equal (0.5, 0.5) → output ≈ average of v1 and v2 = 2.0 per dim
+  const weightsBuf = mkBuf(new Float32Array([0.5, 0.5]));
+  const outBuf = mkEmpty(dim * 4);
+
+  const wsPl = mkPipeline(shaders["tq-weighted-sum"], "weighted_sum");
+  await dispatchAndWait(wsPl, [
+    { binding: 0, resource: { buffer: mkUniform(new Uint32Array([dim, numPos, polarWords, qjlWords])) } },
+    { binding: 1, resource: { buffer: weightsBuf } },
+    { binding: 2, resource: { buffer: vPolar } }, { binding: 3, resource: { buffer: vQjl } },
+    { binding: 4, resource: { buffer: vMaxR } }, { binding: 5, resource: { buffer: vGamma } },
+    { binding: 6, resource: { buffer: rotBuf } },
+    { binding: 7, resource: { buffer: outBuf } },
+  ], 1);
+
+  // Apply inverse rotation (identity in this case, but test the pipeline)
+  const finalBuf = mkEmpty(dim * 4);
+  const irPl = mkPipeline(shaders["tq-inverse-rotate"], "inverse_rotate");
+  await dispatchAndWait(irPl, [
+    { binding: 0, resource: { buffer: mkUniform(new Uint32Array([dim, 0, 0, 0])) } },
+    { binding: 1, resource: { buffer: outBuf } },
+    { binding: 2, resource: { buffer: rotBuf } },
+    { binding: 3, resource: { buffer: finalBuf } },
+  ], 1);
+
+  const r = await readBuf(finalBuf, dim * 4);
+  // Expected: ~2.0 per dim (average of 1.0 and 3.0), TQ lossy so allow 30% error
+  const avgVal = r.reduce((s, v) => s + v, 0) / dim;
+  const relErr = Math.abs(avgVal - 2.0) / 2.0;
+  relErr < 0.3 ? pass(`TQ weighted sum + inverse_rotate (avg=${avgVal.toFixed(3)}, relErr=${(relErr*100).toFixed(1)}%)`) :
+    fail("TQ weighted sum", `avg=${avgVal.toFixed(4)} expected≈2.0 relErr=${(relErr*100).toFixed(1)}%`);
+} catch (e) { fail("TQ weighted sum", e.message); }
+
+// ===== Test 12: Q6_K matmul =====
+if (hasF16) {
+  info("\n--- Q6_K MatMul ---");
+  try {
+    const pl = mkPipeline(shaders["matmul-q6k"], "matmul_q6k");
+    // 1 row × 256 cols = 1 Q6_K block (210 bytes)
+    // Layout: ql[128] + qh[64] + scales[16] + d[2] = 210 bytes
+    const nRows = 1, nCols = 256;
+    const blockBytes = new Uint8Array(212); // pad to multiple of 4
+    // Set d = 1.0 (f16) at byte 208
+    new DataView(blockBytes.buffer).setUint16(208, 0x3C00, true);
+    // Set scales[0] = 1 (int8), rest = 0 → only sub-block 0 contributes
+    blockBytes[192] = 1;
+    // Set ql: first 16 quants, low nibble = 5 (value 5-32=-27? no, q6=5, weight=d*sc*(5-32)=-27)
+    // Actually, let's set q6=32 (zero-centered) → ql low nibble = 0, qh = 2 → q6 = 0|(2<<4) = 32 → weight = 0
+    // Better: set q6=33 → weight = d*sc*(33-32) = 1*1*1 = 1.0
+    // q6=33 = 0b100001 → ql_lo = 1 (0b0001), qh = 2 (0b10)
+    // For group 0 (y[0..31]): ql[l] & 0xF, qh[l] bits 0-1
+    // Set ql[0..15] low nibble = 1, qh[0..15] bits 0-1 = 2
+    for (let l = 0; l < 16; l++) {
+      blockBytes[l] = 0x01; // ql[l] low nibble = 1, high nibble = 0
+      blockBytes[128 + l] = 0x02; // qh[l] bits 0-1 = 2
+    }
+    // q6 = 1 | (2 << 4) = 33 → weight = 1.0 * 1 * (33 - 32) = 1.0 for first 16 cols
+    // Cols 16-31 (still group 0 but is=1): scales[1] = 0 → weight = 0
+    // Input = all 1.0
+    const inputVec = new Float32Array(nCols).fill(1.0);
+    const oBuf = mkEmpty(4);
+    await dispatchAndWait(pl, [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array([nRows, nCols, 0, 0])) } },
+      { binding: 1, resource: { buffer: mkBuf(blockBytes) } },
+      { binding: 2, resource: { buffer: mkBuf(inputVec) } },
+      { binding: 3, resource: { buffer: oBuf } },
+    ], nRows);
+    const r = await readBuf(oBuf, 4);
+    // Expected: 16 * 1.0 = 16.0 (16 weights with value 1.0, rest 0)
+    const ok = close(r[0], 16.0, 1.0);
+    ok ? pass(`Q6_K matmul (expected 16.0, got ${r[0].toFixed(2)})`) :
+      fail("Q6_K matmul", `got ${r[0].toFixed(4)} expected 16.0`);
+  } catch (e) { fail("Q6_K matmul", e.message); }
+} else {
+  info("\n--- Q6_K matmul SKIPPED (no shader-f16) ---");
+}
+
+// ===== Test 13: Multi-dispatch chain with verified values =====
+if (hasF16) {
+  info("\n--- Chain: RMSNorm → MatMul → Residual (exact values) ---");
+  try {
+    const hidden = 256;
+    const outDim = 4; // small output for exact verification
+    const plNorm = mkPipeline(shaders["rms-norm"], "rms_norm");
+    const plMat = mkPipeline(shaders["matmul-q4k"], "matmul_q4k");
+    const plRes = mkPipeline(shaders["residual-add"], "residual_add");
+
+    // Input: all 1.0 (256 elements)
+    const inputData = new Float32Array(hidden).fill(1.0);
+    const inputBuf = mkBuf(inputData);
+
+    // Step 1: RMSNorm with weight=0 → output = input * rms * (1+0)
+    // rms = 1/sqrt(mean(1²×256)/256 + 1e-6) = 1/sqrt(1) = 1.0
+    // So normed = input * 1.0 * 1.0 = all 1.0
+    const normed = mkEmpty(hidden * 4);
+    const normP = new ArrayBuffer(16);
+    new Uint32Array(normP)[0] = hidden;
+    new Float32Array(normP)[1] = 1e-6;
+    await dispatchAndWait(plNorm, [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array(normP)) } },
+      { binding: 1, resource: { buffer: inputBuf } },
+      { binding: 2, resource: { buffer: mkBuf(new Float32Array(hidden)) } },
+      { binding: 3, resource: { buffer: normed } },
+    ], 1);
+
+    // Verify RMSNorm output is ~1.0
+    const normedR = await readBuf(normed, hidden * 4);
+    const normOk = close(normedR[0], 1.0, 0.001) && close(normedR[127], 1.0, 0.001);
+    normOk ? pass("Chain step 1: RMSNorm(all 1s) → all 1.0") :
+      fail("Chain RMSNorm", `normed[0]=${normedR[0].toFixed(4)} normed[127]=${normedR[127].toFixed(4)}`);
+
+    // Step 2: MatMul — 4 rows × 256 cols, weights: d=1.0, dmin=0, scale[0]=1, nibbles=5
+    // Each row: sub-block 0 (32 cols) has weight=5, rest=0
+    // dot(weights[row], normed) = 5.0 * 32 * 1.0 = 160.0
+    const bytesPerBlock = 144;
+    const wBytes = new Uint8Array(outDim * bytesPerBlock);
+    for (let r = 0; r < outDim; r++) {
+      const base = r * bytesPerBlock;
+      const dv = new DataView(wBytes.buffer, base);
+      dv.setUint16(0, 0x3C00, true); // d = 1.0 f16
+      dv.setUint16(2, 0x0000, true); // dmin = 0.0 f16
+      wBytes[base + 4] = 1;          // scale[0] = 1
+      for (let j = 16; j < bytesPerBlock; j++) wBytes[base + j] = 0x55; // all nibbles = 5
+    }
+    const projected = mkEmpty(outDim * 4);
+    await dispatchAndWait(plMat, [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array([outDim, hidden, 0, 0])) } },
+      { binding: 1, resource: { buffer: mkBuf(wBytes) } },
+      { binding: 2, resource: { buffer: normed } },
+      { binding: 3, resource: { buffer: projected } },
+    ], outDim);
+
+    const projR = await readBuf(projected, outDim * 4);
+    const matOk = close(projR[0], 160.0, 1.0) && close(projR[3], 160.0, 1.0);
+    matOk ? pass(`Chain step 2: MatMul → [${projR[0].toFixed(1)}, ${projR[1].toFixed(1)}, ${projR[2].toFixed(1)}, ${projR[3].toFixed(1)}] (expected all 160)`) :
+      fail("Chain MatMul", `got [${projR.slice(0,4).map(v=>v.toFixed(2)).join(",")}] expected [160,160,160,160]`);
+
+    // Step 3: Residual — first 4 elements of input + projected (padded)
+    const padded = mkEmpty(hidden * 4);
+    const enc = device.createCommandEncoder();
+    enc.copyBufferToBuffer(projected, 0, padded, 0, outDim * 4);
+    device.queue.submit([enc.finish()]);
+    const finalBuf = mkEmpty(hidden * 4);
+    await dispatchAndWait(plRes, [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array([hidden, 0, 0, 0])) } },
+      { binding: 1, resource: { buffer: inputBuf } },
+      { binding: 2, resource: { buffer: padded } },
+      { binding: 3, resource: { buffer: finalBuf } },
+    ], 1);
+
+    const result = await readBuf(finalBuf, hidden * 4);
+    // First 4: 1.0 + 160.0 = 161.0. Rest: 1.0 + 0.0 = 1.0
+    const resOk = close(result[0], 161.0, 1.0) && close(result[3], 161.0, 1.0) && close(result[4], 1.0, 0.001) && close(result[255], 1.0, 0.001);
+    resOk ? pass(`Chain step 3: Residual → [${result[0].toFixed(1)}, ..., ${result[4].toFixed(1)}, ..., ${result[255].toFixed(1)}] (161, 161, ..., 1, ..., 1)`) :
+      fail("Chain Residual", `got [${result[0].toFixed(1)}, ${result[3].toFixed(1)}, ${result[4].toFixed(1)}, ${result[255].toFixed(1)}] expected [161, 161, 1, 1]`);
+  } catch (e) { fail("Chain dispatch", e.message); }
+} else {
+  info("\n--- Chain dispatch SKIPPED (no shader-f16) ---");
+}
+
+// ===== Test 15: GGUF Parser (WASM) =====
+info("\n--- GGUF Parser ---");
+try {
+  const resp = await fetch("/gguf-parser.wasm");
+  if (!resp.ok) throw new Error("gguf-parser.wasm not found at /gguf-parser.wasm — build it first");
+  const bytes = await resp.arrayBuffer();
+  const { instance } = await WebAssembly.instantiate(bytes, {});
+  const exports = instance.exports;
+
+  // Create a minimal valid GGUF v3 header (no tensors, no metadata)
+  const header = new ArrayBuffer(24);
+  const hv = new DataView(header);
+  hv.setUint32(0, 0x46554747, true);  // magic "GGUF"
+  hv.setUint32(4, 3, true);           // version 3
+  hv.setBigUint64(8, 0n, true);       // tensor_count = 0
+  hv.setBigUint64(16, 0n, true);      // kv_count = 0
+
+  const mem = exports.memory;
+  const ptr = exports.gguf_alloc(24);
+  new Uint8Array(mem.buffer, ptr, 24).set(new Uint8Array(header));
+  const result = exports.gguf_parse(ptr, 24);
+  const ok = result === 0;
+  ok ? pass("GGUF parser (minimal header)") : fail("GGUF parser", "returned " + result);
+  exports.gguf_free();
+  exports.gguf_dealloc(ptr, 24);
+} catch (e) { fail("GGUF parser", e.message); }
+
+// ===== Test: Batch Q4_K MatMul =====
+if (hasF16) {
+  info("\n--- Batch Q4_K MatMul (3 inputs) ---");
+  try {
+    const pl = mkPipeline(shaders["batch-matmul-q4k"], "batch_matmul_q4k");
+    const nRows = 2, nCols = 256, nBatch = 3;
+    const bytesPerBlock = 144;
+    const wBytes = new Uint8Array(nRows * bytesPerBlock);
+    for (let r = 0; r < nRows; r++) {
+      const base = r * bytesPerBlock;
+      new DataView(wBytes.buffer, base).setUint16(0, 0x3C00, true);
+      new DataView(wBytes.buffer, base).setUint16(2, 0x0000, true);
+      wBytes[base + 4] = 1;
+      for (let j = 16; j < bytesPerBlock; j++) wBytes[base + j] = 0x55;
+    }
+    // 3 input vectors: all 1s, all 2s, all 3s
+    const inputVec = new Float32Array(nBatch * nCols);
+    for (let b = 0; b < nBatch; b++)
+      for (let i = 0; i < nCols; i++) inputVec[b * nCols + i] = b + 1;
+    const oBuf = mkEmpty(nBatch * nRows * 4);
+    await dispatchAndWait(pl, [
+      { binding: 0, resource: { buffer: mkUniform(new Uint32Array([nRows, nCols, nBatch, 0])) } },
+      { binding: 1, resource: { buffer: mkBuf(wBytes) } },
+      { binding: 2, resource: { buffer: mkBuf(inputVec) } },
+      { binding: 3, resource: { buffer: oBuf } },
+    ], nRows, nBatch);
+    const r = await readBuf(oBuf, nBatch * nRows * 4);
+    // Each row: 32 weights of value 5, input=b+1 → dot = 32*5*(b+1) = 160*(b+1)
+    const ok = close(r[0], 160, 1) && close(r[1], 160, 1)   // batch 0
+            && close(r[2], 320, 1) && close(r[3], 320, 1)    // batch 1
+            && close(r[4], 480, 1) && close(r[5], 480, 1);   // batch 2
+    ok ? pass(`Batch Q4_K matmul (3 batches: [${r[0]}, ${r[2]}, ${r[4]}])`) :
+      fail("Batch Q4_K matmul", `got [${Array.from(r).map(v=>v.toFixed(0)).join(",")}]`);
+  } catch (e) { fail("Batch Q4_K matmul", e.message); }
+}
+
+// ===== Test 16: OPFS write + random read =====
+info("\n--- OPFS random access ---");
+try {
+  const root = await navigator.storage.getDirectory();
+  const filename = "_gpu_test_opfs.bin";
+
+  // Write known data: 4 chunks of 256 bytes each (1KB total)
+  const handle = await root.getFileHandle(filename, { create: true });
+  const writable = await handle.createWritable();
+  for (let chunk = 0; chunk < 4; chunk++) {
+    const data = new Uint8Array(256);
+    data.fill(chunk + 1); // chunk 0 = all 1s, chunk 1 = all 2s, etc.
+    await writable.write(data);
+  }
+  await writable.close();
+
+  // Read back the file
+  const file = await handle.getFile();
+  if (file.size !== 1024) throw new Error("OPFS file size wrong: " + file.size);
+
+  // Random access: read chunk 2 (bytes 512-767, should be all 3s)
+  const slice = file.slice(512, 768);
+  const buf = await slice.arrayBuffer();
+  const view = new Uint8Array(buf);
+  const allThrees = view.every(v => v === 3);
+
+  // Random access: read chunk 0 (bytes 0-255, should be all 1s)
+  const slice0 = file.slice(0, 256);
+  const buf0 = await slice0.arrayBuffer();
+  const view0 = new Uint8Array(buf0);
+  const allOnes = view0.every(v => v === 1);
+
+  // Cleanup
+  await root.removeEntry(filename);
+
+  (allThrees && allOnes)
+    ? pass("OPFS write + random read (4 chunks, verified 2 slices)")
+    : fail("OPFS random access", `chunk2_all3s=${allThrees} chunk0_all1s=${allOnes}`);
+} catch (e) { fail("OPFS random access", e.message); }
+
+// ===== Test 17: OPFS → GPU upload pipeline =====
+info("\n--- OPFS → GPU upload ---");
+try {
+  const root = await navigator.storage.getDirectory();
+  const filename = "_gpu_test_tensor.bin";
+
+  // Write a fake tensor: 64 f32 values [1.0, 2.0, 3.0, ..., 64.0]
+  const tensorData = new Float32Array(64);
+  for (let i = 0; i < 64; i++) tensorData[i] = i + 1;
+
+  const handle = await root.getFileHandle(filename, { create: true });
+  const writable = await handle.createWritable();
+  await writable.write(tensorData.buffer);
+  await writable.close();
+
+  const file = await handle.getFile();
+
+  // Simulate per-tensor upload: read from OPFS → GPU buffer
+  const offset = 32 * 4; // read elements 32-63 (second half)
+  const size = 32 * 4;
+  const slice = file.slice(offset, offset + size);
+  const buf = await slice.arrayBuffer();
+
+  const gpuBuf = device.createBuffer({
+    size, usage: ALL_USAGE, mappedAtCreation: true,
+  });
+  new Uint8Array(gpuBuf.getMappedRange()).set(new Uint8Array(buf));
+  gpuBuf.unmap();
+
+  // Read back from GPU and verify
+  const result = await readBuf(gpuBuf, size);
+  // Should be [33, 34, 35, ..., 64]
+  const ok = close(result[0], 33) && close(result[15], 48) && close(result[31], 64);
+
+  // Cleanup
+  await root.removeEntry(filename);
+
+  ok ? pass(`OPFS → GPU: read offset=${offset} got [${result[0]}, ..., ${result[31]}]`)
+     : fail("OPFS → GPU", `expected [33..64], got [${result[0]}, ${result[15]}, ${result[31]}]`);
+} catch (e) { fail("OPFS → GPU upload", e.message); }
+
+// ===== Summary =====
+info("\n===========================");
+info(`Results: ${passed} passed, ${failed} failed`);
+if (failed === 0) out("pass", "ALL TESTS PASSED");
+</script>
+</body>
+</html>

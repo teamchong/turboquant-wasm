@@ -1,0 +1,4 @@
+Utility library
+~~~~~~~~~~~~~~~
+This “library” is an internal collection of extensions on top of the C standard
+library, used by Graphviz but not specific to Graphviz.

@@ -1,6 +1,6 @@
 {
   "name": "turboquant-wasm",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "TurboQuant WASM SIMD vector compression — 3 bits/dim with fast dot product. Requires relaxed SIMD (Chrome 114+, Firefox 128+, Safari 18+, Node 20+)",
   "type": "module",
   "main": "dist/index.js",
@@ -22,8 +22,8 @@
     "node": ">=20"
   },
   "scripts": {
-    "build:zig": "mkdir -p dist && zig build-exe -target wasm32-freestanding -mcpu=generic+simd128+relaxed_simd -O ReleaseSmall src/wasm_exports.zig --name turboquant -fno-entry -rdynamic && mv turboquant.wasm dist/",
-    "build:opt": "wasm-opt -Oz --strip-producers --strip-target-features dist/turboquant.wasm -o dist/turboquant.wasm --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals --enable-relaxed-simd",
+    "build:zig": "mkdir -p dist && zig build-exe -target wasm32-freestanding -mcpu=generic+simd128+relaxed_simd -O ReleaseFast -fstrip src/wasm_exports.zig --name turboquant -fno-entry -rdynamic && mv turboquant.wasm dist/",
+    "build:opt": "wasm-opt -O3 --strip-producers --strip-target-features dist/turboquant.wasm -o dist/turboquant.wasm --enable-simd --enable-bulk-memory --enable-nontrapping-float-to-int --enable-sign-ext --enable-mutable-globals --enable-relaxed-simd",
     "build:embed": "node scripts/embed-wasm.mjs",
     "build:types": "bun x tsc --emitDeclarationOnly",
     "build:js": "bun build src/js/index.ts src/js/gpu-index.ts --outdir dist --target browser --format esm --minify --sourcemap=external && bun run build:types",

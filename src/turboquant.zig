@@ -69,7 +69,15 @@ pub const Engine = struct {
         e.* = undefined;
     }
 
-    pub fn encode(e: *Engine, allocator: std.mem.Allocator, x: []const f32) ![]u8 {
+    /// Returns the exact byte size of a compressed vector for this engine's dimension.
+    pub fn bytesPerVector(e: *const Engine) usize {
+        return format.HEADER_SIZE + polar.polarBytesNeeded(e.dim) + qjl.qjlBytesNeeded(e.dim);
+    }
+
+    /// Encode vector directly into pre-allocated output buffer. Zero allocations.
+    /// `out` must have length >= bytesPerVector().
+    /// Returns the number of bytes written (always == bytesPerVector()).
+    pub fn encodeInto(e: *Engine, x: []const f32, out: []u8) EncodeError!usize {
         const dim = e.dim;
         if (x.len != dim) return EncodeError.InvalidDimension;
 
@@ -82,42 +90,30 @@ pub const Engine = struct {
         }
         if (max_r == 0) max_r = 1.0;
 
-        const polar_encoded = try polar.encode(allocator, e.scratch_rotated, max_r);
-        errdefer allocator.free(polar_encoded);
+        const polar_out = out[format.HEADER_SIZE..];
+        const polar_written = polar.encodeInto(polar_out, e.scratch_rotated, max_r) catch
+            return EncodeError.InvalidDimension;
 
-        computeResidualFromPolar(polar_encoded, e.scratch_rotated, max_r, e.scratch_residual);
+        computeResidualFromPolar(polar_out[0..polar_written], e.scratch_rotated, max_r, e.scratch_residual);
 
         const gamma = math.norm(e.scratch_residual);
-        const qjl_encoded = try qjl.encodeWithWorkspace(allocator, e.scratch_residual, &e.rot_op, &e.qjl_workspace);
-        errdefer allocator.free(qjl_encoded);
+        const qjl_out = out[format.HEADER_SIZE + polar_written ..];
+        const qjl_written = qjl.encodeIntoWithWorkspace(qjl_out, e.scratch_residual, &e.rot_op, &e.qjl_workspace) catch
+            return EncodeError.InvalidDimension;
 
-        const polar_bytes = @as(u32, @intCast(polar_encoded.len));
-        const qjl_bytes = @as(u32, @intCast(qjl_encoded.len));
-        const total_size = format.HEADER_SIZE + polar_encoded.len + qjl_encoded.len;
-
-        const result = try allocator.alloc(u8, total_size);
-        errdefer allocator.free(result);
-
-        format.writeHeader(result, @intCast(dim), polar_bytes, qjl_bytes, max_r, gamma);
-        @memcpy(result[format.HEADER_SIZE..][0..polar_encoded.len], polar_encoded);
-        @memcpy(result[format.HEADER_SIZE + polar_encoded.len ..], qjl_encoded);
-        allocator.free(polar_encoded);
-        allocator.free(qjl_encoded);
-
-        const bpd = (total_size - format.HEADER_SIZE) * 8 / dim;
-        log.debug("encoded: dim={}, bytes={}, bits/dim={}", .{ dim, total_size, bpd });
-
-        return result;
+        format.writeHeader(out, @intCast(dim), @intCast(polar_written), @intCast(qjl_written), max_r, gamma);
+        return format.HEADER_SIZE + polar_written + qjl_written;
     }
 
-    pub fn decode(e: *Engine, allocator: std.mem.Allocator, compressed: []const u8) ![]f32 {
+    /// Decode compressed data into pre-allocated output buffer. Zero allocations.
+    /// `out` must have length >= dim.
+    pub fn decodeInto(e: *Engine, compressed: []const u8, out: []f32) DecodeError!void {
         const header = format.readHeader(compressed) catch |err| switch (err) {
             error.InvalidHeader => return DecodeError.InvalidHeader,
             error.OutOfMemory => return DecodeError.OutOfMemory,
             error.InvalidPayload => return DecodeError.InvalidPayload,
         };
-        const dim = e.dim;
-        if (header.dim != dim) return DecodeError.InvalidPayload;
+        if (header.dim != e.dim) return DecodeError.InvalidPayload;
 
         const payload = format.slicePayload(compressed, header) catch |err| switch (err) {
             error.InvalidHeader => return DecodeError.InvalidHeader,
@@ -125,22 +121,28 @@ pub const Engine = struct {
             error.InvalidPayload => return DecodeError.InvalidPayload,
         };
 
-        // polar_decoded is in ROTATED space
-        polar.decodeInto(e.scratch_polar_decoded, payload.polar, header.max_r) catch |err| switch (err) {
-            error.InvalidDimension => return DecodeError.InvalidPayload,
-            error.OutOfMemory => return DecodeError.OutOfMemory,
-        };
-
-        // qjl_decoded is also computed in rotated space (don't inverse-rotate here)
+        polar.decodeInto(e.scratch_polar_decoded, payload.polar, header.max_r) catch
+            return DecodeError.InvalidPayload;
         qjl.decodeIntoRotated(e.scratch_qjl_decoded, payload.qjl, header.gamma, &e.qjl_workspace);
-
-        // Combine in rotated space, then inverse-rotate back to original space
         math.addInPlace(e.scratch_polar_decoded, e.scratch_qjl_decoded);
+        e.rot_op.matVecMulTransposed(e.scratch_polar_decoded, out);
+    }
 
-        const result = try allocator.alloc(f32, dim);
+    /// Allocating encode — calls encodeInto internally. Caller must free result.
+    pub fn encode(e: *Engine, allocator: std.mem.Allocator, x: []const f32) ![]u8 {
+        const bpv = e.bytesPerVector();
+        const result = try allocator.alloc(u8, bpv);
         errdefer allocator.free(result);
-        e.rot_op.matVecMulTransposed(e.scratch_polar_decoded, result);
+        const written = try e.encodeInto(x, result);
+        log.debug("encoded: dim={}, bytes={}, bits/dim={}", .{ e.dim, written, (written - format.HEADER_SIZE) * 8 / e.dim });
+        return result[0..written];
+    }
 
+    /// Allocating decode — calls decodeInto internally. Caller must free result.
+    pub fn decode(e: *Engine, allocator: std.mem.Allocator, compressed: []const u8) ![]f32 {
+        const result = try allocator.alloc(f32, e.dim);
+        errdefer allocator.free(result);
+        try e.decodeInto(compressed, result);
         return result;
     }
 
