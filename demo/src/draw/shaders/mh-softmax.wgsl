@@ -44,7 +44,9 @@ fn mh_softmax(
   }
   workgroupBarrier();
 
-  // Phase 2: parallel max for numerical stability.
+  // Phase 2: parallel max for numerical stability. Subgroup butterfly
+  // reduction — max is order-invariant so no FP-reorder risk (unlike
+  // phase 3's sum which stays as a shared-memory tree reduction below).
   var local_max = -1e30f;
   i = tid;
   while (i < n) {
@@ -52,18 +54,23 @@ fn mh_softmax(
     if (v > local_max) { local_max = v; }
     i += WG_SIZE;
   }
-  s_reduce[tid] = local_max;
+  // Intra-subgroup butterfly (5 strides for 32-wide subgroup).
+  local_max = max(local_max, subgroupShuffleXor(local_max, 1u));
+  local_max = max(local_max, subgroupShuffleXor(local_max, 2u));
+  local_max = max(local_max, subgroupShuffleXor(local_max, 4u));
+  local_max = max(local_max, subgroupShuffleXor(local_max, 8u));
+  local_max = max(local_max, subgroupShuffleXor(local_max, 16u));
+  if ((tid & 31u) == 0u) { s_reduce[tid >> 5u] = local_max; }
   workgroupBarrier();
-
-  var stride = WG_SIZE / 2u;
-  while (stride > 0u) {
-    if (tid < stride) {
-      let other = s_reduce[tid + stride];
-      if (other > s_reduce[tid]) { s_reduce[tid] = other; }
-    }
-    stride /= 2u;
-    workgroupBarrier();
-  }
+  // Cross-subgroup butterfly over 8 stashed maxes. Lanes ≥ 8 carry -inf;
+  // only lane 0's result is read. Called at top level for uniform flow.
+  var cross_max = -1e30f;
+  if (tid < 8u) { cross_max = s_reduce[tid]; }
+  cross_max = max(cross_max, subgroupShuffleXor(cross_max, 1u));
+  cross_max = max(cross_max, subgroupShuffleXor(cross_max, 2u));
+  cross_max = max(cross_max, subgroupShuffleXor(cross_max, 4u));
+  if (tid == 0u) { s_reduce[0] = cross_max; }
+  workgroupBarrier();
   let max_val = s_reduce[0];
 
   // Phase 3: parallel exp + per-thread sum.
@@ -78,7 +85,7 @@ fn mh_softmax(
   s_reduce[tid] = local_sum;
   workgroupBarrier();
 
-  stride = WG_SIZE / 2u;
+  var stride = WG_SIZE / 2u;
   while (stride > 0u) {
     if (tid < stride) {
       s_reduce[tid] += s_reduce[tid + stride];
