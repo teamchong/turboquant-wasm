@@ -33,6 +33,8 @@
   },
   "devDependencies": {
     "@playwright/test": "^1.59.1",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
     "@types/three": "^0.170.0",
     "@webgpu/types": "^0.1.69",
     "typescript": "^5.9.3",

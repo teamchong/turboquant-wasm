@@ -176,7 +176,7 @@ export const ExcalidrawElementSchema = z.object({
   updated: z.number().optional(),
   locked: z.boolean().optional(),
   link: z.string().nullable().optional(),
-  customData: z.record(z.unknown()).nullable().optional(),
+  customData: z.record(z.string(), z.unknown()).nullable().optional(),
   // Text fields
   text: z.string().optional(),
   fontSize: z.number().optional(),
@@ -205,8 +205,8 @@ export const ExcalidrawFileSchema = z.object({
   version: z.number(),
   source: z.string().optional(),
   elements: z.array(ExcalidrawElementSchema),
-  appState: z.record(z.unknown()).optional(),
-  files: z.record(z.unknown()).optional(),
+  appState: z.record(z.string(), z.unknown()).optional(),
+  files: z.record(z.string(), z.unknown()).optional(),
 }).passthrough();
 
 export type ExcalidrawFile = z.infer<typeof ExcalidrawFileSchema>;

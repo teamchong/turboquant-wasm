@@ -216,7 +216,7 @@ class UniformMega {
   /** Upload all staged data to GPU in one call. Call before queue.submit(). */
   flush(): void {
     if (this.nextOffset > 0) {
-      this.device.queue.writeBuffer(this.buf, 0, this.cpu, 0, this.nextOffset);
+      this.device.queue.writeBuffer(this.buf, 0, this.cpu as Uint8Array<ArrayBuffer>, 0, this.nextOffset);
     }
   }
 }
@@ -436,11 +436,11 @@ export class InferenceEngine {
       }
       const buf = device.createBuffer({ size: mat.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
       const bufT = device.createBuffer({ size: matT.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-      device.queue.writeBuffer(buf, 0, mat);
-      device.queue.writeBuffer(bufT, 0, matT);
+      device.queue.writeBuffer(buf, 0, mat as Float32Array<ArrayBuffer>);
+      device.queue.writeBuffer(bufT, 0, matT as Float32Array<ArrayBuffer>);
       const signs = generateHadamardSigns(dim, 42);
       const signsBuf = device.createBuffer({ size: signs.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-      device.queue.writeBuffer(signsBuf, 0, signs);
+      device.queue.writeBuffer(signsBuf, 0, signs as Int32Array<ArrayBuffer>);
       return [buf, bufT, signsBuf];
     };
 

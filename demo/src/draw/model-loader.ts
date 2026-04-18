@@ -303,7 +303,7 @@ export async function uploadTensorsToGPU(
 
   const uploadFromView = (tensor: TensorMeta, view: Uint8Array) => {
     const gpuBuf = mkBuf(tensor.size);
-    device.queue.writeBuffer(gpuBuf, 0, view);
+    device.queue.writeBuffer(gpuBuf, 0, view as Uint8Array<ArrayBuffer>);
     tensor.gpuBuffer = gpuBuf;
     uploadedBytes += tensor.size;
     uploaded++;
