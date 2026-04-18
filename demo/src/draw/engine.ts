@@ -1775,13 +1775,17 @@ export class InferenceEngine {
     // 1. Pre-attention norm — nBatch rows of HIDDEN_SIZE.
     this.rmsNorm(enc, inputBuf, this.weight(L + "attn_norm.weight"), s.normed, HIDDEN_SIZE, nBatch);
 
-    // 2. Q/K/V projections — batched matmul (nBatch outputs per call).
+    // 2. Q/K/V projections — batched matmul. Shared-KV layers skip K and V;
+    //    tq_encode guard at step 5 already does this, so matching the skip
+    //    earlier avoids ~40 % of Q/K/V matmul work during prefill too.
     const vTensor = this.model.tensors.get(L + "attn_v.weight")!;
     this.matmulBatched(enc, this.weight(L + "attn_q.weight"), s.normed, s.q, qSize, HIDDEN_SIZE, nBatch, false);
-    this.matmulBatched(enc, this.weight(L + "attn_k.weight"), s.normed, s.k, kvSize, HIDDEN_SIZE, nBatch, false);
-    this.matmulBatched(enc, vTensor.gpuBuffer!, s.normed, s.v, kvSize, HIDDEN_SIZE, nBatch, vTensor.type === GGML_Q6_K);
+    if (reuseLayer < 0) {
+      this.matmulBatched(enc, this.weight(L + "attn_k.weight"), s.normed, s.k, kvSize, HIDDEN_SIZE, nBatch, false);
+      this.matmulBatched(enc, vTensor.gpuBuffer!, s.normed, s.v, kvSize, HIDDEN_SIZE, nBatch, vTensor.type === GGML_Q6_K);
+    }
 
-    // 3. QK-norm + V-norm — nBatch × NUM_HEADS rows for Q, nBatch × NUM_KV_HEADS rows for K/V.
+    // 3. QK-norm + V-norm. Shared-KV layers skip K-norm and V-norm.
     {
       const normP = new ArrayBuffer(16);
       new Uint32Array(normP)[0] = dim;
@@ -1792,21 +1796,23 @@ export class InferenceEngine {
         { binding: 2, resource: { buffer: this.weight(L + "attn_q_norm.weight") } },
         { binding: 3, resource: { buffer: s.qNormed } },
       ], nBatch * NUM_HEADS);
-      this.dispatch(enc, this.pipelines.rmsNorm, [
-        this.u16(new Uint32Array(normP)),
-        { binding: 1, resource: { buffer: s.k } },
-        { binding: 2, resource: { buffer: this.weight(L + "attn_k_norm.weight") } },
-        { binding: 3, resource: { buffer: s.kNormed } },
-      ], nBatch * NUM_KV_HEADS);
-      this.dispatch(enc, this.pipelines.rmsNorm, [
-        this.u16(new Uint32Array(normP)),
-        { binding: 1, resource: { buffer: s.v } },
-        { binding: 2, resource: { buffer: s.onesWeight } },
-        { binding: 3, resource: { buffer: s.vNormed } },
-      ], nBatch * NUM_KV_HEADS);
+      if (reuseLayer < 0) {
+        this.dispatch(enc, this.pipelines.rmsNorm, [
+          this.u16(new Uint32Array(normP)),
+          { binding: 1, resource: { buffer: s.k } },
+          { binding: 2, resource: { buffer: this.weight(L + "attn_k_norm.weight") } },
+          { binding: 3, resource: { buffer: s.kNormed } },
+        ], nBatch * NUM_KV_HEADS);
+        this.dispatch(enc, this.pipelines.rmsNorm, [
+          this.u16(new Uint32Array(normP)),
+          { binding: 1, resource: { buffer: s.v } },
+          { binding: 2, resource: { buffer: s.onesWeight } },
+          { binding: 3, resource: { buffer: s.vNormed } },
+        ], nBatch * NUM_KV_HEADS);
+      }
     }
 
-    // 4. RoPE Q/K — n_batch = nBatch (shader uses position = position_start + batch).
+    // 4. RoPE Q/K — n_batch = nBatch. Shared-KV layers skip K RoPE.
     {
       const mkRopeParamsBatched = (nHeads: number): ArrayBuffer => {
         const buf = new ArrayBuffer(32);
@@ -1825,11 +1831,13 @@ export class InferenceEngine {
         { binding: 1, resource: { buffer: s.qNormed } },
         { binding: 2, resource: { buffer: ropeFreqsBuf } },
       ], Math.ceil(nBatch * NUM_HEADS * dim / 2 / 256));
-      this.dispatch(enc, this.pipelines.rope, [
-        this.u32(mkRopeParamsBatched(NUM_KV_HEADS)),
-        { binding: 1, resource: { buffer: s.kNormed } },
-        { binding: 2, resource: { buffer: ropeFreqsBuf } },
-      ], Math.ceil(nBatch * NUM_KV_HEADS * dim / 2 / 256));
+      if (reuseLayer < 0) {
+        this.dispatch(enc, this.pipelines.rope, [
+          this.u32(mkRopeParamsBatched(NUM_KV_HEADS)),
+          { binding: 1, resource: { buffer: s.kNormed } },
+          { binding: 2, resource: { buffer: ropeFreqsBuf } },
+        ], Math.ceil(nBatch * NUM_KV_HEADS * dim / 2 / 256));
+      }
     }
 
     // 5. TQ-encode K/V — num_vectors = nBatch, write_pos = positionStart.
