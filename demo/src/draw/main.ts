@@ -941,38 +941,26 @@ async function checkWebGPUSupport(): Promise<string | null> {
   const isAndroid = /Android/.test(ua);
   const isMobile = isIOS || isAndroid;
   const gpu = (navigator as any).gpu;
-  if (!gpu) {
-    if (isIOS) return "iOS Safari doesn't expose WebGPU here. Settings → Safari → Advanced → Feature Flags → enable WebGPU (iOS 18+). Even with WebGPU on, this demo needs to download a 3 GB model — iPhones typically cap tab memory around 1-2 GB and will run out. Desktop browser recommended.";
-    if (isAndroid) return "Android Chrome: enable chrome://flags/#enable-unsafe-webgpu and restart. Note: the 3 GB model download may exceed phone memory. Desktop recommended.";
-    return "WebGPU not available. This demo needs Chrome 114+, Edge 114+, Safari 18+, or Firefox 128+.";
-  }
+  // Single answer on unsupported platforms: use desktop Chrome. Safari
+  // lacks the subgroups extension our matmul shaders need; mobile browsers
+  // cap per-tab memory below the 3 GB this model requires. Pointing users
+  // down "enable flag X" rabbit holes that don't actually work was worse.
+  const CHROME_MSG = "Please use desktop Chrome 134+ (Windows, macOS, or Linux). This demo needs the WebGPU subgroups extension that Safari hasn't shipped and the 3 GB model that mobile browsers can't hold in one tab.";
+  if (isMobile) return CHROME_MSG;
+  if (!gpu) return CHROME_MSG;
   let adapter: GPUAdapter | null;
   try {
     adapter = await gpu.requestAdapter();
   } catch (e) {
-    return `WebGPU adapter request failed: ${(e as Error).message}. Close other GPU-heavy tabs and retry.`;
+    return `WebGPU adapter request failed: ${(e as Error).message}. Close other GPU-heavy tabs and retry, or switch to desktop Chrome.`;
   }
   if (!adapter) {
-    return "WebGPU is enabled but no GPU adapter is available. Try closing other GPU-heavy tabs, or check chrome://gpu.";
+    return "WebGPU is enabled but no GPU adapter is available. Try closing other GPU-heavy tabs, check chrome://gpu, or switch to desktop Chrome.";
   }
   const missing: string[] = [];
   if (!adapter.features.has("shader-f16")) missing.push("shader-f16");
   if (!adapter.features.has("subgroups")) missing.push("subgroups");
-  if (missing.length > 0) {
-    if (isIOS) {
-      return `iOS Safari's WebGPU is missing ${missing.join(" + ")}. Our matmul shaders need the subgroups extension (Apple hasn't shipped it in Safari yet) and shader-f16 for Q4_K_M dequant. This demo requires a desktop browser (Chrome 134+, Edge 134+, or a Mac with Safari 18+ via Technology Preview builds).`;
-    }
-    if (isAndroid) {
-      return `Android Chrome's WebGPU is missing ${missing.join(" + ")}. Try chrome://flags/#enable-unsafe-webgpu and chrome://flags/#enable-webgpu-experimental-features. Even if enabled, the 3 GB model may exceed phone memory. Desktop recommended.`;
-    }
-    return `This GPU adapter is missing required features: ${missing.join(", ")}. On Chrome/Edge try toggling chrome://flags/#enable-unsafe-webgpu and chrome://flags/#enable-webgpu-experimental-features. On older Intel iGPUs these extensions may simply not be available.`;
-  }
-  if (isMobile) {
-    // WebGPU + subgroups + shader-f16 all present on a phone — rare but
-    // possible. Log a warning so the user sees the memory caveat without
-    // blocking the run; they'll hit real OOM naturally if it happens.
-    console.warn("[draw] WebGPU available on mobile. The demo downloads a 3 GB model + uses ~3 GB GPU memory; mobile tabs typically cap around 1-2 GB. Desktop recommended.");
-  }
+  if (missing.length > 0) return CHROME_MSG;
   return null;
 }
 
