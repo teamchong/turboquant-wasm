@@ -360,7 +360,13 @@ async function streamConstrained(initialTokenId: number, maxTokens: number, eosI
 
     for (let i = 0; i < maxTokens; i++) {
       if (aborted) { reason = "aborted"; break; }
-      engine.setLogitMaskIndex(grammar.state);
+      // S_IN_THINK's mask allows every token (built by grammar.ts: every
+      // id passes simulateToken's fast-path return). Dispatching the mask
+      // kernel in that state is a full 262k-lane sweep that performs zero
+      // semantic work — skip it entirely. The mask re-enables the moment
+      // grammar transitions to a code-syntax state.
+      if (grammar.state === S_IN_THINK) engine.disableLogitMask();
+      else engine.setLogitMaskIndex(grammar.state);
       const tok = await engine.generateToken(nextToken);
       lastTokenId = tok;
       const stats = engine.getStats();
