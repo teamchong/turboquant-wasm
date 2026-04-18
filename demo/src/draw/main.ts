@@ -267,6 +267,44 @@ function workerCall<T>(msg: any, responseType: string): Promise<T> {
 // orphans for every connected node whose label rendered through a bound
 // text element.)
 const NODE_TYPES = new Set(["rectangle", "ellipse", "diamond", "table", "class"]);
+// Mechanical quick-fix: given generated SDK code + a list of orphan
+// LABELS (first string arg to addXxx), strip the matching
+// `const VAR = addXxx("LABEL", ...)` declarations AND any subsequent
+// connect/message/addGroup/addLane calls that reference the dead VAR
+// names. Produces a smaller-but-valid diagram without a full model
+// regen. Runs before the retry path in generate(); if the result
+// still looks broken we fall through to the regular retry.
+function stripOrphanDeclarations(code: string, orphanLabels: string[]): string {
+  if (orphanLabels.length === 0) return code;
+  const labelSet = new Set(orphanLabels.map(s => s.trim()));
+  const deadVars = new Set<string>();
+  // Pass 1: find every `const VAR = addXxx("LABEL"` where LABEL is
+  // orphaned; collect VAR names. Regex is permissive about optional
+  // whitespace. Only matches the first string arg.
+  const declRe = /^(\s*)(?:const|let|var)\s+(\w+)\s*=\s*add\w+\s*\(\s*"((?:[^"\\]|\\.)*)"/gm;
+  let m: RegExpExecArray | null;
+  while ((m = declRe.exec(code)) !== null) {
+    const varName = m[2];
+    const label = m[3];
+    if (labelSet.has(label)) deadVars.add(varName);
+  }
+  if (deadVars.size === 0) return code;
+  // Pass 2: drop whole lines that declare a dead var OR reference one
+  // as a positional arg to connect/message/addGroup/addLane. Identifier
+  // boundaries use \b so "user" doesn't match "userInput".
+  const lines = code.split("\n");
+  const deadVarPattern = [...deadVars].map(v => v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+  const declLineRe = new RegExp(`^\\s*(?:const|let|var)\\s+(?:${deadVarPattern})\\s*=`);
+  const refRe = new RegExp(`\\b(?:${deadVarPattern})\\b`);
+  const kept: string[] = [];
+  for (const line of lines) {
+    if (declLineRe.test(line)) continue;     // drop the dead declaration
+    if (refRe.test(line)) continue;          // drop any reference (connect/message/addGroup arg)
+    kept.push(line);
+  }
+  return kept.join("\n");
+}
+
 function detectOrphanNodes(elements: any[]): string[] {
   const referenced = new Set<string>();
   for (const el of elements) {
@@ -781,7 +819,7 @@ async function generate() {
       const totalNodes = elementsRendered.filter((el: any) => NODE_TYPES.has(el.type) && !el.customData?._group).length;
       const orphanRatio = totalNodes > 0 ? orphans.length / totalNodes : 0;
       const ORPHAN_RETRY_THRESHOLD = 0.4;
-      const hasOrphans = orphans.length > 0
+      let hasOrphans = orphans.length > 0
         && orphanRatio >= ORPHAN_RETRY_THRESHOLD
         && attempt < MAX_ATTEMPTS - 1;
 
@@ -792,9 +830,40 @@ async function generate() {
       // "Diagram ready" with nothing on screen.
       const isEmpty = !code || totalNodes === 0;
 
+      // IDE-style quick-fix: before triggering a full model regen for orphan
+      // nodes, try mechanically stripping the `const ORPHAN = addXxx(...)`
+      // declarations and re-executing. If the trimmed code produces a
+      // connected diagram, skip the retry entirely — a ~15s regen saved
+      // whenever the model over-declared. Only nodes on the orphan list get
+      // stripped; connect/message/addGroup etc. lines are preserved even if
+      // they referenced the stripped names (those calls become no-ops since
+      // the names are undefined, but JS would throw — so we also drop lines
+      // that REFERENCE orphan names). This is the quick-fix codemod an IDE
+      // auto-applies; no other browser LLM stack has it because they lack
+      // a compile-gate + semantic orphan detector in-page.
+      if (!error && hasOrphans && !isEmpty) {
+        const stripped = stripOrphanDeclarations(code, orphans);
+        const { result: fixResult, error: fixError } = await executeCode(stripped);
+        const fixElements = fixResult.json?.elements || [];
+        const fixOrphans = fixError ? orphans : detectOrphanNodes(fixElements);
+        const fixTotal = fixElements.filter((el: any) => NODE_TYPES.has(el.type) && !el.customData?._group).length;
+        const fixRatio = fixTotal > 0 ? fixOrphans.length / fixTotal : 1;
+        if (!fixError && fixTotal > 0 && fixRatio < ORPHAN_RETRY_THRESHOLD) {
+          console.log(`[draw] attempt ${attempt + 1}: auto-fixed by stripping ${orphans.length} orphan(s): ${orphans.join(", ")}`);
+          code = stripped;
+          setCode(code);
+          finalResult = fixResult;
+          if (fixResult.json) updateDiagram(fixResult.json.elements || []);
+          hasOrphans = false;
+        }
+      }
+
       if (!error && !hasOrphans && !isEmpty) {
         currentCode = code;
-        if (result.json) { updateDiagram(result.json.elements || []); fitToScreen(); }
+        if (result.json || finalResult?.json) {
+          updateDiagram((finalResult?.json || result.json).elements || []);
+          fitToScreen();
+        }
         statusEl.textContent = attempt === 0 ? "Diagram ready" : `Diagram ready (fixed after ${attempt} ${attempt === 1 ? "retry" : "retries"})`;
         statusEl.classList.remove("error");
         break;
