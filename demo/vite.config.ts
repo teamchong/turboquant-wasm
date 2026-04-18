@@ -231,11 +231,6 @@ export default defineConfig(({ command }) => ({
   base: command === "serve" ? "/" : "/turboquant-wasm/",
   assetsInclude: ["**/*.wgsl"],
   plugins: [systemCacheAsset(__dirname)],
-  resolve: {
-    alias: {
-      "turboquant-wasm": resolve(__dirname, "../src/js/index.ts"),
-    },
-  },
   build: {
     outDir: "dist",
     emptyOutDir: true,
