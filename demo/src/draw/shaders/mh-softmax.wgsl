@@ -31,25 +31,19 @@ fn mh_softmax(
   let row_start = head * n;
   let max_pos = params.query_pos + 1u;
   let win_start = params.window_start;
-
-  // Phase 1: causal + sliding-window mask. Each thread strides across `n`,
-  // setting out-of-window positions to -inf. Operates directly on `data`
-  // (no shared scratch) since positions are independent.
-  var i = tid;
-  while (i < n) {
-    if (i >= max_pos || i < win_start) {
-      data[row_start + i] = -1e30;
-    }
-    i += WG_SIZE;
-  }
-  workgroupBarrier();
+  // Hi-Z loop bound: phases 2-4 only need positions in [win_start, scan_end).
+  // Prior phase 1 wrote -1e30 to out-of-window slots so downstream reads
+  // were harmless; with tighter bounds those slots are never read.
+  // Sliding-window layers (28/35) have window=512 but n grows to 3000+,
+  // so the old 0..n scan did ~6× the needed work here.
+  let scan_end = min(max_pos, n);
 
   // Phase 2: parallel max for numerical stability. Subgroup butterfly
   // reduction — max is order-invariant so no FP-reorder risk (unlike
   // phase 3's sum which stays as a shared-memory tree reduction below).
   var local_max = -1e30f;
-  i = tid;
-  while (i < n) {
+  var i = win_start + tid;
+  while (i < scan_end) {
     let v = data[row_start + i];
     if (v > local_max) { local_max = v; }
     i += WG_SIZE;
@@ -73,10 +67,10 @@ fn mh_softmax(
   workgroupBarrier();
   let max_val = s_reduce[0];
 
-  // Phase 3: parallel exp + per-thread sum.
+  // Phase 3: parallel exp + per-thread sum. Same window-bounded scan.
   var local_sum = 0.0f;
-  i = tid;
-  while (i < n) {
+  i = win_start + tid;
+  while (i < scan_end) {
     let e = exp(data[row_start + i] - max_val);
     data[row_start + i] = e;
     local_sum += e;
@@ -95,10 +89,11 @@ fn mh_softmax(
   }
   let total = s_reduce[0];
 
-  // Phase 4: parallel normalize.
+  // Phase 4: parallel normalize. Window-bounded so out-of-window slots
+  // keep stale values (never read by wsum_p1's compact-list path below).
   let inv = 1.0f / total;
-  i = tid;
-  while (i < n) {
+  i = win_start + tid;
+  while (i < scan_end) {
     data[row_start + i] = data[row_start + i] * inv;
     i += WG_SIZE;
   }
