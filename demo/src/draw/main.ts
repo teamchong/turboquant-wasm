@@ -68,6 +68,10 @@ let prefillDebounce: ReturnType<typeof setTimeout> | null = null;
 let lastPrefillText = "";
 let userPrefilled = false;
 let eagerFirstToken = 0;
+// Snapshot of the token sequence prefilled by the most recent eager prefill,
+// so the generate() fast-path can hand it to currentAttemptPrefilled for
+// retry-LCP without re-tokenising.
+let lastEagerPrefilledTokens: number[] | null = null;
 // Set while doUserPrefill is in flight so generate() can await it instead of
 // stacking a second prefill on top — that double-post used to race the
 // engine's _stagingBuf.mapAsync (only one outstanding map allowed per buffer).
@@ -78,6 +82,12 @@ let eagerPrefillPromise: Promise<void> | null = null;
 // full restoreCache → re-prefill path — saves most of the ~1-2s re-prefill
 // cost on iterative prompts like "draw X" followed by "draw X with 5 nodes".
 let cachedUserTokens: number[] | null = null;
+// Tokens prefilled for the CURRENT attempt inside the active generate() call.
+// Used by the retry branch to compute LCP against the new (post-failure)
+// conversation's tokenIds — the retry adds {assistant: code, user: error}
+// turns on top of the original user prompt, so the first user-turn portion
+// matches and can be skipped via rollbackKV. Cleared when generate() exits.
+let currentAttemptPrefilled: number[] | null = null;
 // Position where the system-prompt snapshot ends. Initialised at init-time
 // once we know systemTokenIds. LCP rollback targets are computed as
 // `systemCacheEnd + lcpLen`.
@@ -369,10 +379,12 @@ async function doUserPrefill() {
     eagerFirstToken = r.firstToken;
     userPrefilled = true;
     cachedUserTokens = userTokenIds;
+    lastEagerPrefilledTokens = userTokenIds;
     console.log("[draw] eager prefill done, first token:", eagerFirstToken);
   } catch {
     userPrefilled = false;
     cachedUserTokens = null;
+    lastEagerPrefilledTokens = null;
   } finally {
     resolveEager();
     eagerPrefillPromise = null;
@@ -434,6 +446,9 @@ async function generate() {
     const conversation: Array<{ role: string; content: string }> = [
       { role: "user", content: textPart },
     ];
+    // Reset per-generate() retry-rollback state. Populated after each
+    // attempt's prefill so the NEXT attempt can LCP against it.
+    currentAttemptPrefilled = null;
 
     // Separate per-phase budgets so a long reasoning turn doesn't starve
     // the code stream. Previously a single MAX_NEW_TOKENS=1024 was shared
@@ -538,23 +553,29 @@ async function generate() {
       if (attempt === 0 && userPrefilled && textPart === lastPrefillText) {
         console.log("[draw] using eager prefill, first token:", eagerFirstToken);
         nextToken = eagerFirstToken;
+        // Capture the eager-prefilled token sequence so a retry can LCP
+        // against it. doUserPrefill stores it on the module-scope cache.
+        currentAttemptPrefilled = lastEagerPrefilledTokens;
       } else {
         const tokenIds = tokenizeConversation(conversation, true);
         const phase = attempt === 0 ? "Processing prompt" : `Fixing error (retry ${attempt}/${MAX_ATTEMPTS - 1})`;
         statusEl.innerHTML = `<span class="spinner"></span> ${phase}...`;
 
-        // Prefix reuse — on attempt 0, if the previous generate left a
-        // compatible token sequence in KV, roll back to the longest common
-        // prefix instead of restoring to the system snapshot and re-prefilling
-        // everything. Saves the (shared-prefix × ms-per-token) fraction of the
-        // prefill cost on iterative prompts. Skip on retries because the
-        // conversation structure changes mid-attempt (assistant turn added,
-        // user feedback appended) and the KV vs re-tokenised-conversation
-        // alignment past the first-attempt user turn is non-trivial.
+        // Prefix reuse — two sources of LCP:
+        //   (a) attempt 0: cross-call reuse from the previous generate()'s
+        //       `cachedUserTokens` (iterative prompts share a prefix).
+        //   (b) attempt > 0 (retry): reuse the PREVIOUS attempt's prefilled
+        //       tokens. The retry appends {assistant: code, user: error} to
+        //       the conversation — the chat template's output up through the
+        //       first `<|turn>model\n` matches attempt N's prefill exactly,
+        //       so LCP ≈ prev_attempt_prefill_len − thought_template (~8 tok).
+        //       Unique to the retry-loop architecture — nothing else in the
+        //       browser LLM space has an error-feedback retry step to reuse.
         let lcp = 0;
-        if (attempt === 0 && cachedUserTokens) {
-          const maxLcp = Math.min(cachedUserTokens.length, tokenIds.length - 1);
-          while (lcp < maxLcp && cachedUserTokens[lcp] === tokenIds[lcp]) lcp++;
+        const lcpSource = attempt === 0 ? cachedUserTokens : currentAttemptPrefilled;
+        if (lcpSource) {
+          const maxLcp = Math.min(lcpSource.length, tokenIds.length - 1);
+          while (lcp < maxLcp && lcpSource[lcp] === tokenIds[lcp]) lcp++;
           if (lcp < PREFIX_REUSE_MIN) lcp = 0;
         }
 
@@ -576,6 +597,7 @@ async function generate() {
           nextToken = prefillResult.firstToken;
         }
         cachedUserTokens = tokenIds;
+        currentAttemptPrefilled = tokenIds;
       }
       userPrefilled = false;
       lastPrefillText = "";
