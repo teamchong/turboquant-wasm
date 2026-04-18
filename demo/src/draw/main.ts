@@ -647,6 +647,16 @@ async function generate() {
       // Thinking phase is over either way — drop the cloud.
       clearThinkingCloud();
 
+      // Log the full reasoning so the curious user can inspect what the
+      // model was thinking before the code phase started. The `<channel|>`
+      // marker (if present) terminates the visible block — strip it + any
+      // trailing partial channel opener so the console output matches the
+      // same "visible" view the thinking cloud showed mid-stream.
+      if (thinkingText) {
+        const visible = thinkingText.replace(/<channel\|>.*$/s, "").trim();
+        if (visible) console.log(`[draw] thinking (${thinkingText.length}ch):\n${visible}`);
+      }
+
       // Phase B — inject a "now emit code" reminder and run the constrained
       // code stream. Always runs after phase A (even if thinking ran past
       // its budget without closing the channel): the reminder is the only
@@ -740,26 +750,28 @@ async function generate() {
 
       // Render whatever compiled, then queue retry.
       if (result.json) updateDiagram(result.json.elements || []);
+      let retryFeedback: string;
       if (error) {
         console.log(`[draw] attempt ${attempt + 1} failed: ${error}`);
+        retryFeedback = `The code above failed at runtime with: ${error}\n\nRegenerate the full code, fixing the error.`;
         conversation.push({ role: "assistant", content: code });
-        conversation.push({ role: "user", content: `The code above failed at runtime with: ${error}\n\nRegenerate the full code, fixing the error.` });
+        conversation.push({ role: "user", content: retryFeedback });
       } else if (isEmpty) {
         console.log(`[draw] attempt ${attempt + 1}: empty output (no diagram produced)`);
+        retryFeedback = `The previous response produced no diagram code — only reasoning text or an empty string. Respond with the JavaScript SDK calls directly, no prose, no markdown. Start with the first call and end with the last.`;
         conversation.push({ role: "assistant", content: code });
-        conversation.push({
-          role: "user",
-          content: `The previous response produced no diagram code — only reasoning text or an empty string. Respond with the JavaScript SDK calls directly, no prose, no markdown. Start with the first call and end with the last.`,
-        });
+        conversation.push({ role: "user", content: retryFeedback });
         lastError = "empty output";
       } else {
         console.log(`[draw] attempt ${attempt + 1}: ${orphans.length} orphan node(s): ${orphans.join(", ")}`);
+        retryFeedback = `The code above runs, but these nodes are declared and never connected to anything: ${orphans.map(o => `"${o}"`).join(", ")}\n\nEither add connect/message edges that reference them, or remove them. Regenerate the full code.`;
         conversation.push({ role: "assistant", content: code });
-        conversation.push({
-          role: "user",
-          content: `The code above runs, but these nodes are declared and never connected to anything: ${orphans.map(o => `"${o}"`).join(", ")}\n\nEither add connect/message edges that reference them, or remove them. Regenerate the full code.`,
-        });
+        conversation.push({ role: "user", content: retryFeedback });
       }
+      // Dump the full user-feedback that the next retry will see — lets
+      // the curious user inspect what the model is being asked to fix
+      // before the retry starts.
+      console.log(`[draw] retry feedback for attempt ${attempt + 2}:\n${retryFeedback}`);
     }
 
     if (lastError && !aborted) {
