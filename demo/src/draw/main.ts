@@ -82,6 +82,11 @@ let eagerPrefillPromise: Promise<void> | null = null;
 // full restoreCache → re-prefill path — saves most of the ~1-2s re-prefill
 // cost on iterative prompts like "draw X" followed by "draw X with 5 nodes".
 let cachedUserTokens: number[] | null = null;
+// Resolves when the in-flight generate() call finishes its finally block.
+// Second click on the Generate button aborts the previous run and awaits this
+// before starting a new one — without this, the abort + restart race the
+// worker (double prefill, double stream, GPU buffer contention).
+let currentGeneration: Promise<void> | null = null;
 // Tokens prefilled for the CURRENT attempt inside the active generate() call.
 // Used by the retry branch to compute LCP against the new (post-failure)
 // conversation's tokenIds — the retry adds {assistant: code, user: error}
@@ -284,6 +289,33 @@ function detectOrphanNodes(elements: any[]): string[] {
   return orphans;
 }
 
+// Excalidraw text elements render plain text — so when the model emits
+// markdown in the thinking channel (headers, bold, bullets, fenced code),
+// the raw `**`, `##`, backticks etc. show up as literal characters. Strip
+// the syntax and keep the payload so the thinking cloud is readable.
+function stripMarkdown(md: string): string {
+  return md
+    // Fenced code blocks: drop the ``` fences, keep the body.
+    .replace(/```[a-zA-Z0-9]*\n?/g, "")
+    // Inline code: `x` → x
+    .replace(/`([^`]+)`/g, "$1")
+    // Headers: `### Foo` → `Foo`
+    .replace(/^\s{0,3}#{1,6}\s+/gm, "")
+    // Bold/strong: **x** or __x__ → x
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/__([^_]+)__/g, "$1")
+    // Italic/em: *x* or _x_ → x (avoid eating bullet-style "* item" by requiring non-space after the *).
+    .replace(/(^|[^*])\*([^*\s][^*]*?)\*/g, "$1$2")
+    .replace(/(^|[^_])_([^_\s][^_]*?)_/g, "$1$2")
+    // List bullets: `- item` / `* item` / `+ item` → `• item`
+    .replace(/^(\s*)[-*+]\s+/gm, "$1• ")
+    // Numbered lists: keep the number but drop trailing `)` if present → `1.` stays `1.`
+    // Links: [text](url) → text
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    // Blockquote prefix
+    .replace(/^\s{0,3}>\s+/gm, "");
+}
+
 // LRU-ish cache keyed by (full text, template flag) that memoises
 // apply_chat_template + encode. Keystroke-driven eager prefill fires several
 // times per second under debounce, and the tokenizer's encode path is
@@ -405,10 +437,24 @@ async function generate() {
   const prompt = promptEl.value.trim();
   if (!prompt) return;
 
-  if (busy) { aborted = true; worker?.postMessage({ type: "abort" }); return; }
+  // Cancel-and-restart: second click aborts the in-flight generation, waits
+  // for it to unwind (the stream loop checks `aborted` at every token + at
+  // retry-loop boundaries), then falls through to start a fresh run on the
+  // (possibly changed) prompt. Previously a second click only aborted —
+  // forcing the user to click twice to actually retry.
+  if (busy) {
+    aborted = true;
+    worker?.postMessage({ type: "abort" });
+    if (currentGeneration) {
+      generateBtn.innerHTML = '<span class="spinner"></span> Cancelling...';
+      await currentGeneration;
+    }
+  }
 
   busy = true;
   aborted = false;
+  let resolveCurrent!: () => void;
+  currentGeneration = new Promise<void>((r) => { resolveCurrent = r; });
 
   if (!modelReady) {
     generateBtn.innerHTML = '<span class="spinner"></span> Waiting for model...';
@@ -512,7 +558,7 @@ async function generate() {
       // chunk) so the final thinking-cloud frame doesn't flash the marker
       // before we clear.
       const visible = thinkingText.replace(/<channel\|>.*$/s, "");
-      if (visible) showThinkingCloud(visible);
+      if (visible) showThinkingCloud(stripMarkdown(visible));
       statusEl.textContent = `Thinking... ${tokenCount} tok`;
     };
     const renderCodeToken = (id: number) => {
@@ -806,6 +852,8 @@ async function generate() {
 
   busy = false;
   generateBtn.textContent = "Generate Diagram";
+  resolveCurrent();
+  currentGeneration = null;
 }
 
 // =============================================================================
@@ -855,6 +903,37 @@ async function main() {
     const errorCard = document.createElement("div");
     errorCard.style.cssText = "padding:16px;margin:12px;background:#21262d;border:1px solid #f85149;border-radius:6px;color:#e6edf3;font-size:13px;line-height:1.6;";
     errorCard.innerHTML = `<strong style="color:#f85149;">Can't run in this browser</strong><br><br>${gpuError}`;
+    codeArea.appendChild(errorCard);
+    generateBtn.disabled = true;
+    promptEl.disabled = true;
+    return;
+  }
+
+  // Singleton lock: only one tab runs the engine at a time. A second tab
+  // would allocate its own WebGPU device, duplicate the 3 GB model pointer
+  // in memory, and race for OPFS access — the browser would almost
+  // certainly OOM or throttle both. navigator.locks.request with
+  // `ifAvailable: true` returns null if another holder exists; holding the
+  // returned promise forever keeps the lock for this page's lifetime (it
+  // releases when the page unloads). Available on all WebGPU browsers
+  // (Chrome 69+, Firefox 96+, Safari 15.4+).
+  const lockAcquired = await new Promise<boolean>((resolve) => {
+    navigator.locks.request(
+      "turboquant-draw-engine",
+      { ifAvailable: true },
+      (lock) => {
+        if (lock === null) { resolve(false); return undefined; }
+        resolve(true);
+        return new Promise<void>(() => { /* held for page lifetime */ });
+      },
+    );
+  });
+  if (!lockAcquired) {
+    statusEl.innerHTML = `<span style="color:#f85149;">Already running in another tab</span>`;
+    statusEl.classList.add("error");
+    const errorCard = document.createElement("div");
+    errorCard.style.cssText = "padding:16px;margin:12px;background:#21262d;border:1px solid #f85149;border-radius:6px;color:#e6edf3;font-size:13px;line-height:1.6;";
+    errorCard.innerHTML = `<strong style="color:#f85149;">Already running in another tab</strong><br><br>This demo keeps a 3 GB Gemma 4 E2B model resident in GPU memory. Running it twice concurrently would OOM the browser. Close the other tab and reload this one.`;
     codeArea.appendChild(errorCard);
     generateBtn.disabled = true;
     promptEl.disabled = true;
