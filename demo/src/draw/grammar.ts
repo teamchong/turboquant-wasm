@@ -243,11 +243,18 @@ export type SdkMode =
  * setType calls are ignored — our grammar will mask them, but even if a
  * second one slipped through we don't act on it.
  *
- * Pattern matches `setType("sequence")` or `setType("architecture")` with
- * flexible whitespace. The value must be exactly one of those two strings
- * — anything else is ignored and SDK state stays UNSET.
+ * All eight supported DiagramType values (types.ts) are recognised by
+ * the pattern. Routing:
+ *   "sequence"  → SDK_MODE_SEQUENCE
+ *   everything else ("architecture" | "flowchart" | "state" | "orgchart"
+ *                    | "er" | "class" | "swimlane") → SDK_MODE_ARCHITECTURE
+ * The sub-types within the generic category share the architecture
+ * branch's KV (same underlying Graphviz layout; presentational
+ * variations only). If we ever want per-sub-type branches (e.g. a
+ * dedicated "class" branch for UML diagrams), extend the routing here
+ * AND add the branch to BRANCHES in prompts/index.ts.
  */
-const SET_TYPE_RE = /setType\s*\(\s*"(sequence|architecture)"\s*\)/;
+const SET_TYPE_RE = /setType\s*\(\s*"(sequence|architecture|flowchart|state|orgchart|er|class|swimlane)"\s*\)/;
 
 export type ModeAction = (mode: SdkMode) => void;
 
@@ -275,7 +282,12 @@ export class ModeTracker {
   /** Feed the latest decoded token text. Returns true iff SDK state
    *  just transitioned into a non-UNSET mode on this call. If a transition
    *  happens, registered onEnter handlers for the new mode fire before
-   *  this method returns. */
+   *  this method returns.
+   *
+   *  Routing (all non-sequence values collapse to ARCHITECTURE because
+   *  they share the architecture branch's KV — see SET_TYPE_RE comment):
+   *    "sequence"  → SDK_MODE_SEQUENCE
+   *    other       → SDK_MODE_ARCHITECTURE */
   observe(text: string): boolean {
     if (this._mode !== SDK_MODE_UNSET) return false;
     if (text.length === 0) return false;

@@ -27,17 +27,23 @@ import { SDK_TYPES } from "../drawmode/sdk-types.js";
 
 export const ARCHITECTURE_PROMPT = `${PREAMBLE}
 
-You are in ARCHITECTURE mode (setType("architecture") has been called).
+You are in one of the NON-SEQUENCE diagram modes — setType() has been
+called with "architecture" | "flowchart" | "state" | "orgchart" | "er"
+| "class" | "swimlane". All seven share the same Graphviz-based layout
+and the addBox / addEllipse / addDiamond / addTable / addClass +
+addGroup / addLane + connect vocabulary (presentational variations).
+
 Do NOT use addActor or message(...) — those are sequence-mode only.
 
-TYPES — pick the sub-type based on the user's words. For direction, call setDirection("LR") etc. as the second line if needed.
-1. ARCHITECTURE (default): addBox with row/col/color/icon, connect, addGroup
-2. FLOWCHART: addBox/addEllipse/addDiamond, connect with labels
-3. STATE MACHINE: setDirection("LR") then addEllipse for states, connect with transition labels
-4. ORG CHART: addBox hierarchy, connect
-5. ER: addTable(name, [{name,type,key}], opts), connect with {cardinality:"1:N"}
-6. UML CLASS: addClass(name, {attributes:[{name,type}], methods:[{name,type}]}, opts), connect with {relation:"inheritance"}
-7. SWIMLANE: addBox for steps, addLane(name, [children]), connect
+What each sub-type looks like (pick by matching the user's words; for
+direction, call setDirection("LR") etc. as the second line if needed):
+1. architecture: addBox with row/col/color/icon + connect + addGroup.
+2. flowchart:    addBox + addEllipse + addDiamond + connect with labels.
+3. state:        setDirection("LR") + addEllipse for states + connect with transition labels.
+4. orgchart:     addBox hierarchy + connect.
+5. er:           addTable(name, [{name,type,key}], opts) + connect with {cardinality:"1:N"}.
+6. class:        addClass(name, {attributes, methods}, opts) + connect with {relation:"inheritance"}.
+7. swimlane:     addBox for steps + addLane(name, [children]) + connect.
 
 ARCHITECTURE example:
 setType("architecture");
@@ -57,7 +63,7 @@ connect(api, queue, "enqueue job");
 addGroup("Backend", [api, cache, db, queue]);
 
 SWIMLANE example:
-setType("architecture");
+setType("swimlane");
 const placeOrder = addBox("Place order", { col: 0, color: "frontend" });
 const validateCart = addBox("Validate cart", { col: 1, color: "backend" });
 const charge = addBox("Charge card", { col: 2, color: "backend" });
@@ -74,7 +80,7 @@ connect(charge, ship, "paid");
 connect(ship, notify, "shipped");
 
 UML CLASS example:
-setType("architecture");
+setType("class");
 const animal = addClass("Animal", {
   attributes: [{ name: "name", type: "string" }, { name: "age", type: "int" }],
   methods: [{ name: "eat()", type: "void" }, { name: "sleep()", type: "void" }],

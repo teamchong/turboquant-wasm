@@ -58,9 +58,20 @@ test.describe("ModeTracker", () => {
     expect(t.mode).toBe(SDK_MODE_ARCHITECTURE);
   });
 
-  test("ignores unknown setType args", () => {
+  test("routes all non-sequence types to ARCHITECTURE", () => {
+    // flowchart / state / orgchart / er / class / swimlane all collapse
+    // to the architecture branch because they share Graphviz layout.
+    for (const arg of ["flowchart", "state", "orgchart", "er", "class", "swimlane", "architecture"]) {
+      const t = new ModeTracker();
+      expect(t.observe(`setType("${arg}");`)).toBe(true);
+      expect(t.mode).toBe(SDK_MODE_ARCHITECTURE);
+    }
+  });
+
+  test("ignores truly-unknown setType args", () => {
+    // Not in the DiagramType union → regex doesn't match → no fire.
     const t = new ModeTracker();
-    expect(t.observe('setType("flowchart");\nsetType("er");')).toBe(false);
+    expect(t.observe('setType("calendar");\nsetType("mindmap");')).toBe(false);
     expect(t.mode).toBe(SDK_MODE_UNSET);
   });
 
@@ -95,14 +106,18 @@ test.describe("ModeTracker", () => {
     expect(order).toEqual(["first", "second", "third"]);
   });
 
-  test("onEnter does not fire on ignored setType args", () => {
+  test("onEnter does not fire on truly-unknown setType args", () => {
+    // "calendar" isn't in the DiagramType union → regex doesn't match
+    // → no handler fires and mode stays UNSET. (Real types from the
+    // union like "flowchart" fire ARCHITECTURE — see the routing test.)
     const t = new ModeTracker();
     let fired = false;
     t.onEnter(SDK_MODE_SEQUENCE, () => { fired = true; });
     t.onEnter(SDK_MODE_ARCHITECTURE, () => { fired = true; });
 
-    t.observe('setType("flowchart");');
+    t.observe('setType("calendar");');
     expect(fired).toBe(false);
+    expect(t.mode).toBe(SDK_MODE_UNSET);
   });
 
   test("onEnter(UNSET) rejects at registration time", () => {

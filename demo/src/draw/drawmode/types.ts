@@ -217,8 +217,30 @@ export const EXCALIDRAW_VERSION = 2;
 /** Layout direction for Graphviz rankdir */
 export type LayoutDirection = "TB" | "LR" | "RL" | "BT";
 
-/** Diagram type */
-export type DiagramType = "architecture" | "sequence";
+/** Diagram type.
+ *
+ *  Two categories at the LAYOUT level:
+ *    - "sequence" triggers the vertical actors + horizontal-messages
+ *      chronological renderer.
+ *    - Everything else falls through to the generic Graphviz layout
+ *      (boxes/ellipses/diamonds/tables/classes connected via edges).
+ *
+ *  The sub-types within the generic category ("architecture",
+ *  "flowchart", "state", "orgchart", "er", "class", "swimlane") are
+ *  presentational — they tell the model which shapes to prefer and
+ *  which rules to follow, but share the underlying renderer. Listed
+ *  exhaustively here so the type system matches every string that the
+ *  SDK prompts can produce.
+ */
+export type DiagramType =
+  | "architecture"
+  | "sequence"
+  | "flowchart"
+  | "state"
+  | "orgchart"
+  | "er"
+  | "class"
+  | "swimlane";
 
 /** Theme preset names */
 export type ThemePreset = "default" | "sketch" | "blueprint" | "minimal";

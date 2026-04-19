@@ -1093,10 +1093,15 @@ async function main() {
     // the engine so mountKV() can swap them in mid-stream when the grammar
     // recognises a completed setType(...) call.
     //
-    // ?branch=<name> was a pre-v1 query-param hack for validating per-
-    // branch prompt quality before the mid-stream swap was wired. Removed:
-    // branch selection is now driven purely by what the model emits,
-    // which is the whole point of the dynamic context design.
+    // Normal users never pass any query param — branch selection at
+    // runtime is driven by what the model emits, which is the whole point
+    // of the dynamic context design.
+    //
+    // ?buildBranch=<name> is an internal-only override used by the
+    // build-cache playwright test (tests/build-cache.spec.ts). It forces
+    // the boot branch's prompt to be <name> instead of "router" so the
+    // test can produce a TQKV dump per branch. The param is NEVER part of
+    // the normal user-facing flow.
     const tokenizeBranchPrompt = (text: string): number[] => {
       const msgs = [{ role: "system", content: text }];
       const asText = tokenizer.apply_chat_template(msgs, { tokenize: false, add_generation_prompt: false });
@@ -1109,12 +1114,23 @@ async function main() {
     };
     console.log(`[draw] branch token counts: router=${branchTokenIds.router.length}, sequence=${branchTokenIds.sequence.length}, architecture=${branchTokenIds.architecture.length}`);
 
-    // The "live" system cache at boot is the router. User prompts prefill
-    // on top of router KV. Mid-stream, when setType fires, engine.mountKV
-    // replaces router with the chosen branch and the do-over re-prefills
+    const buildBranchParam = new URLSearchParams(location.search).get("buildBranch");
+    const bootBranch: BranchName =
+      buildBranchParam && (buildBranchParam in BRANCHES)
+        ? (buildBranchParam as BranchName)
+        : "router";
+    if (buildBranchParam && bootBranch !== "router") {
+      console.log(`[draw] BUILD-ONLY override: boot branch = "${bootBranch}" (via ?buildBranch=)`);
+    }
+
+    // The "live" system cache at boot is the bootBranch (router for real
+    // users; one of the other branches when the build-cache test is
+    // regenerating that specific branch's KV). User prompts prefill on
+    // top of this KV. Mid-stream, when setType fires, engine.mountKV
+    // replaces it with the chosen branch and the do-over re-prefills
     // the user turn on top of the new branch.
-    const systemTokenIds: number[] = branchTokenIds.router;
-    console.log("[draw] active boot branch: router,", systemTokenIds.length, "tokens");
+    const systemTokenIds: number[] = branchTokenIds[bootBranch];
+    console.log(`[draw] active boot branch: ${bootBranch}, ${systemTokenIds.length} tokens`);
     systemCacheEnd = systemTokenIds.length;
 
     worker = new EngineWorker();

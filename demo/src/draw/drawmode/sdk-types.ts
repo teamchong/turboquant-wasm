@@ -32,7 +32,7 @@ interface ConnectOpts {
 
 declare class Diagram {
   setDirection(direction: "TB" | "LR" | "RL" | "BT"): void;
-  setType(type: "architecture" | "sequence" | "swimlane" | "class"): void;
+  setType(type: "architecture" | "sequence" | "flowchart" | "state" | "orgchart" | "er" | "class" | "swimlane"): void;
 
   addBox(label: string, opts?: ShapeOpts): string;
   addEllipse(label: string, opts?: ShapeOpts): string;
