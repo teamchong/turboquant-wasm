@@ -10,6 +10,26 @@ pub const qjl = @import("qjl.zig");
 pub const EncodeError = error{ InvalidDimension, OutOfMemory };
 pub const DecodeError = error{ InvalidHeader, InvalidPayload, OutOfMemory };
 
+/// Validate that payload field sizes in the header are consistent with the
+/// declared dimension. Prevents out-of-bounds reads in polar/qjl when a
+/// crafted header claims a large dim but provides undersized payloads.
+fn validatePayloadSizes(header: format.Header) bool {
+    const dim: u32 = header.dim;
+    if (dim == 0 or dim % 2 != 0) return false;
+
+    // polar: (dim/2) pairs * 7 bits, rounded up to bytes, plus 1 padding byte
+    const num_pairs = dim / 2;
+    const polar_bits = num_pairs * 7;
+    const expected_polar = (polar_bits + 7) / 8 + 1;
+    if (header.polar_bytes != expected_polar) return false;
+
+    // qjl: one sign bit per dimension, rounded up to bytes
+    const expected_qjl = (dim + 7) / 8;
+    if (header.qjl_bytes != expected_qjl) return false;
+
+    return true;
+}
+
 pub const EngineConfig = struct {
     dim: usize,
     seed: u32,
@@ -114,6 +134,7 @@ pub const Engine = struct {
             error.InvalidPayload => return DecodeError.InvalidPayload,
         };
         if (header.dim != e.dim) return DecodeError.InvalidPayload;
+        if (!validatePayloadSizes(header)) return DecodeError.InvalidPayload;
 
         const payload = format.slicePayload(compressed, header) catch |err| switch (err) {
             error.InvalidHeader => return DecodeError.InvalidHeader,
@@ -149,6 +170,7 @@ pub const Engine = struct {
     pub fn dot(e: *Engine, q: []const f32, compressed: []const u8) f32 {
         const header = format.readHeader(compressed) catch return 0;
         if (q.len != e.dim or header.dim != e.dim) return 0;
+        if (!validatePayloadSizes(header)) return 0;
 
         const payload = format.slicePayload(compressed, header) catch return 0;
 
@@ -188,7 +210,7 @@ pub const Engine = struct {
         // Precompute q_sum for QJL fast path (SIMD reduction)
         var q_sum: f32 = 0;
         const d = rotated_q.len;
-        const lane: usize = comptime if (is_aarch64) 4 else 4;
+        const lane = std.simd.suggestVectorLength(f32) orelse 4;
         {
             var sum_vec: @Vector(lane, f32) = @splat(0);
             var si: usize = 0;
@@ -223,9 +245,6 @@ pub const Engine = struct {
             out_scores[i] = polar_sum + qjl_sum;
         }
     }
-
-    const builtin = @import("builtin");
-    const is_aarch64 = builtin.cpu.arch == .aarch64;
 };
 
 fn computeResidualFromPolar(polar_encoded: []const u8, rotated: []const f32, max_r: f32, residual: []f32) void {
@@ -435,6 +454,25 @@ test "decode rejects truncated payload" {
     try std.testing.expectError(DecodeError.InvalidPayload, result);
 }
 
+test "decode rejects payload with inconsistent field sizes" {
+    const allocator = std.testing.allocator;
+    var engine = try Engine.init(allocator, .{ .dim = 8, .seed = 12345 });
+    defer engine.deinit(allocator);
+
+    // Encode a valid vector, then corrupt the polar_bytes field in the header
+    const x: [8]f32 = .{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 };
+    const compressed = try engine.encode(allocator, &x);
+    defer allocator.free(compressed);
+
+    // Corrupt polar_bytes (offset 6..10) to an inconsistent value
+    var corrupted = try allocator.dupe(u8, compressed);
+    defer allocator.free(corrupted);
+    std.mem.writeInt(u32, corrupted[6..10], 0, .little);
+
+    const result = engine.decode(allocator, corrupted);
+    try std.testing.expectError(DecodeError.InvalidPayload, result);
+}
+
 test "dot returns zero on dimension mismatch" {
     const allocator = std.testing.allocator;
     var engine = try Engine.init(allocator, .{ .dim = 8, .seed = 12345 });
@@ -446,6 +484,24 @@ test "dot returns zero on dimension mismatch" {
 
     const wrong_dim: [16]f32 = .{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0, 16.0 };
     const result = engine.dot(&wrong_dim, compressed);
+    try std.testing.expectEqual(0.0, result);
+}
+
+test "dot returns zero on payload with inconsistent field sizes" {
+    const allocator = std.testing.allocator;
+    var engine = try Engine.init(allocator, .{ .dim = 8, .seed = 12345 });
+    defer engine.deinit(allocator);
+
+    const x: [8]f32 = .{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 };
+    const compressed = try engine.encode(allocator, &x);
+    defer allocator.free(compressed);
+
+    var corrupted = try allocator.dupe(u8, compressed);
+    defer allocator.free(corrupted);
+    std.mem.writeInt(u32, corrupted[6..10], 0, .little);
+
+    const q: [8]f32 = .{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 };
+    const result = engine.dot(&q, corrupted);
     try std.testing.expectEqual(0.0, result);
 }
 

@@ -65,7 +65,9 @@ pub fn readHeader(data: []const u8) FormatError!Header {
 
 pub fn slicePayload(data: []const u8, header: Header) FormatError!struct { polar: []const u8, qjl: []const u8 } {
     const payload_start = HEADER_SIZE;
-    const payload_end = payload_start + header.polar_bytes + header.qjl_bytes;
+    // Guard against u32 overflow when summing polar_bytes + qjl_bytes
+    const payload_len = std.math.add(u32, header.polar_bytes, header.qjl_bytes) catch return FormatError.InvalidPayload;
+    const payload_end = payload_start + payload_len;
     if (data.len < payload_end) return FormatError.InvalidPayload;
 
     return .{
