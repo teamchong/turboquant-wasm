@@ -897,14 +897,22 @@ async function generate() {
       // thinking + code phases fresh.
       if (mountTarget && !aborted) {
         console.log(`[draw] mid-stream mount: swap router → "${mountTarget}", re-prefilling + redoing thinking+code`);
-        // Wipe all pre-mount output — generated under router context was
-        // partial-setType-and-maybe-garbage; the specialised branch gets a
-        // clean slate.
-        generatedCode = "";
+        // Replace the router's partial output (typically truncated mid-
+        // setType, e.g. `setType("seq`) with the completed setType line
+        // for the target branch. Keeps the setType visible in the editor
+        // throughout the mount + re-thinking flow — previously we cleared
+        // the editor and the setType "disappeared" until the end.
+        //
+        // The branch's prompt says setType has been called, so the model
+        // usually does NOT re-emit it — output appends below as expected.
+        // If it does re-emit, the final dedupe step before executeCode
+        // strips duplicate setType lines.
+        const setTypeHeader = `setType("${mountTarget}");\n`;
+        generatedCode = setTypeHeader;
         thinkingText = "";
         tokenCount = 0;
         lastStmtCount = 0;
-        setCode("");
+        setCode(setTypeHeader);
         resetDiagram();
         clearThinkingCloud();
         // DON'T reset modeTracker: its fire-once semantics are what keep
@@ -949,21 +957,32 @@ async function generate() {
       let code = generatedCode.trim();
       code = code.replace(/^```(?:javascript|js|typescript|ts)?\s*\n?/i, "");
       code = code.replace(/\n?```\s*$/i, "");
-      // A mid-stream mount means the model's setType(...) fire was
-      // consumed as the mount signal under the router and then discarded
-      // when we wiped the code buffer for the do-over. The mounted
-      // branch's prompt says "setType has been called", so the model
-      // typically does NOT re-emit it. Without setType in the executed
-      // code, the SDK's diagramType stays at its default ("architecture"),
-      // which renders sequence / class / er / etc. as generic
-      // architecture — wrong layout.
-      //
-      // Fix: prepend setType("<target>") whenever a mount fired AND the
-      // generated code doesn't already have it. The typecheck is a
-      // simple "starts with setType(" after whitespace — defensive
-      // against the occasional case where the model does re-emit it.
-      if (mountTarget && code && !/^\s*setType\s*\(/.test(code)) {
-        code = `setType("${mountTarget}");\n${code}`;
+      // If a mount fired, generatedCode was seeded with the canonical
+      // setType("<target>");\n at mount time. If the branch ALSO emitted
+      // setType(...) as its first code line (some branches prompt
+      // ambiguously), we'd have two setType calls — dedupe by removing
+      // any non-first setType lines whose arg matches the mount target.
+      // Defensive; most branches don't re-emit.
+      if (mountTarget) {
+        const canonical = `setType("${mountTarget}");`;
+        // Strip any DUPLICATE setType call whose target matches mountTarget,
+        // keeping only the first occurrence.
+        let seen = false;
+        code = code.replace(/setType\s*\(\s*"[^"]*"\s*\)\s*;?/g, (match) => {
+          if (!seen) {
+            seen = true;
+            return canonical;
+          }
+          return "";
+        });
+        // Also ensure setType is on its own line (strip leftover `;;` or
+        // blank-lines-with-whitespace from the dedupe).
+        code = code.replace(/\n\s*\n\s*\n+/g, "\n\n").trim();
+        // If somehow no setType made it in (e.g., the router's partial
+        // was truncated before we seeded), prepend canonical.
+        if (!/^\s*setType\s*\(/.test(code)) {
+          code = `${canonical}\n${code}`;
+        }
       }
       setCode(code);
 
