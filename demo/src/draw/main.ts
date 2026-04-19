@@ -1033,6 +1033,13 @@ async function generate() {
         // setType in the branch's output won't trigger another mount.
         const second = await runThinkingAndCode(postMountFirst);
         phaseAReasonFinal = second.phaseAReason;
+        // Remember the mount target so the NEXT attempt (retry after a
+        // compile-gate failure) can skip the router entirely and mount
+        // this branch directly. Without this assignment, retries fall
+        // into the router path, the model doesn't re-emit setType
+        // (it's already in the conversation), runCodePhaseOnly discards
+        // every token, and we silently produce empty output.
+        lastMountedBranch = mountTarget;
       }
 
       // Debug: capture how each phase actually terminated — invaluable for

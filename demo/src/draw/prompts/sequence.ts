@@ -21,20 +21,22 @@ this mode is addActor(...) + message(from, to, label). Do NOT use addBox,
 addEllipse, addDiamond, addTable, addClass, addGroup, or addLane in this
 mode — they are invalid here.
 
-SEQUENCE example:
+SEQUENCE example (note: every actor participates in at least one message):
 setType("sequence");
+const user = addActor("User");
 const browser = addActor("Browser");
-const dns = addActor("DNS");
 const api = addActor("API");
 const db = addActor("Database");
-message(browser, dns, "Resolve example.com");
-message(dns, browser, "93.184.216.34");
-message(browser, api, "GET /users");
-message(api, db, "SELECT * FROM users");
-message(db, api, "rows");
-message(api, browser, "200 OK");
+message(user, browser, "Clicks login");
+message(browser, api, "POST /login");
+message(api, db, "SELECT * FROM users WHERE email=?");
+message(db, api, "user row");
+message(api, browser, "200 OK + session cookie");
+message(browser, user, "Show dashboard");
 
 Sequence-specific rules:
+- EVERY actor you declare MUST appear as either the from or the to of at least one message. Declaring an actor you never reference (e.g. addActor("User") without any message involving user) leaves an orphan column in the diagram — if the actor isn't participating, drop the addActor.
+- The first message usually originates from a user-facing actor (User / Client / Browser) to kick off the flow. For OAuth / login / API flows, the user initiates via a click or request; reflect that with a message(user, ...) as the first line.
 - Use addActor for every participant (one per column). NEVER addBox in a sequence diagram.
 - message(from, to, "label") in chronological order — order in code = order in time, top to bottom.
 - Each message must have a label. Include request AND response as separate messages, plus error paths.

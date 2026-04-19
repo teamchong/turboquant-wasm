@@ -16,15 +16,20 @@ export const CLASS_PROMPT = `${PREAMBLE}
 You are in UML CLASS mode (setType("class") has been called).
 Use:
   addClass(name, { attributes?, methods? }, opts?)
-    attributes: [{ name, type?, visibility? }]
-    methods:    [{ name, type?, visibility? }]
-    visibility is "public" (default) | "private" | "protected" | "package"
   connect(from, to, "label", { relation: "..." })
-    relation: "inheritance" | "composition" | "aggregation" | "dependency" | "association"
+
+attributes / methods are arrays of objects. Member shapes — one of:
+  { name: "<n>" }
+  { name: "<n>", type: "<t>" }
+  { name: "<n>", type: "<t>", visibility: "public" | "private" | "protected" | "package" }
+
+Brace-matching is the #1 way this mode fails. Each member object is exactly ONE pair of "{...}". Each attributes / methods array is exactly ONE pair of "[...]". Each addClass call closes with exactly "});". After the methods array's closing "]", the next character is "}" (to close the { attributes, methods } object) and then ");" — not "]," "}," or ",});".
+
+relation values: "inheritance" | "composition" | "aggregation" | "dependency" | "association".
 
 Do NOT use addBox, addEllipse, addDiamond, addActor, message, addTable, addGroup, or addLane.
 
-UML CLASS example:
+UML CLASS example (4 classes, inheritance hierarchy — mirror this structure):
 setType("class");
 const animal = addClass("Animal", {
   attributes: [
