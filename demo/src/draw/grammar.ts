@@ -249,13 +249,33 @@ export type SdkMode =
  */
 const SET_TYPE_RE = /setType\s*\(\s*"(sequence|architecture)"\s*\)/;
 
+export type ModeAction = (mode: SdkMode) => void;
+
 export class ModeTracker {
   private buffer = "";
   private _mode: SdkMode = SDK_MODE_UNSET;
+  private onEnterHandlers = new Map<SdkMode, ModeAction[]>();
+
+  /** Register a callback that fires when SDK state transitions into `mode`.
+   *  Multiple handlers per mode are allowed; they run in registration order.
+   *  Handlers run synchronously — async work must be scheduled by the handler
+   *  itself (e.g. via queue.submit on a GPU device).
+   *
+   *  v1 only fires onEnter for SEQUENCE / ARCHITECTURE. UNSET is never
+   *  "entered" (it's the initial state + the post-reset state). */
+  onEnter(mode: SdkMode, fn: ModeAction): void {
+    if (mode === SDK_MODE_UNSET) {
+      throw new Error("onEnter(UNSET) never fires — use reset() for that");
+    }
+    const list = this.onEnterHandlers.get(mode);
+    if (list) list.push(fn);
+    else this.onEnterHandlers.set(mode, [fn]);
+  }
 
   /** Feed the latest decoded token text. Returns true iff SDK state
-   *  just transitioned into a non-UNSET mode on this call (caller can
-   *  use this to fire mount actions without tracking prev-vs-next). */
+   *  just transitioned into a non-UNSET mode on this call. If a transition
+   *  happens, registered onEnter handlers for the new mode fire before
+   *  this method returns. */
   observe(text: string): boolean {
     if (this._mode !== SDK_MODE_UNSET) return false;
     if (text.length === 0) return false;
@@ -263,16 +283,23 @@ export class ModeTracker {
     const m = SET_TYPE_RE.exec(this.buffer);
     if (!m) return false;
     this._mode = m[1] === "sequence" ? SDK_MODE_SEQUENCE : SDK_MODE_ARCHITECTURE;
-    // Drop the buffer — we only scan once per generation.
     this.buffer = "";
+    const handlers = this.onEnterHandlers.get(this._mode);
+    if (handlers) for (const fn of handlers) fn(this._mode);
     return true;
   }
 
-  /** Reset to UNSET. Call at start of each generation AND on retry
-   *  rollback (retry replays the router, so SDK state must restart). */
+  /** Reset SDK state to UNSET and clear the scan buffer. Does NOT
+   *  unregister handlers — they persist across generations. */
   reset(): void {
     this.buffer = "";
     this._mode = SDK_MODE_UNSET;
+  }
+
+  /** Unregister all handlers. Useful for tests; production code typically
+   *  registers once at construction and relies on reset() to re-arm. */
+  clearHandlers(): void {
+    this.onEnterHandlers.clear();
   }
 
   get mode(): SdkMode { return this._mode; }

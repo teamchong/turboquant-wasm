@@ -74,6 +74,55 @@ test.describe("ModeTracker", () => {
     expect(t2.mode).toBe(SDK_MODE_ARCHITECTURE);
   });
 
+  test("onEnter handler fires synchronously on transition", () => {
+    const t = new ModeTracker();
+    const calls: number[] = [];
+    t.onEnter(SDK_MODE_SEQUENCE, (m) => calls.push(m));
+    t.onEnter(SDK_MODE_ARCHITECTURE, (m) => calls.push(m));
+
+    t.observe('setType("sequence");');
+    expect(calls).toEqual([SDK_MODE_SEQUENCE]);
+  });
+
+  test("multiple onEnter handlers run in registration order", () => {
+    const t = new ModeTracker();
+    const order: string[] = [];
+    t.onEnter(SDK_MODE_ARCHITECTURE, () => order.push("first"));
+    t.onEnter(SDK_MODE_ARCHITECTURE, () => order.push("second"));
+    t.onEnter(SDK_MODE_ARCHITECTURE, () => order.push("third"));
+
+    t.observe('setType("architecture");');
+    expect(order).toEqual(["first", "second", "third"]);
+  });
+
+  test("onEnter does not fire on ignored setType args", () => {
+    const t = new ModeTracker();
+    let fired = false;
+    t.onEnter(SDK_MODE_SEQUENCE, () => { fired = true; });
+    t.onEnter(SDK_MODE_ARCHITECTURE, () => { fired = true; });
+
+    t.observe('setType("flowchart");');
+    expect(fired).toBe(false);
+  });
+
+  test("onEnter(UNSET) rejects at registration time", () => {
+    const t = new ModeTracker();
+    expect(() => t.onEnter(SDK_MODE_UNSET, () => {})).toThrow(/never fires/);
+  });
+
+  test("handlers persist across reset()", () => {
+    const t = new ModeTracker();
+    const calls: number[] = [];
+    t.onEnter(SDK_MODE_SEQUENCE, (m) => calls.push(m));
+
+    t.observe('setType("sequence");');
+    expect(calls).toEqual([SDK_MODE_SEQUENCE]);
+
+    t.reset();
+    t.observe('setType("sequence");');
+    expect(calls).toEqual([SDK_MODE_SEQUENCE, SDK_MODE_SEQUENCE]);
+  });
+
   test("does not fire on partial setType within thinking text", () => {
     const t = new ModeTracker();
     // Thinking mode might emit prose that MENTIONS setType — but since the
