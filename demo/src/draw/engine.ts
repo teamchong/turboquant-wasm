@@ -1365,6 +1365,62 @@ export class InferenceEngine {
   }
 
   // ===========================================================================
+  // Multi-branch KV: mount a pre-baked branch as the active system cache
+  // ===========================================================================
+  //
+  // v1 flat mount: a branch IS the system cache. mountKV(name) wipes any
+  // tokens past the previous system cache and replaces the system KV with
+  // the named branch's pre-baked KV. After mount, engine.position equals
+  // the branch's token count — caller is responsible for re-prefilling the
+  // user's turn + any seed tokens they want the model to see before
+  // resuming decode.
+  //
+  // Why no "splice onto the end of router" in v1: a branch's K was RoPE-
+  // encoded for positions [0, branch_len). Mounting it at position P > 0
+  // would make those K vectors point at the wrong positional phase, so
+  // attention would be wrong. v2 adds a re-RoPE pass (#102) that enables
+  // arbitrary-position mount and nested sub-shells.
+
+  private branches = new Map<string, { blob: ArrayBuffer; tokenIds: number[] }>();
+  private _activeBranch: string | null = null;
+
+  /** Get the name of the branch currently mounted as the system cache,
+   *  or null if no branch has been mounted (e.g. plain loadCache path). */
+  get activeBranch(): string | null { return this._activeBranch; }
+
+  /** Make a branch mountable later. Call once per branch at worker init,
+   *  after parsing the multi-branch system-cache container. Stores the
+   *  blob + tokens in CPU memory; does NOT touch the GPU until mountKV()
+   *  is called. */
+  registerBranch(name: string, blob: ArrayBuffer, tokenIds: number[]): void {
+    this.branches.set(name, { blob, tokenIds });
+  }
+
+  /** Mount the named branch as the active system cache. Equivalent to
+   *  loadCache(branch.blob, branch.tokenIds) plus bookkeeping. Throws if
+   *  the branch is not registered.
+   *
+   *  Side-effects:
+   *    - All GPU KV cache buffers are overwritten with the branch's bytes
+   *    - engine.position is set to the branch's token count
+   *    - engine.activeBranch is set to `name`
+   *    - snapshot state (if any) is invalidated — caller should re-snapshot
+   *      if they want restoreCache() to return to the new branch */
+  mountKV(name: string): void {
+    const entry = this.branches.get(name);
+    if (!entry) {
+      const available = [...this.branches.keys()].join(", ") || "(none registered)";
+      throw new Error(`mountKV: unknown branch "${name}". Registered: ${available}`);
+    }
+    this.loadCache(entry.blob, entry.tokenIds);
+    this._activeBranch = name;
+  }
+
+  /** List registered branch names (in insertion order). Useful for
+   *  diagnostics and for the worker's "which branches did we load?" log. */
+  get registeredBranches(): string[] { return [...this.branches.keys()]; }
+
+  // ===========================================================================
   // Run one decoder layer
   // ===========================================================================
 
