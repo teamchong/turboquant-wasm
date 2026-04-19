@@ -118,7 +118,7 @@ test.describe.serial("Build system prompt cache", () => {
       });
       page.on("pageerror", (err) => console.log(`[${branch}] [pageerror] ${err.message}`));
 
-      await page.goto(`${BASE_URL}/draw.html?noCache=1&branch=${branch}`);
+      await page.goto(`${BASE_URL}/draw.html?noCache=1&buildBranch=${branch}`);
 
       const heartbeatStart = Date.now();
       const heartbeat = setInterval(() => {
