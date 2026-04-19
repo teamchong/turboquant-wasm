@@ -226,33 +226,61 @@ export class GrammarState {
 // and is trivially cheap.
 // =============================================================================
 
+// One SDK_MODE constant per setType value (plus UNSET for the initial
+// "router is active" state). A separate SDK mode per DiagramType means
+// each setType fire mounts a DIFFERENT branch, so per-type branches
+// can contain dense per-type content (few-shot examples, tight rules)
+// without being diluted by irrelevant other-type content.
 export const SDK_MODE_UNSET = 0;
-export const SDK_MODE_SEQUENCE = 1;
-export const SDK_MODE_ARCHITECTURE = 2;
+export const SDK_MODE_ARCHITECTURE = 1;
+export const SDK_MODE_SEQUENCE = 2;
+export const SDK_MODE_FLOWCHART = 3;
+export const SDK_MODE_STATE = 4;
+export const SDK_MODE_ORGCHART = 5;
+export const SDK_MODE_ER = 6;
+export const SDK_MODE_CLASS = 7;
+export const SDK_MODE_SWIMLANE = 8;
 
 export type SdkMode =
   | typeof SDK_MODE_UNSET
+  | typeof SDK_MODE_ARCHITECTURE
   | typeof SDK_MODE_SEQUENCE
-  | typeof SDK_MODE_ARCHITECTURE;
+  | typeof SDK_MODE_FLOWCHART
+  | typeof SDK_MODE_STATE
+  | typeof SDK_MODE_ORGCHART
+  | typeof SDK_MODE_ER
+  | typeof SDK_MODE_CLASS
+  | typeof SDK_MODE_SWIMLANE;
+
+/** Map a setType("...") arg to its SDK_MODE constant. Returns UNSET
+ *  for strings that aren't in the DiagramType union (used by the
+ *  observe path to ignore unknown args without firing).
+ */
+export function sdkModeForSetTypeArg(arg: string): SdkMode {
+  switch (arg) {
+    case "architecture": return SDK_MODE_ARCHITECTURE;
+    case "sequence":     return SDK_MODE_SEQUENCE;
+    case "flowchart":    return SDK_MODE_FLOWCHART;
+    case "state":        return SDK_MODE_STATE;
+    case "orgchart":     return SDK_MODE_ORGCHART;
+    case "er":           return SDK_MODE_ER;
+    case "class":        return SDK_MODE_CLASS;
+    case "swimlane":     return SDK_MODE_SWIMLANE;
+    default:             return SDK_MODE_UNSET;
+  }
+}
 
 /**
  * Tracks SDK-level state by scanning decoded text for completed
  * `setType("...")` calls. One instance per generation.
  *
- * v1 only fires one transition (UNSET → SEQUENCE | ARCHITECTURE). Further
- * setType calls are ignored — our grammar will mask them, but even if a
- * second one slipped through we don't act on it.
+ * Fires UNSET → one of the 8 per-type SDK_MODEs on first match. Each
+ * mode maps 1:1 to a branch name (grammar.ts SDK_MODE_* ↔ BRANCHES
+ * keys in prompts/index.ts), so the onEnter handler can mount the
+ * correct specialised KV without any extra lookup.
  *
- * All eight supported DiagramType values (types.ts) are recognised by
- * the pattern. Routing:
- *   "sequence"  → SDK_MODE_SEQUENCE
- *   everything else ("architecture" | "flowchart" | "state" | "orgchart"
- *                    | "er" | "class" | "swimlane") → SDK_MODE_ARCHITECTURE
- * The sub-types within the generic category share the architecture
- * branch's KV (same underlying Graphviz layout; presentational
- * variations only). If we ever want per-sub-type branches (e.g. a
- * dedicated "class" branch for UML diagrams), extend the routing here
- * AND add the branch to BRANCHES in prompts/index.ts.
+ * Fires once per generation: a second setType in the same stream is
+ * ignored. A retry resets the tracker via reset().
  */
 const SET_TYPE_RE = /setType\s*\(\s*"(sequence|architecture|flowchart|state|orgchart|er|class|swimlane)"\s*\)/;
 
@@ -284,17 +312,25 @@ export class ModeTracker {
    *  happens, registered onEnter handlers for the new mode fire before
    *  this method returns.
    *
-   *  Routing (all non-sequence values collapse to ARCHITECTURE because
-   *  they share the architecture branch's KV — see SET_TYPE_RE comment):
-   *    "sequence"  → SDK_MODE_SEQUENCE
-   *    other       → SDK_MODE_ARCHITECTURE */
+   *  Each of the 8 DiagramType setType args routes to its own mode:
+   *    "architecture" → SDK_MODE_ARCHITECTURE
+   *    "sequence"     → SDK_MODE_SEQUENCE
+   *    "flowchart"    → SDK_MODE_FLOWCHART
+   *    "state"        → SDK_MODE_STATE
+   *    "orgchart"     → SDK_MODE_ORGCHART
+   *    "er"           → SDK_MODE_ER
+   *    "class"        → SDK_MODE_CLASS
+   *    "swimlane"     → SDK_MODE_SWIMLANE
+   */
   observe(text: string): boolean {
     if (this._mode !== SDK_MODE_UNSET) return false;
     if (text.length === 0) return false;
     this.buffer += text;
     const m = SET_TYPE_RE.exec(this.buffer);
     if (!m) return false;
-    this._mode = m[1] === "sequence" ? SDK_MODE_SEQUENCE : SDK_MODE_ARCHITECTURE;
+    const next = sdkModeForSetTypeArg(m[1]);
+    if (next === SDK_MODE_UNSET) return false; // shouldn't happen given the regex, defensive
+    this._mode = next;
     this.buffer = "";
     const handlers = this.onEnterHandlers.get(this._mode);
     if (handlers) for (const fn of handlers) fn(this._mode);

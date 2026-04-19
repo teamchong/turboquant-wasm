@@ -11,7 +11,19 @@ import drawmodeWasm from "./drawmode/drawmode-wasm.js";
 import { mountExcalidraw, updateDiagram, resetDiagram, fitToScreen, enterEditMode, exitEditMode, getMode, showThinkingCloud, clearThinkingCloud } from "./excalidraw-viewer.js";
 import { createEditor, setCode, appendCode, getCode } from "./code-editor.js";
 import EngineWorker from "./engine-worker.ts?worker";
-import { buildGrammar, NUM_STATES, ModeTracker, SDK_MODE_SEQUENCE, SDK_MODE_ARCHITECTURE } from "./grammar.js";
+import {
+  buildGrammar,
+  NUM_STATES,
+  ModeTracker,
+  SDK_MODE_ARCHITECTURE,
+  SDK_MODE_SEQUENCE,
+  SDK_MODE_FLOWCHART,
+  SDK_MODE_STATE,
+  SDK_MODE_ORGCHART,
+  SDK_MODE_ER,
+  SDK_MODE_CLASS,
+  SDK_MODE_SWIMLANE,
+} from "./grammar.js";
 
 const TOKENIZER_ID = "onnx-community/gemma-4-E2B-it-ONNX";
 const GGUF_URL = "https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_K_M.gguf";
@@ -724,8 +736,18 @@ async function generate() {
       // returning to the router snapshot via restoreCache + prefill.
       const modeTracker = new ModeTracker();
       let pendingMount: BranchName | null = null;
-      modeTracker.onEnter(SDK_MODE_SEQUENCE, () => { pendingMount = "sequence"; });
+      // One handler per mode — each maps to its own branch with dense
+      // per-type content. Adding a new DiagramType value requires adding
+      // a handler here, a branch file in prompts/, an entry in BRANCHES,
+      // and a constant + route in grammar.ts.
       modeTracker.onEnter(SDK_MODE_ARCHITECTURE, () => { pendingMount = "architecture"; });
+      modeTracker.onEnter(SDK_MODE_SEQUENCE,     () => { pendingMount = "sequence"; });
+      modeTracker.onEnter(SDK_MODE_FLOWCHART,    () => { pendingMount = "flowchart"; });
+      modeTracker.onEnter(SDK_MODE_STATE,        () => { pendingMount = "state"; });
+      modeTracker.onEnter(SDK_MODE_ORGCHART,     () => { pendingMount = "orgchart"; });
+      modeTracker.onEnter(SDK_MODE_ER,           () => { pendingMount = "er"; });
+      modeTracker.onEnter(SDK_MODE_CLASS,        () => { pendingMount = "class"; });
+      modeTracker.onEnter(SDK_MODE_SWIMLANE,     () => { pendingMount = "swimlane"; });
 
       // Phase A (thinking) + reminder + Phase B (code). Bundled as a block
       // so the mid-stream mount do-over can run it twice: once under the
@@ -1111,8 +1133,19 @@ async function main() {
       router: tokenizeBranchPrompt(BRANCHES.router),
       sequence: tokenizeBranchPrompt(BRANCHES.sequence),
       architecture: tokenizeBranchPrompt(BRANCHES.architecture),
+      flowchart: tokenizeBranchPrompt(BRANCHES.flowchart),
+      state: tokenizeBranchPrompt(BRANCHES.state),
+      orgchart: tokenizeBranchPrompt(BRANCHES.orgchart),
+      er: tokenizeBranchPrompt(BRANCHES.er),
+      class: tokenizeBranchPrompt(BRANCHES.class),
+      swimlane: tokenizeBranchPrompt(BRANCHES.swimlane),
     };
-    console.log(`[draw] branch token counts: router=${branchTokenIds.router.length}, sequence=${branchTokenIds.sequence.length}, architecture=${branchTokenIds.architecture.length}`);
+    console.log(
+      `[draw] branch token counts:\n` +
+      Object.entries(branchTokenIds)
+        .map(([name, ids]) => `  ${name.padEnd(14)} = ${ids.length}`)
+        .join("\n"),
+    );
 
     const buildBranchParam = new URLSearchParams(location.search).get("buildBranch");
     const bootBranch: BranchName =

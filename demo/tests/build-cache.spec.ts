@@ -31,7 +31,17 @@ const OUTPUT_PATH = resolve(HERE, "..", "public", "system-cache.bin");
 const DEV_PORT = process.env.PLAYWRIGHT_DEV_PORT ?? "5173";
 const BASE_URL = `http://localhost:${DEV_PORT}`;
 
-const BRANCH_ORDER = ["router", "sequence", "architecture"] as const;
+const BRANCH_ORDER = [
+  "router",
+  "sequence",
+  "architecture",
+  "flowchart",
+  "state",
+  "orgchart",
+  "er",
+  "class",
+  "swimlane",
+] as const;
 
 /**
  * Chrome's persistent-profile model writes SingletonLock / SingletonCookie /

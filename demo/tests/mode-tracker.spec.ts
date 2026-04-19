@@ -2,8 +2,14 @@ import { test, expect } from "@playwright/test";
 import {
   ModeTracker,
   SDK_MODE_UNSET,
-  SDK_MODE_SEQUENCE,
   SDK_MODE_ARCHITECTURE,
+  SDK_MODE_SEQUENCE,
+  SDK_MODE_FLOWCHART,
+  SDK_MODE_STATE,
+  SDK_MODE_ORGCHART,
+  SDK_MODE_ER,
+  SDK_MODE_CLASS,
+  SDK_MODE_SWIMLANE,
 } from "../src/draw/grammar";
 
 // Pure-TS tests for the SDK ModeTracker. No browser needed.
@@ -58,13 +64,21 @@ test.describe("ModeTracker", () => {
     expect(t.mode).toBe(SDK_MODE_ARCHITECTURE);
   });
 
-  test("routes all non-sequence types to ARCHITECTURE", () => {
-    // flowchart / state / orgchart / er / class / swimlane all collapse
-    // to the architecture branch because they share Graphviz layout.
-    for (const arg of ["flowchart", "state", "orgchart", "er", "class", "swimlane", "architecture"]) {
+  test("routes each of the 8 DiagramType values to its own mode", () => {
+    const expected: Array<[string, number]> = [
+      ["architecture", SDK_MODE_ARCHITECTURE],
+      ["sequence",     SDK_MODE_SEQUENCE],
+      ["flowchart",    SDK_MODE_FLOWCHART],
+      ["state",        SDK_MODE_STATE],
+      ["orgchart",     SDK_MODE_ORGCHART],
+      ["er",           SDK_MODE_ER],
+      ["class",        SDK_MODE_CLASS],
+      ["swimlane",     SDK_MODE_SWIMLANE],
+    ];
+    for (const [arg, mode] of expected) {
       const t = new ModeTracker();
       expect(t.observe(`setType("${arg}");`)).toBe(true);
-      expect(t.mode).toBe(SDK_MODE_ARCHITECTURE);
+      expect(t.mode).toBe(mode);
     }
   });
 
