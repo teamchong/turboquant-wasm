@@ -13,18 +13,19 @@ pub const DecodeError = error{ InvalidHeader, InvalidPayload, OutOfMemory };
 /// Validate that payload field sizes in the header are consistent with the
 /// declared dimension. Prevents out-of-bounds reads in polar/qjl when a
 /// crafted header claims a large dim but provides undersized payloads.
+///
+/// Delegates to the single source of truth for encoded sizes —
+/// `polar.polarBytesNeeded` and `qjl.qjlBytesNeeded` — so if either format's
+/// bit widths ever change (e.g. R_BITS / THETA_BITS retuned, QJL widens
+/// from 1-bit) this check stays in sync automatically.
 fn validatePayloadSizes(header: format.Header) bool {
     const dim: u32 = header.dim;
     if (dim == 0 or dim % 2 != 0) return false;
 
-    // polar: (dim/2) pairs * 7 bits, rounded up to bytes, plus 1 padding byte
-    const num_pairs = dim / 2;
-    const polar_bits = num_pairs * 7;
-    const expected_polar = (polar_bits + 7) / 8 + 1;
+    const expected_polar = polar.polarBytesNeeded(dim);
     if (header.polar_bytes != expected_polar) return false;
 
-    // qjl: one sign bit per dimension, rounded up to bytes
-    const expected_qjl = (dim + 7) / 8;
+    const expected_qjl = qjl.qjlBytesNeeded(dim);
     if (header.qjl_bytes != expected_qjl) return false;
 
     return true;
@@ -499,6 +500,46 @@ test "dot returns zero on payload with inconsistent field sizes" {
     var corrupted = try allocator.dupe(u8, compressed);
     defer allocator.free(corrupted);
     std.mem.writeInt(u32, corrupted[6..10], 0, .little);
+
+    const q: [8]f32 = .{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 };
+    const result = engine.dot(&q, corrupted);
+    try std.testing.expectEqual(0.0, result);
+}
+
+test "decode rejects payload with inconsistent qjl_bytes" {
+    // Symmetric coverage for the qjl_bytes validation path. The existing
+    // tests corrupt polar_bytes (header offset 6..10); qjl_bytes lives at
+    // offset 10..14 and has its own size check in validatePayloadSizes.
+    // Without this test a regression that removes the qjl_bytes check
+    // while keeping the polar_bytes check wouldn't be caught.
+    const allocator = std.testing.allocator;
+    var engine = try Engine.init(allocator, .{ .dim = 8, .seed = 12345 });
+    defer engine.deinit(allocator);
+
+    const x: [8]f32 = .{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 };
+    const compressed = try engine.encode(allocator, &x);
+    defer allocator.free(compressed);
+
+    var corrupted = try allocator.dupe(u8, compressed);
+    defer allocator.free(corrupted);
+    std.mem.writeInt(u32, corrupted[10..14], 0, .little);
+
+    const result = engine.decode(allocator, corrupted);
+    try std.testing.expectError(DecodeError.InvalidPayload, result);
+}
+
+test "dot returns zero on payload with inconsistent qjl_bytes" {
+    const allocator = std.testing.allocator;
+    var engine = try Engine.init(allocator, .{ .dim = 8, .seed = 12345 });
+    defer engine.deinit(allocator);
+
+    const x: [8]f32 = .{ 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0 };
+    const compressed = try engine.encode(allocator, &x);
+    defer allocator.free(compressed);
+
+    var corrupted = try allocator.dupe(u8, compressed);
+    defer allocator.free(corrupted);
+    std.mem.writeInt(u32, corrupted[10..14], 0, .little);
 
     const q: [8]f32 = .{ 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8 };
     const result = engine.dot(&q, corrupted);
