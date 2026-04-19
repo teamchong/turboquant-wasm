@@ -647,6 +647,17 @@ async function generate() {
     const reminderTokenIds: number[] = Array.from(reminderEncoded);
     if (reminderTokenIds[0] === 2) reminderTokenIds.shift();  // strip BOS if present
 
+    // Thinking channel close marker. Prefilling this after the user turn
+    // (which ends with `<|channel>thought\n` from the chat template) skips
+    // the thinking phase entirely: the model enters code mode for its very
+    // first token. Used on the ROUTER run — the model only needs to emit
+    // setType(...) there; full planning-under-branch thinking happens in
+    // the post-mount do-over.
+    const CHANNEL_CLOSE_TEXT = "<channel|>";
+    const channelCloseEncoded = tokenizer.encode(CHANNEL_CLOSE_TEXT);
+    const channelCloseTokenIds: number[] = Array.from(channelCloseEncoded);
+    if (channelCloseTokenIds[0] === 2) channelCloseTokenIds.shift();  // strip BOS if present
+
     let lastError: string | undefined;
     let finalResult: any = null;
 
@@ -749,10 +760,45 @@ async function generate() {
       modeTracker.onEnter(SDK_MODE_CLASS,        () => { pendingMount = "class"; });
       modeTracker.onEnter(SDK_MODE_SWIMLANE,     () => { pendingMount = "swimlane"; });
 
-      // Phase A (thinking) + reminder + Phase B (code). Bundled as a block
-      // so the mid-stream mount do-over can run it twice: once under the
-      // router (to detect the setType), then again under the mounted
-      // branch (with full mode-specific docs in KV).
+      // Phase B only (code) — used for the router run where we skip
+      // thinking entirely. The router just has to emit setType(...); real
+      // planning happens under the mounted branch after the mount fires.
+      const runCodePhaseOnly = async (initialToken: number): Promise<{ mountTarget: BranchName | null }> => {
+        if (!EOS_TOKENS.has(initialToken)) {
+          const text = tokenizer.decode([initialToken], { skip_special_tokens: true });
+          modeTracker.observe(text);
+          if (pendingMount) return { mountTarget: pendingMount };
+          renderCodeToken(initialToken);
+        }
+
+        await workerStream(
+          {
+            type: "streamConstrained",
+            tokenId: initialToken,
+            maxTokens: MAX_CODE_TOKENS,
+            eosIds: [...EOS_TOKENS],
+            startInThinking: false,
+          } as any,
+          (msg) => {
+            if (aborted) return;
+            if (EOS_TOKENS.has(msg.id)) return;
+            const text = tokenizer.decode([msg.id], { skip_special_tokens: true });
+            modeTracker.observe(text);
+            if (pendingMount) {
+              worker!.postMessage({ type: "abort" });
+              return;
+            }
+            renderCodeToken(msg.id);
+            onStreamMsg(msg);
+          },
+        );
+
+        return { mountTarget: pendingMount };
+      };
+
+      // Phase A (thinking) + reminder + Phase B (code). Used for the
+      // post-mount do-over under the specialised branch: the model gets
+      // rich per-type context, plans the actual diagram, then emits code.
       const runThinkingAndCode = async (initialToken: number): Promise<{ mountTarget: BranchName | null; phaseAReason: string }> => {
         if (!EOS_TOKENS.has(initialToken)) renderThinkingToken(initialToken);
 
@@ -791,13 +837,11 @@ async function generate() {
         const codeStartToken = prefillResult.firstToken;
 
         // Observe the very first code token too — the model may have
-        // emitted setType as its first post-thinking token (e.g. the
-        // reminder primed it directly into code-emission mode).
+        // emitted setType as its first post-thinking token.
         if (!EOS_TOKENS.has(codeStartToken)) {
           renderCodeToken(codeStartToken);
           modeTracker.observe(tokenizer.decode([codeStartToken], { skip_special_tokens: true }));
           if (pendingMount) {
-            // Mount detected on first token — no stream started yet.
             return { mountTarget: pendingMount, phaseAReason: phaseA.reason };
           }
         }
@@ -813,15 +857,10 @@ async function generate() {
           (msg) => {
             if (aborted) return;
             if (EOS_TOKENS.has(msg.id)) return;
-            // Feed decoded text to mode tracker BEFORE rendering so a
-            // setType-completing token fires pendingMount on this same
-            // iteration. The worker's next-iter abort check then ends
-            // the stream cleanly.
             const text = tokenizer.decode([msg.id], { skip_special_tokens: true });
             modeTracker.observe(text);
             if (pendingMount) {
               worker!.postMessage({ type: "abort" });
-              // Don't render — pre-mount output is about to be discarded.
               return;
             }
             renderCodeToken(msg.id);
@@ -832,9 +871,25 @@ async function generate() {
         return { mountTarget: pendingMount, phaseAReason: phaseA.reason };
       };
 
-      // First run — under router.
-      let { mountTarget, phaseAReason: firstReason } = await runThinkingAndCode(nextToken);
-      let phaseAReasonFinal = firstReason;
+      // FIRST RUN under router: skip thinking entirely. The chat template
+      // left the cache at `...<|channel>thought\n`; prefilling <channel|>
+      // + reminder closes the thinking channel and primes code mode, so
+      // the model's first generated token IS the first code token. Saves
+      // ~5s of wasted router thinking that would be discarded anyway.
+      //
+      // The nextToken returned by the user-turn prefill was a thinking
+      // token (what the model would have emitted WITHOUT our follow-up
+      // prefill). We discard it — that's one forward pass of wasted
+      // compute, but vs re-running full phase A it's cheap.
+      statusEl.textContent = "Picking diagram type...";
+      const routerSkipPrefill = [...channelCloseTokenIds, ...reminderTokenIds];
+      const routerCodeStartResult = await workerCall<{ firstToken: number }>(
+        { type: "prefill", tokenIds: routerSkipPrefill }, "prefillDone",
+      );
+      const routerCodeStartToken = routerCodeStartResult.firstToken;
+
+      let { mountTarget } = await runCodePhaseOnly(routerCodeStartToken);
+      let phaseAReasonFinal = "skipped-under-router";
 
       // Mount triggered? Do the full do-over on the specialised branch.
       // runThinkingAndCode already set pendingMount and aborted the stream;
