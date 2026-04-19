@@ -1403,18 +1403,15 @@ async function main() {
       }
       if (msg.type === "ready") { workerInitDone = true; markReadyIfBoth(); }
       if (msg.type === "grammarReady") { grammarInitDone = true; markReadyIfBoth(); }
-      // Worker did a fresh prefill (no cache, or rejected stale cache after
-      // a SYSTEM_PROMPT edit). Ship the new dump to the vite dev server so
-      // it can overwrite public/system-cache.bin — next reload gets the fast
-      // path. In production (no /api/write-system-cache endpoint) this just
-      // 404s and we log-and-move-on.
+      // Worker may dump a freshly-prefilled router KV if the on-disk cache
+      // was missing or stale. We used to forward this to the dev server to
+      // auto-replace public/system-cache.bin, but with the multi-branch
+      // TQKC format that convenience is actively dangerous: a single-branch
+      // TQKV post would overwrite all seven non-router branches with
+      // nothing. Ignore the dump — `bun run rebuild-cache` is the
+      // authoritative way to refresh every branch.
       if (msg.type === "cacheRebuilt") {
-        fetch("/api/write-system-cache", { method: "POST", body: msg.data })
-          .then(async (r) => {
-            if (r.ok) console.log(`[draw] system-cache.bin rewritten (${(msg.data.byteLength / 1e6).toFixed(1)} MB)`);
-            else console.warn(`[draw] cache auto-write failed: ${r.status} ${await r.text()}`);
-          })
-          .catch((e) => console.warn(`[draw] cache auto-write skipped: ${e.message}`));
+        console.log(`[draw] worker dumped ${(msg.data.byteLength / 1e6).toFixed(1)} MB (auto-write disabled — run 'bun run rebuild-cache' to refresh public/system-cache.bin)`);
       }
       if (msg.type === "error" && !busy) {
         statusEl.textContent = `Error: ${msg.message}`;
