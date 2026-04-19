@@ -95,12 +95,22 @@ pointer + position-offset pair.
 
 Branch names (v1):
 - `"router"` — mode-picker preamble; small, always loaded initially
-- `"sequence"`, `"architecture"`, `"uml"` — per-mode specialised prompts
+- `"sequence"`, `"architecture"` — per-mode specialised prompts
 
-Branch sizes to fit in current KV budget: router ~500 tok, each mode
-branch ~1800 tok. Total baked ~5900 tok vs current 3005 — larger file,
-but only one branch is "live" at a time, so attention scan per decode
-step is smaller.
+(Originally planned `"uml"` as a separate branch, but the runtime
+`DiagramType` is only `"architecture" | "sequence"` — `class`, `er`,
+`swimlane`, etc. are visual shape sub-types inside `architecture` mode,
+so they share its branch.)
+
+Approximate branch sizes (rough, from char-count):
+- router ~200 tok
+- sequence ~800 tok (incl. SDK_TYPES)
+- architecture ~2200 tok (incl. SDK_TYPES)
+
+Total baked ~3200 tok — roughly matches today's single 3005-tok blob.
+Because only one branch is "live" at a time, runtime attention scan
+drops from 3005 → 200 (router alone) or 200+800=1000 (sequence) or
+200+2200=2400 (architecture). 1.3-15× less attention work per step.
 
 ### 2. KV mount primitive
 
@@ -197,7 +207,7 @@ single SYSTEM_PROMPT.
 
 ## Scope
 
-### v1 — flat branches, router + 3 modes
+### v1 — flat branches, router + 2 modes
 
 - [ ] Multi-branch cache file format (writer + reader)
 - [ ] `engine.mountKV(branchName)` — load from baked blob, no RoPE shift
@@ -254,10 +264,10 @@ Deferred until v1 demonstrates value.
 ## Open questions
 
 1. **How much does a branched system-cache.bin grow?** Today's is
-   68.9 MB (3005 tokens, TQ-compressed). If each branch is ~1800 tokens
-   we're looking at router + 3×1800 = ~5900 tokens baked, ~135 MB. Is
-   that acceptable? Gzip during asset emit would help but TQ data is
-   already near-random, bad compression ratio.
+   68.9 MB (3005 tokens, TQ-compressed). Revised estimate after the
+   2-mode split: router + sequence + architecture ≈ 3200 tokens baked,
+   so ~73 MB — roughly the same size, not 2× as first thought. TQ bytes
+   per token scale linearly with token count.
 
 2. **Is the model actually better in specialised mode?** Needs
    perplexity-on-mode-specific-prompt measurement before and after to
