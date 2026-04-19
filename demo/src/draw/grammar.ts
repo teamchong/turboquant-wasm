@@ -209,3 +209,71 @@ export class GrammarState {
     this.state = this.transitions[this.state * this.vocabSize + tokenId];
   }
 }
+
+// =============================================================================
+// SDK-level state (orthogonal to char-level grammar states above)
+//
+// The char-level grammar validates JS syntax (quotes balanced, identifiers
+// don't contain spaces, etc.) but does not know which SDK functions are
+// available in which diagram mode. We track that separately via ModeTracker:
+// a side-channel that watches decoded text as the model emits it and flips
+// SDK state when it recognises a completed `setType("...")` call.
+//
+// Why orthogonal, not nested into the char-level state table: nesting would
+// 3× the mask + transition tables (9 char states × 3 SDK states) for a
+// feature that only needs to fire once per generation. A side-channel tracks
+// O(emitted_text_len) characters for the single `setType(...)` pattern match
+// and is trivially cheap.
+// =============================================================================
+
+export const SDK_MODE_UNSET = 0;
+export const SDK_MODE_SEQUENCE = 1;
+export const SDK_MODE_ARCHITECTURE = 2;
+
+export type SdkMode =
+  | typeof SDK_MODE_UNSET
+  | typeof SDK_MODE_SEQUENCE
+  | typeof SDK_MODE_ARCHITECTURE;
+
+/**
+ * Tracks SDK-level state by scanning decoded text for completed
+ * `setType("...")` calls. One instance per generation.
+ *
+ * v1 only fires one transition (UNSET → SEQUENCE | ARCHITECTURE). Further
+ * setType calls are ignored — our grammar will mask them, but even if a
+ * second one slipped through we don't act on it.
+ *
+ * Pattern matches `setType("sequence")` or `setType("architecture")` with
+ * flexible whitespace. The value must be exactly one of those two strings
+ * — anything else is ignored and SDK state stays UNSET.
+ */
+const SET_TYPE_RE = /setType\s*\(\s*"(sequence|architecture)"\s*\)/;
+
+export class ModeTracker {
+  private buffer = "";
+  private _mode: SdkMode = SDK_MODE_UNSET;
+
+  /** Feed the latest decoded token text. Returns true iff SDK state
+   *  just transitioned into a non-UNSET mode on this call (caller can
+   *  use this to fire mount actions without tracking prev-vs-next). */
+  observe(text: string): boolean {
+    if (this._mode !== SDK_MODE_UNSET) return false;
+    if (text.length === 0) return false;
+    this.buffer += text;
+    const m = SET_TYPE_RE.exec(this.buffer);
+    if (!m) return false;
+    this._mode = m[1] === "sequence" ? SDK_MODE_SEQUENCE : SDK_MODE_ARCHITECTURE;
+    // Drop the buffer — we only scan once per generation.
+    this.buffer = "";
+    return true;
+  }
+
+  /** Reset to UNSET. Call at start of each generation AND on retry
+   *  rollback (retry replays the router, so SDK state must restart). */
+  reset(): void {
+    this.buffer = "";
+    this._mode = SDK_MODE_UNSET;
+  }
+
+  get mode(): SdkMode { return this._mode; }
+}
