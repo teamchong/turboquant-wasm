@@ -760,15 +760,33 @@ async function generate() {
       modeTracker.onEnter(SDK_MODE_CLASS,        () => { pendingMount = "class"; });
       modeTracker.onEnter(SDK_MODE_SWIMLANE,     () => { pendingMount = "swimlane"; });
 
-      // Phase B only (code) — used for the router run where we skip
-      // thinking entirely. The router just has to emit setType(...); real
-      // planning happens under the mounted branch after the mount fires.
+      // Router-phase observer. Tokens emitted under the router branch are
+      // thrown away — real code is generated under the mounted branch.
+      // During the router run we ONLY feed decoded text to modeTracker
+      // (to detect the setType) and tick the token / speed counters so
+      // the UI shows progress. We deliberately do NOT:
+      //   - append anything to the code editor
+      //   - accumulate anything in generatedCode
+      //   - trigger the partial-executor
+      // Once mount fires, the editor is seeded with `setType("<target>");\n`
+      // and branch tokens append normally via renderCodeToken from there.
+      // Result: editor is never polluted by the partial / truncated router
+      // setType that was causing the "setType flickers / disappears" bug.
+      const observeForMount = (id: number): boolean => {
+        tokenCount++;
+        updateSpeed();
+        const chunk = tokenizer.decode([id], { skip_special_tokens: true });
+        if (chunk) modeTracker.observe(chunk);
+        return pendingMount !== null;
+      };
+
+      // Router code phase: stream, observe each token, never render. The
+      // moment observeForMount sees a completed setType(...) it sets
+      // pendingMount and we abort the worker so the mount + do-over
+      // flow takes over.
       const runCodePhaseOnly = async (initialToken: number): Promise<{ mountTarget: BranchName | null }> => {
         if (!EOS_TOKENS.has(initialToken)) {
-          const text = tokenizer.decode([initialToken], { skip_special_tokens: true });
-          modeTracker.observe(text);
-          if (pendingMount) return { mountTarget: pendingMount };
-          renderCodeToken(initialToken);
+          if (observeForMount(initialToken)) return { mountTarget: pendingMount };
         }
 
         await workerStream(
@@ -782,13 +800,10 @@ async function generate() {
           (msg) => {
             if (aborted) return;
             if (EOS_TOKENS.has(msg.id)) return;
-            const text = tokenizer.decode([msg.id], { skip_special_tokens: true });
-            modeTracker.observe(text);
-            if (pendingMount) {
+            if (observeForMount(msg.id)) {
               worker!.postMessage({ type: "abort" });
               return;
             }
-            renderCodeToken(msg.id);
             onStreamMsg(msg);
           },
         );
@@ -897,32 +912,31 @@ async function generate() {
       // thinking + code phases fresh.
       if (mountTarget && !aborted) {
         console.log(`[draw] mid-stream mount: swap router → "${mountTarget}", re-prefilling + redoing thinking+code`);
-        // Replace the router's partial output (typically truncated mid-
-        // setType, e.g. `setType("seq`) with the completed setType line
-        // for the target branch. Keeps the setType visible in the editor
-        // throughout the mount + re-thinking flow — previously we cleared
-        // the editor and the setType "disappeared" until the end.
+        // Router phase rendered nothing to the editor (observeForMount is
+        // pure observation). Seed the editor now with the canonical
+        // setType("<target>");\n — branch tokens will append below it
+        // once the do-over starts streaming. This is the SOURCE OF TRUTH
+        // for the visible code from this point on.
+        //
+        // generatedCode shadows editor content so the statement-boundary
+        // partial-executor in renderCodeToken has something to count from.
+        // It IS the editor content (plus whatever tokens arrive next).
         //
         // The branch's prompt says setType has been called, so the model
         // usually does NOT re-emit it — output appends below as expected.
-        // If it does re-emit, the final dedupe step before executeCode
-        // strips duplicate setType lines.
+        // If it does re-emit, the final dedupe step strips duplicate
+        // setType lines before executeCode.
         const setTypeHeader = `setType("${mountTarget}");\n`;
         generatedCode = setTypeHeader;
-        thinkingText = "";
-        tokenCount = 0;
-        lastStmtCount = 0;
         setCode(setTypeHeader);
-        resetDiagram();
-        clearThinkingCloud();
         // DON'T reset modeTracker: its fire-once semantics are what keep
         // the second pass from aborting again. The model under the mounted
-        // branch will typically re-emit `setType("sequence")` as its first
-        // code line (the branch's examples show it), and if the tracker
-        // were reset it would re-fire and abort the stream mid-string,
-        // truncating the code (observed: 17ch of `setType("sequence`
-        // before EOS). Keeping the tracker "already fired" makes observe
-        // return false for the rest of the attempt.
+        // branch may re-emit `setType("sequence")` as its first code line
+        // (the branch's examples show it); if the tracker were reset it
+        // would re-fire and abort the stream mid-string, truncating the
+        // code (observed pre-fix: 17ch of `setType("sequence` before EOS).
+        // Keeping the tracker "already fired" makes observe return false
+        // for the rest of the attempt.
         pendingMount = null;
         // Conversation tokens re-prefilled on the mounted branch (the
         // mountBranchAndPrefill worker call does the prefill internally
