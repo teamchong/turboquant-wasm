@@ -4,14 +4,14 @@
 import { AutoTokenizer } from "@huggingface/transformers";
 import { executeCode } from "./drawmode/executor.js";
 import { SDK_TYPES } from "./drawmode/sdk-types.js";
-import { BRANCHES, type BranchName } from "./prompts/index.js";
+import { BRANCHES, type BranchName, ROUTER_PROMPT } from "./prompts/index.js";
 import { parseSystemCache } from "./system-cache-container.js";
 import { loadWasm } from "./drawmode/layout.js";
 import drawmodeWasm from "./drawmode/drawmode-wasm.js";
 import { mountExcalidraw, updateDiagram, resetDiagram, fitToScreen, enterEditMode, exitEditMode, getMode, showThinkingCloud, clearThinkingCloud } from "./excalidraw-viewer.js";
 import { createEditor, setCode, appendCode, getCode } from "./code-editor.js";
 import EngineWorker from "./engine-worker.ts?worker";
-import { buildGrammar, NUM_STATES } from "./grammar.js";
+import { buildGrammar, NUM_STATES, ModeTracker, SDK_MODE_SEQUENCE, SDK_MODE_ARCHITECTURE } from "./grammar.js";
 
 const TOKENIZER_ID = "onnx-community/gemma-4-E2B-it-ONNX";
 const GGUF_URL = "https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_K_M.gguf";
@@ -712,57 +712,53 @@ async function generate() {
         }
       };
 
-      // First token (from prefill) — it's the first reasoning token, render
-      // it into the thinking cloud. If the model ended the turn immediately
-      // (EOS on nextToken) we fall through with empty content and the retry
-      // loop handles it below.
-      if (!EOS_TOKENS.has(nextToken)) renderThinkingToken(nextToken);
-
-      // Phase A — stream thinking. Worker stops the moment grammar
-      // transitions out of S_IN_THINK (the `<channel|>` token just landed).
-      const phaseA = await workerStream(
-        {
-          type: "streamConstrained",
-          tokenId: nextToken,
-          maxTokens: MAX_THINKING_TOKENS,
-          eosIds: [...EOS_TOKENS],
-          startInThinking: true,
-        } as any,
-        (msg) => {
-          if (aborted) return;
-          if (EOS_TOKENS.has(msg.id)) return;
-          renderThinkingToken(msg.id);
-          onStreamMsg(msg);
-        },
-      );
-
-      // Thinking phase is over either way — drop the cloud.
-      clearThinkingCloud();
-
-      // Log the full reasoning so the curious user can inspect what the
-      // model was thinking before the code phase started. The `<channel|>`
-      // marker (if present) terminates the visible block — strip it + any
-      // trailing partial channel opener so the console output matches the
-      // same "visible" view the thinking cloud showed mid-stream.
-      if (thinkingText) {
-        const visible = thinkingText.replace(/<channel\|>.*$/s, "").trim();
-        if (visible) console.log(`[draw] thinking (${thinkingText.length}ch):\n${visible}`);
-      }
-
-      // Phase B — inject a "now emit code" reminder and run the constrained
-      // code stream. Always runs after phase A (even if thinking ran past
-      // its budget without closing the channel): the reminder is the only
-      // way out of the thinking loop, so dropping phase B would guarantee
-      // empty code. Prepending `<channel|>` into KV is only correct when
-      // thinking *did* close normally; when it didn't, the reminder's
-      // leading "\n\n" is enough of a separator.
+      // Dynamic-context mount detection. modeTracker scans decoded code-
+      // phase text for `setType("sequence"|"architecture")`. When it
+      // fires, pendingMount is set and we abort the stream so the caller
+      // can swap the system-cache branch and re-run phase A + phase B
+      // under the specialised context.
       //
-      // IMPORTANT: on thinkingEnded the worker emitted the `<channel|>`
-      // token but did NOT feed it back into KV (streamConstrained breaks
-      // before writing it), so we prepend its id to the reminder prefill.
-      // Without this the model would see continuous reasoning → reminder
-      // with no channel close in cache, violating its trained wire format.
-      if (!aborted) {
+      // One-shot per attempt: after the first mount we never swap again
+      // in this attempt (ModeTracker's own fire-once semantics). If a
+      // compile error triggers a retry, the outer attempt loop resets by
+      // returning to the router snapshot via restoreCache + prefill.
+      const modeTracker = new ModeTracker();
+      let pendingMount: BranchName | null = null;
+      modeTracker.onEnter(SDK_MODE_SEQUENCE, () => { pendingMount = "sequence"; });
+      modeTracker.onEnter(SDK_MODE_ARCHITECTURE, () => { pendingMount = "architecture"; });
+
+      // Phase A (thinking) + reminder + Phase B (code). Bundled as a block
+      // so the mid-stream mount do-over can run it twice: once under the
+      // router (to detect the setType), then again under the mounted
+      // branch (with full mode-specific docs in KV).
+      const runThinkingAndCode = async (initialToken: number): Promise<{ mountTarget: BranchName | null; phaseAReason: string }> => {
+        if (!EOS_TOKENS.has(initialToken)) renderThinkingToken(initialToken);
+
+        const phaseA = await workerStream(
+          {
+            type: "streamConstrained",
+            tokenId: initialToken,
+            maxTokens: MAX_THINKING_TOKENS,
+            eosIds: [...EOS_TOKENS],
+            startInThinking: true,
+          } as any,
+          (msg) => {
+            if (aborted) return;
+            if (EOS_TOKENS.has(msg.id)) return;
+            renderThinkingToken(msg.id);
+            onStreamMsg(msg);
+          },
+        );
+
+        clearThinkingCloud();
+
+        if (thinkingText) {
+          const visible = thinkingText.replace(/<channel\|>.*$/s, "").trim();
+          if (visible) console.log(`[draw] thinking (${thinkingText.length}ch):\n${visible}`);
+        }
+
+        if (aborted) return { mountTarget: null, phaseAReason: phaseA.reason };
+
         statusEl.textContent = "Generating diagram code...";
         const prefillTokens = phaseA.reason === "thinkingEnded"
           ? [phaseA.lastTokenId, ...reminderTokenIds]
@@ -772,7 +768,17 @@ async function generate() {
         );
         const codeStartToken = prefillResult.firstToken;
 
-        if (!EOS_TOKENS.has(codeStartToken)) renderCodeToken(codeStartToken);
+        // Observe the very first code token too — the model may have
+        // emitted setType as its first post-thinking token (e.g. the
+        // reminder primed it directly into code-emission mode).
+        if (!EOS_TOKENS.has(codeStartToken)) {
+          renderCodeToken(codeStartToken);
+          modeTracker.observe(tokenizer.decode([codeStartToken], { skip_special_tokens: true }));
+          if (pendingMount) {
+            // Mount detected on first token — no stream started yet.
+            return { mountTarget: pendingMount, phaseAReason: phaseA.reason };
+          }
+        }
 
         await workerStream(
           {
@@ -785,15 +791,70 @@ async function generate() {
           (msg) => {
             if (aborted) return;
             if (EOS_TOKENS.has(msg.id)) return;
+            // Feed decoded text to mode tracker BEFORE rendering so a
+            // setType-completing token fires pendingMount on this same
+            // iteration. The worker's next-iter abort check then ends
+            // the stream cleanly.
+            const text = tokenizer.decode([msg.id], { skip_special_tokens: true });
+            modeTracker.observe(text);
+            if (pendingMount) {
+              worker!.postMessage({ type: "abort" });
+              // Don't render — pre-mount output is about to be discarded.
+              return;
+            }
             renderCodeToken(msg.id);
             onStreamMsg(msg);
           },
         );
+
+        return { mountTarget: pendingMount, phaseAReason: phaseA.reason };
+      };
+
+      // First run — under router.
+      let { mountTarget, phaseAReason: firstReason } = await runThinkingAndCode(nextToken);
+      let phaseAReasonFinal = firstReason;
+
+      // Mount triggered? Do the full do-over on the specialised branch.
+      // runThinkingAndCode already set pendingMount and aborted the stream;
+      // we now mount the branch, re-prefill the user turn, and run the
+      // thinking + code phases fresh.
+      if (mountTarget && !aborted) {
+        console.log(`[draw] mid-stream mount: swap router → "${mountTarget}", re-prefilling + redoing thinking+code`);
+        // Wipe all pre-mount output — generated under router context was
+        // partial-setType-and-maybe-garbage; the specialised branch gets a
+        // clean slate.
+        generatedCode = "";
+        thinkingText = "";
+        tokenCount = 0;
+        lastStmtCount = 0;
+        setCode("");
+        resetDiagram();
+        clearThinkingCloud();
+        modeTracker.reset();
+        pendingMount = null;
+        // Conversation tokens re-prefilled on the mounted branch (the
+        // mountBranchAndPrefill worker call does the prefill internally
+        // and returns the model's first-token prediction, which is the
+        // opening of a fresh thinking channel).
+        const { firstToken: postMountFirst } = await workerCall<{ firstToken: number; branch: string }>(
+          {
+            type: "mountBranchAndPrefill",
+            branch: mountTarget,
+            userTurnTokens: currentAttemptPrefilled ?? tokenizeConversation(conversation, true),
+          },
+          "mountBranchDone",
+        );
+        // Second run — under the mounted branch. pendingMount stays null
+        // throughout; ModeTracker's fire-once semantics mean a second
+        // setType in the branch's output won't trigger another mount.
+        const second = await runThinkingAndCode(postMountFirst);
+        phaseAReasonFinal = second.phaseAReason;
       }
 
       // Debug: capture how each phase actually terminated — invaluable for
       // diagnosing "attempt 0 empty / retry fills in" pathologies.
-      console.log(`[draw] attempt ${attempt + 1} phaseA=${phaseA.reason} thinking=${thinkingText.length}ch code=${generatedCode.length}ch tokCount=${tokenCount}`);
+      const mountedNote = mountTarget ? ` mount=${mountTarget}` : "";
+      console.log(`[draw] attempt ${attempt + 1} phaseA=${phaseAReasonFinal}${mountedNote} thinking=${thinkingText.length}ch code=${generatedCode.length}ch tokCount=${tokenCount}`);
       if (thinkingText.length > 0) {
         console.log(`[draw]   thinking[0..200]=${JSON.stringify(thinkingText.slice(0, 200))}`);
       }
@@ -1026,27 +1087,34 @@ async function main() {
     tokenizer.chat_template = CHAT_TEMPLATE;
     console.log("[draw] tokenizer ready");
 
-    // ?branch=<name> selects which prompt to prefill. Used by the multi-
-    // branch cache build pipeline (tests/build-cache.spec.ts iterates over
-    // the known branches). For interactive testing you can also force a
-    // specific branch's prompt to be used end-to-end (router/sequence/
-    // architecture) to compare diagram quality per mode.
+    // Dynamic-context setup: tokenize every branch's prompt up-front. The
+    // router is what the engine actually boots with (its KV becomes the
+    // initial system cache); sequence + architecture are pre-registered on
+    // the engine so mountKV() can swap them in mid-stream when the grammar
+    // recognises a completed setType(...) call.
     //
-    // Missing / unknown value falls back to the legacy monolithic
-    // SYSTEM_PROMPT — keeps today's users on the same path unchanged.
-    const branchParam = new URLSearchParams(location.search).get("branch");
-    const selectedBranch: BranchName | null =
-      branchParam && (branchParam in BRANCHES) ? (branchParam as BranchName) : null;
-    const sysPromptText = selectedBranch ? BRANCHES[selectedBranch] : SYSTEM_PROMPT;
-    if (selectedBranch) {
-      console.log(`[draw] using branch prompt: "${selectedBranch}" (${sysPromptText.length} chars)`);
-    }
+    // ?branch=<name> was a pre-v1 query-param hack for validating per-
+    // branch prompt quality before the mid-stream swap was wired. Removed:
+    // branch selection is now driven purely by what the model emits,
+    // which is the whole point of the dynamic context design.
+    const tokenizeBranchPrompt = (text: string): number[] => {
+      const msgs = [{ role: "system", content: text }];
+      const asText = tokenizer.apply_chat_template(msgs, { tokenize: false, add_generation_prompt: false });
+      return Array.from(tokenizer.encode(asText));
+    };
+    const branchTokenIds: Record<BranchName, number[]> = {
+      router: tokenizeBranchPrompt(BRANCHES.router),
+      sequence: tokenizeBranchPrompt(BRANCHES.sequence),
+      architecture: tokenizeBranchPrompt(BRANCHES.architecture),
+    };
+    console.log(`[draw] branch token counts: router=${branchTokenIds.router.length}, sequence=${branchTokenIds.sequence.length}, architecture=${branchTokenIds.architecture.length}`);
 
-    const sysMessages = [{ role: "system", content: sysPromptText }];
-    const sysText = tokenizer.apply_chat_template(sysMessages, { tokenize: false, add_generation_prompt: false });
-    const sysEncoded = tokenizer.encode(sysText);
-    const systemTokenIds: number[] = Array.from(sysEncoded);
-    console.log("[draw] system prompt:", systemTokenIds.length, "tokens");
+    // The "live" system cache at boot is the router. User prompts prefill
+    // on top of router KV. Mid-stream, when setType fires, engine.mountKV
+    // replaces router with the chosen branch and the do-over re-prefills
+    // the user turn on top of the new branch.
+    const systemTokenIds: number[] = branchTokenIds.router;
+    console.log("[draw] active boot branch: router,", systemTokenIds.length, "tokens");
     systemCacheEnd = systemTokenIds.length;
 
     worker = new EngineWorker();
@@ -1151,68 +1219,75 @@ async function main() {
     // tests can start generating immediately.
     const skipSys = new URLSearchParams(location.search).get("skipSysPrompt") === "1";
     // ?noCache=1 forces the worker down the prefill path — used by the build
-    // script to regenerate system-cache.bin from scratch. Also auto-forced
-    // when ?branch=<name> is present: the cached bin was built for the
-    // legacy SYSTEM_PROMPT, so its hash would mismatch the per-branch
-    // tokens anyway. Skipping the fetch saves the ~70 MB download.
-    const skipBuiltCache = new URLSearchParams(location.search).get("noCache") === "1" || selectedBranch !== null;
+    // script to regenerate system-cache.bin from scratch.
+    const skipBuiltCache = new URLSearchParams(location.search).get("noCache") === "1";
     const initSystemTokenIds = skipSys ? [] : systemTokenIds;
     const enableProfile = new URLSearchParams(location.search).get("profile") === "1";
 
-    // Try to fetch the prebuilt system-prompt KV cache. If missing or any fetch
-    // error, we just fall through to the slow prefill path in the worker.
-    // `no-cache` (not `no-store`) revalidates with the server so HTTP caching
-    // still works, but avoids serving a stale 404/empty response from an
-    // earlier dev-server run.
+    // Fetch the prebuilt TQKC multi-branch cache. If missing or malformed,
+    // fall through to the slow prefill path (worker will prefill the router
+    // from scratch, then the mount infrastructure still works — just with a
+    // cold first boot).
     //
-    // The cache file may be either:
-    //   - TQKV (single-blob, legacy): load as-is (matches selectedBranch=null)
-    //   - TQKC (multi-branch container): extract the matching branch and
-    //     load only that blob
+    // `no-cache` (not `no-store`) revalidates with the server so HTTP
+    // caching still works.
     //
-    // If the file is TQKC but we're on the legacy monolithic SYSTEM_PROMPT
-    // path (selectedBranch=null), there's no matching branch — skip cache
-    // and let the worker prefill from scratch. This is the one regression
-    // path for v1a: a user on the default path with a fresh TQKC cache
-    // pays the prefill cost once, then stays hot.
-    let cacheBlob: ArrayBuffer | null = null;
+    // Branch blobs are held in owned ArrayBuffers so postMessage transfer
+    // works across the worker boundary (can't transfer a slice of a parent
+    // buffer; slicing copies).
+    type BranchInit = { name: BranchName; blob: ArrayBuffer; tokenCount: number; tokenIds: number[] };
+    let cacheBlob: ArrayBuffer | null = null;             // router blob (the boot branch)
+    const extraBranchInits: BranchInit[] = [];             // sequence + architecture for later mount
     if (!skipSys && !skipBuiltCache) {
       try {
         const res = await fetch("./system-cache.bin", { cache: "no-cache" });
         if (res.ok && (res.headers.get("content-type") || "").includes("octet-stream")) {
           const fullBuf = await res.arrayBuffer();
-          const magic = new DataView(fullBuf).getUint32(0, true);
-          const TQKV = 0x564b5154;
-          const TQKC = 0x434b5154;
-          if (magic === TQKV) {
-            // Legacy single-blob cache. Use as-is.
-            cacheBlob = fullBuf;
-            console.log(`[draw] prebuilt cache fetched (TQKV): ${(fullBuf.byteLength / 1e6).toFixed(1)} MB`);
-          } else if (magic === TQKC && selectedBranch) {
-            const parsed = parseSystemCache(fullBuf);
-            const entry = parsed.branches.get(selectedBranch);
-            if (entry) {
-              // Copy to an owned ArrayBuffer so postMessage transfer works
-              // (can't transfer a slice of the outer buffer).
-              cacheBlob = entry.blob.slice().buffer as ArrayBuffer;
-              console.log(`[draw] prebuilt cache fetched (TQKC): ${(fullBuf.byteLength / 1e6).toFixed(1)} MB, using branch "${selectedBranch}" (${(entry.blob.byteLength / 1e6).toFixed(1)} MB, ${entry.tokenCount} tokens)`);
-            } else {
-              console.warn(`[draw] TQKC container has no branch "${selectedBranch}" — falling back to prefill`);
+          const parsed = parseSystemCache(fullBuf);
+          console.log(`[draw] cache fetched: ${(fullBuf.byteLength / 1e6).toFixed(1)} MB, ${parsed.branches.size} branches (version=${parsed.version})`);
+          for (const name of Object.keys(branchTokenIds) as BranchName[]) {
+            const entry = parsed.branches.get(name);
+            if (!entry) {
+              console.warn(`[draw] cache missing branch "${name}" — will prefill on mount`);
+              continue;
             }
-          } else if (magic === TQKC) {
-            console.log(`[draw] cache is TQKC but no ?branch= specified — falling back to prefill`);
-          } else {
-            console.warn(`[draw] cache has unknown magic 0x${magic.toString(16)} — falling back to prefill`);
+            const owned = entry.blob.slice().buffer as ArrayBuffer;
+            if (name === "router") {
+              cacheBlob = owned;
+            } else {
+              extraBranchInits.push({
+                name,
+                blob: owned,
+                tokenCount: entry.tokenCount,
+                tokenIds: branchTokenIds[name],
+              });
+            }
           }
         }
-      } catch { /* fall through to prefill */ }
+      } catch (e) {
+        console.warn(`[draw] cache fetch failed: ${(e as Error).message} — falling back to prefill`);
+      }
     }
 
     // ?benchUpload=1 makes the worker run every tensor-upload strategy once
     // and log timings — used to benchmark which OPFS read pattern wins.
     const benchUpload = new URLSearchParams(location.search).get("benchUpload") === "1";
-    const initMsg: any = { type: "init", ggufUrl: GGUF_URL, systemTokenIds: initSystemTokenIds, enableProfile, cacheBlob, benchUpload };
-    worker!.postMessage(initMsg, cacheBlob ? [cacheBlob] : []);
+    const initMsg: any = {
+      type: "init",
+      ggufUrl: GGUF_URL,
+      systemTokenIds: initSystemTokenIds,
+      enableProfile,
+      cacheBlob,
+      benchUpload,
+      // Non-active branches: worker registers each on the engine so
+      // mountKV() can later swap one of them into the live cache on setType
+      // detection. router is handled by cacheBlob (or fresh prefill) above.
+      extraBranches: extraBranchInits.map(({ name, blob, tokenCount, tokenIds }) => ({ name, blob, tokenCount, tokenIds })),
+    };
+    const transfers: Transferable[] = [];
+    if (cacheBlob) transfers.push(cacheBlob);
+    for (const b of extraBranchInits) transfers.push(b.blob);
+    worker!.postMessage(initMsg, transfers);
 
     // Grammar bitmaps: build in the background while the worker is busy
     // downloading/uploading the GGUF. Ship to the worker as soon as ready.

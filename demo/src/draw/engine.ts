@@ -1116,12 +1116,19 @@ export class InferenceEngine {
     this.position = 0;
   }
 
+  // Which branch was active when snapshotCache was called. Paired with
+  // _snapshot / _snapshotPosition so restoreCache can also put activeBranch
+  // bookkeeping back in sync (otherwise a mid-stream mountKV leaves
+  // activeBranch stale after a restoreCache).
+  private _snapshotBranch: string | null = null;
+
   /** Snapshot current KV cache state (GPU→GPU copy). Used to cache system prompt prefill. */
   snapshotCache(): void {
     const d = this.device;
     const enc = d.createCommandEncoder();
     this._snapshot = new Map();
     this._snapshotPosition = this.position;
+    this._snapshotBranch = this._activeBranch;
     for (const [layer, c] of this.kvCache) {
       const bufs: GPUBuffer[] = [c.kPolar, c.kQjl, c.kMaxR, c.kGamma, c.vPolar, c.vQjl, c.vMaxR, c.vGamma];
       const copies: GPUBuffer[] = [];
@@ -1151,6 +1158,12 @@ export class InferenceEngine {
     }
     d.queue.submit([enc.finish()]);
     this.position = this._snapshotPosition!;
+    // Roll activeBranch bookkeeping back to whatever was snapshotted.
+    // Keeps retry-after-mount paths coherent: restoreCache puts the KV
+    // back to router state, and activeBranch now correctly says "router"
+    // (or whatever the snapshot was taken under) so the next mountKV
+    // check is against accurate state.
+    this._activeBranch = this._snapshotBranch;
   }
 
   private _snapshot: Map<number, { bufs: GPUBuffer[]; length: number }> | null = null;

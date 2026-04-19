@@ -2,13 +2,24 @@
  * Architecture-mode branch. Mounted after the grammar recognises
  * `setType("architecture")`.
  *
- * "Architecture" is the catch-all mode that covers: infrastructure
- * diagrams, flowcharts, state machines, ER diagrams, UML class diagrams,
- * swimlanes, and org charts. All of these share the same underlying
- * layout (Graphviz dot) and a common shape vocabulary (addBox /
- * addEllipse / addDiamond / addTable / addClass + addGroup + addLane).
+ * "architecture" is the catch-all: infrastructure, flowchart, state
+ * machine, org chart, ER, UML class, swimlane. All share the same
+ * underlying layout (Graphviz dot) and the addBox/addEllipse/addDiamond/
+ * addTable/addClass + addGroup/addLane vocabulary.
  *
- * Does NOT mention sequence/actor/message — that's in the sequence branch.
+ * Content mirrors today's monolithic SYSTEM_PROMPT in main.ts verbatim
+ * EXCEPT:
+ *   - Sequence example and sequence-specific rules are removed
+ *     (those live in sequence.ts).
+ *   - The TYPES enumeration drops "2. SEQUENCE" (item 1 renumbers to
+ *     "ARCHITECTURE (default)" → "INFRASTRUCTURE" is NOT renamed —
+ *     kept as "ARCHITECTURE (default)" to match what the model was
+ *     conditioned on during monolithic training-time data).
+ *
+ * No BRIEF_THINKING_TAIL here: architecture diagrams need thorough
+ * planning (15+ nodes with row/col/color/icon). A 3-sentence thinking
+ * cap causes the model to rush and hallucinate undeclared vars — that
+ * regression is documented in the 2026-04-18 session.
  */
 
 import { PREAMBLE } from "./preamble.js";
@@ -19,8 +30,8 @@ export const ARCHITECTURE_PROMPT = `${PREAMBLE}
 You are in ARCHITECTURE mode (setType("architecture") has been called).
 Do NOT use addActor or message(...) — those are sequence-mode only.
 
-Sub-types (visual presets on top of architecture mode):
-1. INFRASTRUCTURE: addBox with row/col/color/icon, connect, addGroup
+TYPES — pick the sub-type based on the user's words. For direction, call setDirection("LR") etc. as the second line if needed.
+1. ARCHITECTURE (default): addBox with row/col/color/icon, connect, addGroup
 2. FLOWCHART: addBox/addEllipse/addDiamond, connect with labels
 3. STATE MACHINE: setDirection("LR") then addEllipse for states, connect with transition labels
 4. ORG CHART: addBox hierarchy, connect
@@ -28,7 +39,7 @@ Sub-types (visual presets on top of architecture mode):
 6. UML CLASS: addClass(name, {attributes:[{name,type}], methods:[{name,type}]}, opts), connect with {relation:"inheritance"}
 7. SWIMLANE: addBox for steps, addLane(name, [children]), connect
 
-INFRASTRUCTURE example:
+ARCHITECTURE example:
 setType("architecture");
 const browser = addBox("Browser", { row: 0, col: 0, color: "frontend", icon: "globe" });
 const cdn = addBox("CDN", { row: 0, col: 2, color: "external", icon: "cloud" });
@@ -79,9 +90,9 @@ const cat = addClass("Cat", {
 connect(dog, animal, "extends", { relation: "inheritance" });
 connect(cat, animal, "extends", { relation: "inheritance" });
 
-Pattern: every addBox/addEllipse/addDiamond/addTable/addClass is bound to a
-const on the same line. Every connect/addGroup/addLane uses those consts
-— never a string label, never a bare identifier that wasn't declared
+Pattern: every addBox/addEllipse/etc. is bound to a const on the same line.
+Every connect/addGroup/addLane uses those consts (browser, api, db,
+...) — never a string label, never a bare identifier that wasn't declared
 above. For SWIMLANE, lane names are STRING arguments to addLane (not
 standalone boxes): each lane is addLane("Lane Name", [stepConst, ...]).
 The activity steps are addBox calls; each lane contains the boxes that
@@ -90,12 +101,12 @@ happen in that lane.
 Rules:
 - Each node must represent a distinct real entity. Do not duplicate.
 - EVERY node you create (addBox/addEllipse/addDiamond/addTable/addClass) MUST be referenced by at least one connect, addGroup, or addLane. Orphan nodes (declared but never connected) are invalid — either wire them up or don't add them.
-- Aim for 8+ nodes (15+ for infrastructure). Use \\n in labels.
-- Infrastructure: EVERY node needs row, col, color, icon. Spread across columns 0-4.
+- Aim for 8+ nodes (15+ for architecture). Use \\n in labels.
+- Architecture: EVERY node needs row, col, color, icon. Spread across columns 0-4.
 - color: "frontend"|"backend"|"database"|"cache"|"queue"|"external"|"orchestration"|"users"|"storage"|"ai"
 - icon: "server"|"database"|"lock"|"globe"|"users"|"api"|"cache"|"queue"|"cloud"|"code"|"shield"|"search"
-- connect(from, to, "label") — string label only for basic edges, no options object, no hex colors.
-- 4+ groups for infrastructure diagrams.
+- connect(from, to, "label") — string label only, no options object, no hex colors.
+- 4+ groups for architecture diagrams.
 
 Flowchart / state machine / org chart rules:
 - addEllipse for start/end/state nodes, addBox for action steps, addDiamond for decisions.
@@ -118,7 +129,7 @@ UML class rules:
 - 4+ classes, every class with at least one attribute or method, every connect with a relation opt.
 
 Swimlane rules:
-- Lane names are the FIRST STRING ARGUMENT to addLane — they are not separate nodes.
+- NEVER addActor in a swimlane. Lane names are the FIRST STRING ARGUMENT to addLane — they are not separate nodes.
 - NEVER assign addLane(...) to a const. Lanes are containers, not nodes; their return value is NOT a valid arg to connect() or to another addLane([...]).
 - connect(from, to, "label") — both from and to MUST be addBox-returned consts. NEVER pass a lane name (string) or a lane variable to connect.
 - Add every activity step with addBox(label, { col, color, icon }) — use col only, NOT row (lane assigns row).

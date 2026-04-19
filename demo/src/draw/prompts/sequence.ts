@@ -11,10 +11,10 @@
  * architecture branch, out of scope here.
  */
 
-import { PREAMBLE } from "./preamble.js";
+import { PREAMBLE, BRIEF_THINKING_TAIL } from "./preamble.js";
 import { SDK_TYPES } from "../drawmode/sdk-types.js";
 
-export const SEQUENCE_PROMPT = `${PREAMBLE}
+export const SEQUENCE_PROMPT = `${PREAMBLE}${BRIEF_THINKING_TAIL}
 
 You are in SEQUENCE mode (setType("sequence") has been called). The SDK for
 this mode is addActor(...) + message(from, to, label). Do NOT use addBox,

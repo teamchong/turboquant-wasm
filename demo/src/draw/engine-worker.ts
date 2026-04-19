@@ -42,7 +42,21 @@ function enqueue(fn: () => Promise<void>): Promise<void> {
   return next;
 }
 
-async function init(ggufUrl: string, systemTokenIds: number[], enableProfile: boolean, cacheBlob: ArrayBuffer | null, benchUpload = false) {
+interface ExtraBranchInit {
+  name: string;
+  blob: ArrayBuffer;
+  tokenCount: number;
+  tokenIds: number[];
+}
+
+async function init(
+  ggufUrl: string,
+  systemTokenIds: number[],
+  enableProfile: boolean,
+  cacheBlob: ArrayBuffer | null,
+  benchUpload = false,
+  extraBranches: ExtraBranchInit[] = [],
+) {
   try {
     const phases: Array<{ name: string; ms: number }> = [];
     let phaseStart = performance.now();
@@ -166,11 +180,23 @@ async function init(ggufUrl: string, systemTokenIds: number[], enableProfile: bo
 
     // 6. System prompt setup — prefer a prebuilt KV cache blob if main passed
     // one, otherwise fall back to the slow prefill path.
+    //
+    // After this block the "active" cache is the router branch (either
+    // loadCache-ed from the prebuilt blob or freshly prefilled). Any
+    // extraBranches (sequence/architecture) are registered on the engine
+    // via registerBranch so mountKV(name) can swap them in later without
+    // reparsing any blob — they stay CPU-resident in engine.branches.
     if (cacheBlob) {
       try {
         status("Loading prebuilt system cache...");
         const t0 = performance.now();
-        engine.loadCache(cacheBlob, systemTokenIds);
+        // Register router first, then mountKV — this path sets
+        // engine.activeBranch = "router" so the snapshot we take next
+        // correctly records "router" as the baseline branch. restoreCache
+        // uses that to put activeBranch back in sync after a mid-stream
+        // mount followed by retry rollback.
+        engine.registerBranch("router", cacheBlob, systemTokenIds);
+        engine.mountKV("router");
         const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
         console.log(`[worker] loadCache done: ${systemTokenIds.length} tokens in ${elapsed}s`);
         engine.snapshotCache();
@@ -206,20 +232,49 @@ async function init(ggufUrl: string, systemTokenIds: number[], enableProfile: bo
       const elapsed = ((performance.now() - t0) / 1000).toFixed(1);
       console.log(`[worker] prefill done: ${systemTokenIds.length} tokens in ${elapsed}s`);
       status("Caching system prompt...");
-      engine.snapshotCache();
-      console.log("[worker] System prompt prefilled and cached");
 
-      // Auto-rebuild: the prebuilt cache was missing or rejected (stale hash
-      // after a system-prompt edit). Dump the freshly-computed cache and hand
-      // it to main, which will POST it to the dev server so the next reload
-      // is fast. In production (no POST endpoint) main silently drops it.
+      // Dump the freshly-computed KV before snapshot so we can register
+      // it as "router" (snapshotCache will then capture activeBranch =
+      // "router" correctly). The dump itself is also posted back to main
+      // so the dev server can write public/system-cache.bin for the next
+      // reload. In production (no POST endpoint) main silently drops it.
+      let dumpedRouterBlob: ArrayBuffer | null = null;
       try {
         const blob = await engine.dumpCache(systemTokenIds);
-        const buf = blob.buffer.slice(blob.byteOffset, blob.byteOffset + blob.byteLength);
-        post({ type: "cacheRebuilt", data: buf }, [buf]);
+        const buf = blob.buffer.slice(blob.byteOffset, blob.byteOffset + blob.byteLength) as ArrayBuffer;
+        engine.registerBranch("router", buf, systemTokenIds);
+        // Set activeBranch explicitly — we got here via prefill, not
+        // mountKV, so activeBranch was never assigned. Going through
+        // mountKV("router") again would redundantly re-upload the same
+        // bytes we just dumped; assigning directly avoids that.
+        engine.mountKV("router");
+        dumpedRouterBlob = buf;
       } catch (e) {
         console.warn(`[worker] cache auto-dump failed: ${(e as Error).message}`);
       }
+
+      engine.snapshotCache();
+      console.log("[worker] System prompt prefilled and cached");
+
+      if (dumpedRouterBlob) {
+        post({ type: "cacheRebuilt", data: dumpedRouterBlob }, [dumpedRouterBlob]);
+      }
+    }
+
+    // Register non-active branches (sequence, architecture) on the engine
+    // so mountKV(name) can swap them into the live cache later. We do this
+    // AFTER the router is in place so engine.activeBranch stays "router"
+    // (registerBranch alone doesn't mount; mountKV does).
+    for (const b of extraBranches) {
+      try {
+        engine.registerBranch(b.name, b.blob, b.tokenIds);
+        console.log(`[worker] registered branch "${b.name}": ${(b.blob.byteLength / 1e6).toFixed(1)}MB, ${b.tokenCount} tokens`);
+      } catch (e) {
+        console.warn(`[worker] failed to register branch "${b.name}": ${(e as Error).message}`);
+      }
+    }
+    if (extraBranches.length > 0) {
+      console.log(`[worker] branches available: ${engine.registeredBranches.join(", ")}`);
     }
 
     mark("prefill_or_load");
@@ -279,6 +334,34 @@ async function rollbackKV(targetPosition: number) {
   try {
     engine.rollbackKV(targetPosition);
     post({ type: "rollbackKVDone", ok: true });
+  } catch (e) {
+    post({ type: "error", message: (e as Error).message });
+  }
+}
+
+/**
+ * Grammar-triggered branch swap. Replace the active system cache with
+ * the named pre-baked branch, then prefill the user-turn tokens on top
+ * of the fresh branch so the model has the actual request in context.
+ *
+ * Semantics after this call (on success):
+ *   - engine.activeBranch === branch
+ *   - engine.position === branch.tokenCount + userTurnTokens.length
+ *   - last-token argmax (firstToken in the response) is the model's
+ *     next prediction, ready to be handed to the decode loop
+ *
+ * On failure the caller should fall back to a full-restart retry — the
+ * engine may be left in a partial state (cache swapped, prefill failed).
+ */
+async function mountBranchAndPrefill(branch: string, userTurnTokens: number[]) {
+  if (!engine) { post({ type: "error", message: "Engine not initialized" }); return; }
+  try {
+    const t0 = performance.now();
+    engine.mountKV(branch);
+    const firstToken = await engine.prefill(userTurnTokens);
+    const elapsed = ((performance.now() - t0) / 1000).toFixed(2);
+    console.log(`[worker] mountBranchAndPrefill "${branch}" + ${userTurnTokens.length} user tokens in ${elapsed}s, firstToken=${firstToken}`);
+    post({ type: "mountBranchDone", firstToken, branch });
   } catch (e) {
     post({ type: "error", message: (e as Error).message });
   }
@@ -492,7 +575,8 @@ async function conformanceForward(tokenIds: number[]) {
 self.onmessage = (e: MessageEvent) => {
   const msg = e.data;
   switch (msg.type) {
-    case "init": enqueue(() => init(msg.ggufUrl, msg.systemTokenIds, !!msg.enableProfile, msg.cacheBlob ?? null, !!msg.benchUpload)); break;
+    case "init": enqueue(() => init(msg.ggufUrl, msg.systemTokenIds, !!msg.enableProfile, msg.cacheBlob ?? null, !!msg.benchUpload, Array.isArray(msg.extraBranches) ? msg.extraBranches : [])); break;
+    case "mountBranchAndPrefill": enqueue(() => mountBranchAndPrefill(msg.branch, msg.userTurnTokens ?? [])); break;
     case "dumpCache": enqueue(() => dumpCache(msg.systemTokenIds)); break;
     case "prefill": enqueue(() => prefill(msg.tokenIds)); break;
     case "decode": enqueue(() => decode(msg.tokenId)); break;
