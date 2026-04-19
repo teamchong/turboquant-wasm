@@ -709,6 +709,15 @@ async function generate() {
     // attempts 2+3 ran under router, model didn't re-emit setType, all
     // tokens got silently discarded by the router observer.)
     let lastMountedBranch: BranchName | null = null;
+    // Remember the most-substantive code any attempt produced so that if
+    // MAX_ATTEMPTS all fail we can restore it to the editor on exit.
+    // Previously every retry called setCode("") at its start; if a later
+    // attempt produced less useful code than an earlier one (e.g. the
+    // class test: attempt 1 had 689ch with one typo, attempt 2 had 18ch)
+    // the user ended up with the worst attempt as their hand-edit starting
+    // point. We pick the LONGEST version so there's the most context to
+    // fix manually.
+    let bestAttemptCode = "";
 
     for (let attempt = 0; attempt < MAX_ATTEMPTS && !aborted; attempt++) {
       // Prefill the full conversation onto the system-cache snapshot. First
@@ -1084,6 +1093,9 @@ async function generate() {
         }
       }
       setCode(code);
+      if (code.trim().length > bestAttemptCode.trim().length) {
+        bestAttemptCode = code;
+      }
 
       statusEl.textContent = "Rendering diagram...";
       const { result, error } = await executeCode(code);
@@ -1178,6 +1190,14 @@ async function generate() {
 
     if (lastError && !aborted) {
       if (finalResult?.json) { updateDiagram(finalResult.json.elements || []); fitToScreen(); }
+      // Don't leave the editor empty after a failed run. If the current
+      // content is shorter than the best attempt we saw (e.g. attempt 1
+      // had usable code + one typo, attempt 3 produced almost nothing),
+      // restore the best one so the user has the most context to
+      // hand-edit before clicking Render.
+      if (bestAttemptCode.trim().length > getCode().trim().length) {
+        setCode(bestAttemptCode);
+      }
       statusEl.textContent = `Code error after ${MAX_ATTEMPTS} attempts: ${lastError}`;
       statusEl.classList.add("error");
     }

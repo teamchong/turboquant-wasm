@@ -57,6 +57,7 @@ connect(cat, animal, "extends", { relation: "inheritance" });
 connect(owner, dog, "owns", { relation: "composition" });
 
 Rules:
+- EVERY addClass call MUST be assigned to a const — on EVERY class, not just the first few. Writing bare "PayPal = addClass(...)" without "const" fails with "PayPal is not defined" at the next connect that references it.
 - Attributes and methods ALWAYS go inside the addClass call's { attributes, methods } object. NEVER as separate connect() calls — connect is ONLY for class-to-class relationships.
 - Every relationship connect MUST include { relation: "..." } with a valid value. Unrelated edges are invalid.
 - Inheritance arrows: connect(child, parent, "extends", { relation: "inheritance" }). Direction is child → parent.
