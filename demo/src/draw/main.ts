@@ -1317,14 +1317,23 @@ async function checkWebGPUSupport(): Promise<string | null> {
   const isIOS = /iPad|iPhone|iPod/.test(ua) || (ua.includes("Mac") && (navigator as any).maxTouchPoints > 1);
   const isAndroid = /Android/.test(ua);
   const isMobile = isIOS || isAndroid;
+  const isFirefox = /Firefox\//.test(ua);
   const gpu = (navigator as any).gpu;
-  // Single answer on unsupported platforms: use desktop Chrome. Safari
-  // lacks the subgroups extension our matmul shaders need; mobile browsers
-  // cap per-tab memory below the 3 GB this model requires. Pointing users
-  // down "enable flag X" rabbit holes that don't actually work was worse.
-  const CHROME_MSG = "Please use desktop Chrome 134+ (Windows, macOS, or Linux). This demo needs the WebGPU subgroups extension that Safari hasn't shipped and the 3 GB model that mobile browsers can't hold in one tab.";
-  if (isMobile) return CHROME_MSG;
-  if (!gpu) return CHROME_MSG;
+  // Error messages name the missing piece. Linking users to "try
+  // Chrome" as a catch-all was making Firefox users think the demo
+  // is Chrome-exclusive forever; in reality Firefox ships WebGPU on
+  // Win + Apple Silicon but hasn't implemented the subgroups
+  // extension yet (tracked in bugzilla). Be specific.
+  const CHROME_PITCH = "Today that's desktop Chrome 134+ (Windows, macOS, or Linux).";
+  const MOBILE_MSG = `Mobile browsers cap per-tab memory below the 3 GB this model holds in GPU RAM. Open on a desktop. ${CHROME_PITCH}`;
+  const FIREFOX_MSG = `Firefox has WebGPU but hasn't shipped the \`subgroups\` extension yet — the demo's attention kernels depend on \`subgroupShuffleXor\`. ${CHROME_PITCH} Tracking the Firefox-side work at https://bugzilla.mozilla.org/show_bug.cgi?id=1927856 .`;
+  const SAFARI_MSG = `Safari hasn't shipped the WebGPU subgroups extension. ${CHROME_PITCH}`;
+  const NO_WEBGPU_MSG = `Your browser doesn't expose \`navigator.gpu\`. This demo needs WebGPU + shader-f16 + subgroups. ${CHROME_PITCH}`;
+
+  if (isMobile) return MOBILE_MSG;
+  if (!gpu) {
+    return isFirefox ? FIREFOX_MSG : NO_WEBGPU_MSG;
+  }
   let adapter: GPUAdapter | null;
   try {
     adapter = await gpu.requestAdapter();
@@ -1334,10 +1343,13 @@ async function checkWebGPUSupport(): Promise<string | null> {
   if (!adapter) {
     return "WebGPU is enabled but no GPU adapter is available. Try closing other GPU-heavy tabs, check chrome://gpu, or switch to desktop Chrome.";
   }
-  const missing: string[] = [];
-  if (!adapter.features.has("shader-f16")) missing.push("shader-f16");
-  if (!adapter.features.has("subgroups")) missing.push("subgroups");
-  if (missing.length > 0) return CHROME_MSG;
+  const hasF16 = adapter.features.has("shader-f16");
+  const hasSubgroups = adapter.features.has("subgroups");
+  if (!hasF16 || !hasSubgroups) {
+    if (isFirefox) return FIREFOX_MSG;
+    const missing = [!hasF16 && "shader-f16", !hasSubgroups && "subgroups"].filter(Boolean).join(" + ");
+    return `Your WebGPU adapter is missing required features (${missing}). ${CHROME_PITCH}`;
+  }
   return null;
 }
 
