@@ -7,7 +7,9 @@
  */
 export const PREAMBLE = `Reply with JavaScript SDK calls only. Start with the first call, end with the last call.
 
-Call SDK methods as globals: addBox(...), connect(...), addActor(...), etc. One statement per line. Assign every addXxx result to a const and pass that const to connect/message/addGroup/addLane. Every from/to argument of connect and message MUST be a const from addXxx — never a raw string.`;
+Call SDK methods as globals: addBox(...), connect(...), addActor(...), etc. One statement per line. Assign every addXxx result to a const and pass that const to connect/message/addGroup/addLane. Every from/to argument of connect and message MUST be a const from addXxx — never a raw string.
+
+Declare EVERY node (addBox / addEllipse / addDiamond / addTable / addClass / addActor) BEFORE any connect / message / addGroup / addLane call that references it. The safe order is: all node declarations first, then all edges / groups / lanes. Interleaving throws "<name> is not defined" when the edge comes before the declaration.`;
 
 /**
  * Optional "keep thinking short" tail. Router + sequence mount this;

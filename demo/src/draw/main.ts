@@ -700,6 +700,15 @@ async function generate() {
 
     let lastError: string | undefined;
     let finalResult: any = null;
+    // Persists across attempts. On retry, we skip the router run entirely
+    // and mount the previously-picked branch directly — the previous
+    // attempt's conversation already contains `setType("<target>")`, so
+    // the model on retry is unlikely to re-emit it, which used to leave
+    // runCodePhaseOnly spinning with no tokens rendered and emitting an
+    // empty retry. (Observed on ER: attempt 1 mounted er + syntax-errored,
+    // attempts 2+3 ran under router, model didn't re-emit setType, all
+    // tokens got silently discarded by the router observer.)
+    let lastMountedBranch: BranchName | null = null;
 
     for (let attempt = 0; attempt < MAX_ATTEMPTS && !aborted; attempt++) {
       // Prefill the full conversation onto the system-cache snapshot. First
@@ -926,25 +935,46 @@ async function generate() {
         return { mountTarget: pendingMount, phaseAReason: phaseA.reason };
       };
 
-      // FIRST RUN under router: skip thinking entirely. The chat template
-      // left the cache at `...<|channel>thought\n`; prefilling <channel|>
-      // + reminder closes the thinking channel and primes code mode, so
-      // the model's first generated token IS the first code token. Saves
-      // ~5s of wasted router thinking that would be discarded anyway.
+      // Decide whether to run the router phase at all.
       //
-      // The nextToken returned by the user-turn prefill was a thinking
-      // token (what the model would have emitted WITHOUT our follow-up
-      // prefill). We discard it — that's one forward pass of wasted
-      // compute, but vs re-running full phase A it's cheap.
-      statusEl.textContent = "Picking diagram type...";
-      const routerSkipPrefill = [...channelCloseTokenIds, ...reminderTokenIds];
-      const routerCodeStartResult = await workerCall<{ firstToken: number }>(
-        { type: "prefill", tokenIds: routerSkipPrefill }, "prefillDone",
-      );
-      const routerCodeStartToken = routerCodeStartResult.firstToken;
+      // Attempt 0 normal path: run router with skip-thinking, let the
+      // model pick a mode via setType(...), then do-over on the branch.
+      //
+      // Retry path (attempt > 0 with a remembered branch from a prior
+      // attempt): skip the router phase ENTIRELY. The previous attempt's
+      // conversation already contains a committed setType("<target>"),
+      // so the model is unlikely to re-emit setType on retry — running
+      // the router observer would silently discard every token and
+      // produce empty output (the ER failure mode). Mount the remembered
+      // branch directly and run full thinking+code under it.
+      statusEl.textContent = lastMountedBranch
+        ? `Retrying under "${lastMountedBranch}"...`
+        : "Picking diagram type...";
 
-      let { mountTarget } = await runCodePhaseOnly(routerCodeStartToken);
+      let mountTarget: BranchName | null = null;
       let phaseAReasonFinal = "skipped-under-router";
+
+      if (lastMountedBranch) {
+        mountTarget = lastMountedBranch;
+      } else {
+        // FIRST RUN under router: skip thinking entirely. The chat template
+        // left the cache at `...<|channel>thought\n`; prefilling <channel|>
+        // + reminder closes the thinking channel and primes code mode, so
+        // the model's first generated token IS the first code token. Saves
+        // ~5s of wasted router thinking that would be discarded anyway.
+        //
+        // The nextToken returned by the user-turn prefill was a thinking
+        // token (what the model would have emitted WITHOUT our follow-up
+        // prefill). We discard it — that's one forward pass of wasted
+        // compute, but vs re-running full phase A it's cheap.
+        const routerSkipPrefill = [...channelCloseTokenIds, ...reminderTokenIds];
+        const routerCodeStartResult = await workerCall<{ firstToken: number }>(
+          { type: "prefill", tokenIds: routerSkipPrefill }, "prefillDone",
+        );
+        const routerCodeStartToken = routerCodeStartResult.firstToken;
+        const routerResult = await runCodePhaseOnly(routerCodeStartToken);
+        mountTarget = routerResult.mountTarget;
+      }
 
       // Mount triggered? Do the full do-over on the specialised branch.
       // runThinkingAndCode already set pendingMount and aborted the stream;

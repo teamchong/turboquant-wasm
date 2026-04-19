@@ -35,6 +35,7 @@ connect(cto, eng2);
 connect(cfo, fin1);
 
 Rules:
+- Declare EVERY addBox BEFORE any connect call. Never interleave — writing connect(fe_lead, fe_team_1) before const fe_team_1 = addBox(...) throws "fe_team_1 is not defined".
 - One root node (the top of the hierarchy). Every other node must be reachable from the root via parent→child edges.
 - Edges are directional: connect(manager, report). Never connect(report, manager).
 - No cycles. Each report has exactly one manager (no dotted lines / matrix reporting in this mode).
