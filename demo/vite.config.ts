@@ -17,6 +17,12 @@ function promptSourceHash(root: string): string {
     resolve(root, "src/draw/prompts/router.ts"),
     resolve(root, "src/draw/prompts/sequence.ts"),
     resolve(root, "src/draw/prompts/architecture.ts"),
+    resolve(root, "src/draw/prompts/flowchart.ts"),
+    resolve(root, "src/draw/prompts/state.ts"),
+    resolve(root, "src/draw/prompts/orgchart.ts"),
+    resolve(root, "src/draw/prompts/er.ts"),
+    resolve(root, "src/draw/prompts/class.ts"),
+    resolve(root, "src/draw/prompts/swimlane.ts"),
   ];
   const h = createHash("sha256");
   for (const p of srcs) {
@@ -148,27 +154,12 @@ function checkAndRegen(root: string, port: number): void {
 // command, no manual step.
 const systemCacheAsset = (root: string) => ({
   name: "system-cache-asset",
-  // `vite build` path: if the prompt source changed since the last cache
-  // build, regen before the build completes so `dist/` ships a fresh cache.
-  // Playwright's webServer config auto-starts vite dev for us, so this hook
-  // just spawns the test and waits for it to finish.
-  async buildStart() {
-    // Same recursion guard as checkAndRegen — if this vite was itself spawned
-    // by a parent regen, skip.
-    if (process.env.VITE_SKIP_REGEN === "1") return;
-    const hashPath = resolve(root, "public", ".system-cache.prompt-hash");
-    const cachePath = resolve(root, "public", "system-cache.bin");
-    const current = promptSourceHash(root);
-    const stored = existsSync(hashPath) ? readFileSync(hashPath, "utf8").trim() : null;
-    const cacheExists = existsSync(cachePath);
-    if (!stored && cacheExists) {
-      writeFileSync(hashPath, current);
-      return;
-    }
-    if (cacheExists && stored === current) return;
-    console.log("[vite build] system prompt changed → regenerating cache before build");
-    await regenerateCache(root, 5173);
-  },
+  // `vite build` deliberately has NO buildStart hook: the committed
+  // public/system-cache.bin is the source of truth for the prebuilt KV.
+  // Auto-regen during build would require playwright + WebGPU, which
+  // neither GitHub Actions runners nor any other CI has. If the cache
+  // is stale, run `bun run rebuild-cache` on a local dev machine with
+  // WebGPU and commit the updated cache + hash.
   configureServer(server: any) {
     // On dev server startup, detect whether SYSTEM_PROMPT (or SDK_TYPES, which
     // is appended into it) has changed since the last cache build. If so,

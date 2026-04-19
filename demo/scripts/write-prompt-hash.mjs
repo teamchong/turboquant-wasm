@@ -13,9 +13,22 @@ import { fileURLToPath } from "url";
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = resolve(HERE, "..");
 
+// Must stay in sync with promptSourceHash() in demo/vite.config.ts.
+// Any file here that influences a branch's token stream invalidates
+// the cache when edited.
 const srcs = [
   resolve(ROOT, "src/draw/main.ts"),
   resolve(ROOT, "src/draw/drawmode/sdk-types.ts"),
+  resolve(ROOT, "src/draw/prompts/preamble.ts"),
+  resolve(ROOT, "src/draw/prompts/router.ts"),
+  resolve(ROOT, "src/draw/prompts/sequence.ts"),
+  resolve(ROOT, "src/draw/prompts/architecture.ts"),
+  resolve(ROOT, "src/draw/prompts/flowchart.ts"),
+  resolve(ROOT, "src/draw/prompts/state.ts"),
+  resolve(ROOT, "src/draw/prompts/orgchart.ts"),
+  resolve(ROOT, "src/draw/prompts/er.ts"),
+  resolve(ROOT, "src/draw/prompts/class.ts"),
+  resolve(ROOT, "src/draw/prompts/swimlane.ts"),
 ];
 const h = createHash("sha256");
 for (const p of srcs) {
