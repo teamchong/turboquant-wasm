@@ -19,6 +19,8 @@ The **Prompt → Diagram demo is different**: it re-implements the same TurboQua
 
 Same math, two substrates: WASM for CPU vector-search workloads, WGSL for GPU LLM workloads. If you're looking for "what does TurboQuant compression look like on GPU", the draw demo's WGSL shaders in [`demo/src/draw/shaders/`](demo/src/draw/shaders/) are the reference.
 
+Demo: https://github.com/user-attachments/assets/71ae6e5c-a5ec-4d09-9de5-cf67ff42edfb
+
 ## Why TurboQuant?
 
 Float32 embedding indexes are large — 1M vectors × 384-dim = 1.5GB. They don't fit in mobile RAM, take minutes to download, and gzip only saves ~7% because float32 has high entropy.
