@@ -949,6 +949,22 @@ async function generate() {
       let code = generatedCode.trim();
       code = code.replace(/^```(?:javascript|js|typescript|ts)?\s*\n?/i, "");
       code = code.replace(/\n?```\s*$/i, "");
+      // A mid-stream mount means the model's setType(...) fire was
+      // consumed as the mount signal under the router and then discarded
+      // when we wiped the code buffer for the do-over. The mounted
+      // branch's prompt says "setType has been called", so the model
+      // typically does NOT re-emit it. Without setType in the executed
+      // code, the SDK's diagramType stays at its default ("architecture"),
+      // which renders sequence / class / er / etc. as generic
+      // architecture — wrong layout.
+      //
+      // Fix: prepend setType("<target>") whenever a mount fired AND the
+      // generated code doesn't already have it. The typecheck is a
+      // simple "starts with setType(" after whitespace — defensive
+      // against the occasional case where the model does re-emit it.
+      if (mountTarget && code && !/^\s*setType\s*\(/.test(code)) {
+        code = `setType("${mountTarget}");\n${code}`;
+      }
       setCode(code);
 
       statusEl.textContent = "Rendering diagram...";
