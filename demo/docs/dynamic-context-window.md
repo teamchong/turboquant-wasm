@@ -1,298 +1,225 @@
 # Dynamic Context Window
 
-Grammar-triggered, mid-generation KV swap. The LLM's working context
-contracts and expands as it navigates the SDK — like pushd/popd on a
-filesystem — with zero runtime prefill cost.
+Grammar-triggered, mid-generation KV swap. The LLM boots with a small
+"router" system prompt listing every diagram type. When it emits
+`setType("...")`, a runtime observer detects that in the decoded token
+stream and the engine swaps the active KV cache to a pre-baked branch
+containing the full per-type documentation — zero runtime prefill.
 
-Status: design, not implemented. Branch: `feat/dynamic-context-window`.
-
----
+Shipped on branch `feat/dynamic-context-window`. v1 covers flat
+whole-cache swaps (no nested sub-shells). v2 items — nested mount,
+RoPE shift for arbitrary mount positions, per-type grammar
+restrictions — are still open.
 
 ## Problem
 
-Our system prompt is 3005 tokens: full SDK documentation for three
-diagram modes (sequence, architecture, UML) plus shared preamble. Two
-costs scale with its size:
+The original single-blob system prompt was 3005 tokens covering 8
+diagram types. Two costs:
 
-1. **Prefill time** — paid once at system-cache build (~2s) but the bin
-   is 68.9 MB on disk and must be downloaded + loaded each session.
-2. **Attention scan** — every decode step attends over all 3005 system
-   tokens plus the live generation. Each mode only uses ~1/3 of that
-   system prompt; the other 2/3 is clutter the model must learn to
-   ignore.
+1. **Prefill time** — paid once at system-cache build, ~2s. Blob was
+   68.9 MB on disk, downloaded every session on a fresh cache.
+2. **Attention scan** — every decode step attends over all 3005 tokens
+   plus the live generation. Any given prompt uses at most one type's
+   worth of docs; the other ~7/8 is noise the model has to ignore.
 
-The obvious fix — "just inject relevant docs when needed" — runs into
-prefill latency. Adding 500 tokens of focused help mid-generation means
-paying ~250 ms of prefill per injection. That's fine once per
-generation, prohibitive every few tokens.
+Naive fix ("inject focused docs mid-generation") runs into prefill
+latency: 500 new tokens = ~250 ms of prefill per injection. Fine once,
+prohibitive repeatedly.
 
 ## Core idea
 
-Pre-prefill multiple specialised system prompts **offline**. At runtime,
-load a small **router** prompt (tells the model "three modes exist, pick
-one"). When the model emits `setType("sequence")`, the grammar state
-machine fires a **mount** action that swaps in the pre-baked
-`sequence.kv` onto the live cache. Zero runtime prefill. The model now
-has dense mode-specific context without ever having "seen" it prefilled
-in this session.
+Pre-prefill one KV cache per diagram type at build time, all packed
+into a single container file. At runtime, the router cache is active.
+When the model emits `setType("architecture")` (or any other valid
+type), swap the active cache to that type's pre-baked KV. The swap is
+a GPU memcpy, not a prefill. The model loses the router context but
+gains dense per-type context with a re-prefill of just the user turn
+on top.
 
-Grammar is already the state machine (`demo/src/draw/grammar.ts`).
-We extend it with SDK-level states and attach side-effect actions to
-specific transitions.
+Grammar-triggered because the decision point is a syntactic event the
+model produces naturally — no extra routing logic, no pre-request
+heuristics.
 
-## TL;DR
+## Flow
 
 ```
-build time:   prefill router.kv  +  sequence.kv  +  arch.kv  +  uml.kv
-              all baked into public/system-cache.bin
+build time:
+  for each of 9 prompts (router + 8 types):
+    tokenize, prefill engine, dumpCache → TQKV blob
+  pack all 9 into one TQKC container → public/system-cache.bin
 
-runtime:      load router.kv     (~500 tok,    fast)
-              model emits setType("sequence")
-              grammar transition: S_ROUTER → S_SEQUENCE
-                                  action: mountKV(sequence)
-              continue decode with mode-specific KV
+runtime boot:
+  fetch system-cache.bin, parse TQKC
+  load "router" branch's KV as active system cache
+  register the other 8 branches on the engine (CPU-resident blobs,
+    ready for mountKV)
 
-retry:        compile gate fails
-              rollback to pre-setType snapshot
-              remount router.kv (so the model reconsiders the mode)
-              inject error feedback
-              continue decode
+generate:
+  prefill user turn on top of router
+  skip the thinking phase (prefill <channel|> + reminder — router's
+    only job is to pick a type, not plan the diagram)
+  stream code tokens; ModeTracker scans each decoded chunk
+
+on ModeTracker fire (setType("X") recognised):
+  abort stream
+  engine.mountKV("X")  — swap active KV to that branch
+  re-prefill user turn on top of the mounted branch
+  seed editor with canonical setType("X");\n
+  run full thinking + code phase under the specialised KV
+  (fire-once per attempt — a second setType in branch output is
+   suppressed because its editor duplicate was already written)
+
+retry (compile gate fails):
+  restoreCache — puts KV back to router snapshot, resets activeBranch
+  outer loop re-enters with fresh conversation + error feedback
 ```
 
 ## Prior art
 
-Closest three, none of which do this combination:
-
 | System | What they do | What's missing |
 |---|---|---|
-| SGLang **RadixAttention** | Caches prefix KVs across requests; share tree of prompts | Chosen pre-request, not swapped mid-stream |
-| **RP lorebooks** (SillyTavern etc.) | Keyword-triggered context injection | String-level prepend, full re-prefill on every trigger |
-| Constrained decoding (Outlines, Guidance) | Grammar masks logits | Controls output tokens, never touches KV |
+| SGLang RadixAttention | Shares prefix KVs across requests in a tree | Chosen per-request, not swapped mid-generation |
+| RP lorebooks (SillyTavern) | Keyword-triggered context injection | String-level prepend, full re-prefill each trigger |
+| Constrained decoding (Outlines, Guidance) | Grammar masks output logits | Never touches KV |
 
-**Gap:** grammar-triggered, mid-generation KV swap using pre-baked
-branches. Unclaimed as far as I can tell.
+The specific combination — grammar-triggered, mid-generation KV swap
+with pre-baked per-mode branches — doesn't appear published.
 
-## Design
+## Implementation
 
-### 1. Multi-branch cache file format
+### Multi-branch cache file format (TQKC)
 
-Today: `public/system-cache.bin` is one `TQKV`-magic blob.
-
-New format:
-
-```
-[magic "TQKV"]
-[version u16]
-[branch_count u16]
-[branch_index: branch_count × {name_len u8, name bytes, offset u64, len u64, token_count u32}]
-[branch_0 KV bytes]
-[branch_1 KV bytes]
-...
-```
-
-Worker loads all branches into GPU memory on init. Active branch is a
-pointer + position-offset pair.
-
-Branch names (v1):
-- `"router"` — mode-picker preamble; small, always loaded initially
-- `"sequence"`, `"architecture"` — per-mode specialised prompts
-
-(Originally planned `"uml"` as a separate branch, but the runtime
-`DiagramType` is only `"architecture" | "sequence"` — `class`, `er`,
-`swimlane`, etc. are visual shape sub-types inside `architecture` mode,
-so they share its branch.)
-
-Approximate branch sizes (rough, from char-count):
-- router ~200 tok
-- sequence ~800 tok (incl. SDK_TYPES)
-- architecture ~2200 tok (incl. SDK_TYPES)
-
-Total baked ~3200 tok — roughly matches today's single 3005-tok blob.
-Because only one branch is "live" at a time, runtime attention scan
-drops from 3005 → 200 (router alone) or 200+800=1000 (sequence) or
-200+2200=2400 (architecture). 1.3-15× less attention work per step.
-
-### 2. KV mount primitive
-
-**What:** splice a pre-baked branch's KV onto the live cache at the
-current position, so the next token attends over
-`[live prefix ++ branch KV]`.
-
-**Mechanics per layer:**
-
-- Allocate cache slots at positions `P_current .. P_current + branch_len - 1`.
-- Copy branch's K, V tensors into those slots. V needs no transform.
-- **K needs re-RoPE**: branch K was encoded with positional phase for
-  position 0. Multiply each K head's rotation by
-  `exp(i × θ × P_current)` to shift it to `P_current`. One compute-shader
-  pass per layer, sub-ms on M1.
-
-Note: TQ encodes K in a rotated space, so the re-RoPE pass runs before
-the TQ encode on build, OR after decode on runtime mount. Build-time
-re-RoPE is impossible (we don't know `P_current` yet), so it has to be
-runtime. Decode TQ K → re-RoPE → re-encode TQ K. This is the only
-non-cheap part; needs benchmarking before committing.
-
-**Alternative:** skip RoPE shift entirely. Always mount at a FIXED
-position (end of router). Never append more than one sub-branch. On
-retry, rollback and remount. This eliminates RoPE-shift complexity at
-the cost of "branches are only usable from root" (no nesting).
-
-**Recommendation for v1:** alternative. Prove the idea with flat
-branches first. Nested sub-menus (addBox param help, etc.) come later,
-once the RoPE-shift cost is measured.
-
-### 3. Grammar extension: SDK-aware states
-
-Current grammar states are char-level (`S_FREE`, `S_PAREN_NEUTRAL`, …).
-We add SDK-level states on top:
+`demo/src/draw/system-cache-container.ts`. Little-endian, all u32
+(not u64 — max blob is ~20 MB, u32 is fine):
 
 ```
-S_MODE_UNSET  — before setType() called
-S_SEQUENCE    — inside setType("sequence") mode
-S_ARCH        — inside setType("architecture") mode
-S_UML         — inside setType("uml") mode
+4 bytes   magic "TQKC"
+2 bytes   version u16  (= 1)
+2 bytes   branch_count u16
+per branch index entry:
+  1 byte   name_len u8  (max 32)
+  name_len bytes         utf-8
+  4 bytes  offset u32    (bytes from file start to the branch's TQKV blob)
+  4 bytes  length u32    (bytes occupied by that blob)
+  4 bytes  token_count u32
+per branch blob (concatenated after the index):
+  TQKV blob (format unchanged, exactly what Engine.dumpCache emits)
 ```
 
-These compose with the existing char-level states; the grammar becomes
-`(char_state, sdk_state)` pairs. SDK-state transitions fire on
-recognising completed SDK calls.
+`packContainer(entries)` / `unpackContainer(buffer)` are pure — no
+engine, no GPU. `parseSystemCache` auto-detects TQKV single-blob vs
+TQKC container for backwards compat, though v1 ships TQKC-only.
 
-**Hook API:**
+### Branches (9 total)
 
-```ts
-interface GrammarAction {
-  // Fires when grammar completes a transition into `state`.
-  onEnter?: (state: number) => void;
-  // Fires when grammar exits `state` (e.g., rollback).
-  onExit?: (state: number) => void;
-}
-```
-
-Engine wires `onEnter(S_SEQUENCE)` to `engine.mountKV("sequence")`.
-
-### 4. Retry protocol
-
-Today: on compile-gate failure, feed error back, retry from a snapshot.
-
-New: on compile-gate failure:
-
-1. `engine.rollbackKV(routerEnd)` — erase all generation including
-   `setType(...)`.
-2. `engine.mountKV("router")` — restore full menu.
-3. Inject error feedback tokens ("last attempt failed: <error>. Try a
-   different approach.").
-4. Resume decode.
-
-The key insight: if the sub-menu was wrong (model picked arch when user
-wanted sequence), retrying *within* that sub-menu will reproduce the
-error. Always rollback to the fork point.
-
-### 5. Build pipeline
-
-`tests/build-cache.spec.ts` today builds one cache. Extend to:
+Current sizes (`bun run rebuild-cache` reproduces):
 
 ```
-for each branch in [router, sequence, arch, uml]:
-    page.goto(draw.html?noCache=1&branch=${branch})
-    wait for status=Ready
-    dump KV
-    append to system-cache.bin with branch_index entry
+router       766 tok    5.9 MB
+sequence    1202 tok    9.3 MB
+architecture 1662 tok   12.8 MB
+flowchart   1219 tok    9.4 MB
+state       1148 tok    8.9 MB
+orgchart    1189 tok    9.2 MB
+er          1438 tok   11.1 MB
+class       1405 tok   10.9 MB
+swimlane    1399 tok   10.8 MB
+            total      88.3 MB
 ```
 
-Prompt hash includes all four branches' source slices, not just a
-single SYSTEM_PROMPT.
+File is ~30% larger than the old single blob (88 vs 69 MB), but at any
+moment only one branch is live so the runtime attention scan is
+smaller for every type (766 for router, 1148-1662 for the mounted
+branch vs the old uniform 3005).
 
----
+### KV mount primitive
+
+`engine.mountKV(name)` in `engine.ts`. Semantics:
+
+- Loads the named branch's TQKV blob via the existing `loadCache`
+  path.
+- Sets `engine.position = branch.tokenCount`.
+- Sets `engine._activeBranch = name`.
+- Caller is responsible for re-prefilling anything they want past the
+  branch's end (user turn, seed tokens).
+
+No RoPE shift in v1: each branch was prefilled starting at position
+0, so mounting it as the active cache at position 0 keeps every K
+rotation's phase correct. Arbitrary-position mount (for nested
+sub-shells) would need a runtime K re-rotation pass — v2 work.
+
+### ModeTracker
+
+`demo/src/draw/grammar.ts`. Side-channel observer, not composed into
+the char-level grammar's state machine. Pattern match on each decoded
+token chunk:
+
+```
+/setType\s*\(\s*"(sequence|architecture|flowchart|state|orgchart|er|class|swimlane)"\s*\)/
+```
+
+Nine SDK_MODE constants (UNSET + the 8 types). `sdkModeForSetTypeArg`
+maps the matched arg to a constant. `onEnter(mode, fn)` registry fires
+synchronously when observe detects the first match — subsequent
+matches in the same generation are no-ops. `reset()` re-arms for the
+next attempt.
+
+Chose a side-channel over nesting into the transition table: nesting
+would multiply mask + transition sizes by 9 for a feature that fires
+at most once per generation. Pattern match is O(emitted text len) and
+stops on first hit.
+
+### Retry protocol
+
+`engine.restoreCache()` now also restores `_activeBranch` (via a
+`_snapshotBranch` field captured by `snapshotCache`). So a retry after
+a mid-stream mount cleanly goes back to the router snapshot, and the
+bookkeeping stays consistent — no stale `activeBranch = "architecture"`
+after restoring to router KV.
 
 ## Scope
 
-### v1 — flat branches, router + 2 modes
+### v1 (shipped)
 
-- [ ] Multi-branch cache file format (writer + reader)
-- [ ] `engine.mountKV(branchName)` — load from baked blob, no RoPE shift
-  (mount at end of router only)
-- [ ] Grammar SDK-state extension (4 states: unset/sequence/arch/uml)
-- [ ] Grammar action hook API + one hook wiring `setType(x)` → mount
-- [ ] Retry protocol rewrite (rollback past setType, remount router)
-- [ ] Build pipeline extended to produce 4 branches
+- [x] TQKC multi-branch container format (writer + reader + 7 tests)
+- [x] `engine.mountKV(name)` + `registerBranch` primitives
+- [x] ModeTracker with 9-way routing + onEnter hooks (14 tests)
+- [x] Per-type branches: router + 8 types
+- [x] Build pipeline iterates all 9 branches
+- [x] Mid-stream mount do-over in `main.ts` generate()
+- [x] Retry protocol restores activeBranch bookkeeping
+- [x] Skip-thinking-on-router optimisation
 
-**Exit criteria:** generation for each of the three modes is correct
-(compile gate passes on a sample prompt per mode); system-cache.bin is
-~20% larger than today; first-token latency for decode unchanged; tok/s
-unchanged or better (smaller working KV window).
+### v2 (open)
 
-### v2 — nested sub-menus (not in this PR)
-
-- [ ] RoPE-shift runtime pass (K-only, per layer)
-- [ ] Multi-level mount stack (mount onto already-mounted branch)
-- [ ] Finer SDK states — `addBox({…})` param help, `connect(src, dst)`
-  argument help
-- [ ] Grammar actions can also fire `onExit`
-
-Deferred until v1 demonstrates value.
-
----
+- [ ] Runtime RoPE-shift pass for arbitrary-position mount. Lets a
+      branch attach onto the end of an already-active cache instead
+      of replacing it, enabling nested sub-shells.
+- [ ] Per-mode grammar. Today the char-level grammar is shared by all
+      modes; per-mode masks would hard-enforce the allowed function
+      vocabulary (addActor only in sequence, addClass only in class,
+      etc.) rather than relying on per-type prompt instruction.
+- [ ] Finer sub-shells: addBox param help, connect args help, etc.
+      Requires nested mount.
+- [ ] Conformance test for RoPE-shift-through-TQ numerical drift —
+      blocker for v2 since re-RoPE needs decode → rotate → re-encode
+      roundtrip through polar + QJL, which is lossy.
 
 ## Edge cases
 
-1. **Model never calls setType.** Stay on router. Router must be a
-   valid self-contained prompt (it is — today's 3005-tok prompt is a
-   superset). No regression.
-
-2. **Model calls setType with an invalid arg** (e.g., `setType("foo")`).
-   Grammar masks — only "sequence" | "architecture" | "uml" pass. Can't
-   happen.
-
-3. **Model calls setType twice.** Second call is still grammar-valid if
-   the grammar allows mode switching. For v1, grammar masks a second
-   setType after the first one commits. The model's trained behaviour
-   is to call it once anyway.
-
-4. **Retry exhaustion.** After N retries (currently 3?), give up and
-   surface the best-effort output, same as today.
-
-5. **System-cache.bin version mismatch.** Magic + version header; on
-   mismatch, fall back to runtime prefill of router only, no branches.
-   Slow first session, still works.
-
-6. **KV budget overflow.** Worker allocates cache for
-   `routerLen + max(branchLen) + generationBudget`. Checked at init.
-
----
-
-## Open questions
-
-1. **How much does a branched system-cache.bin grow?** Today's is
-   68.9 MB (3005 tokens, TQ-compressed). Revised estimate after the
-   2-mode split: router + sequence + architecture ≈ 3200 tokens baked,
-   so ~73 MB — roughly the same size, not 2× as first thought. TQ bytes
-   per token scale linearly with token count.
-
-2. **Is the model actually better in specialised mode?** Needs
-   perplexity-on-mode-specific-prompt measurement before and after to
-   prove value. It's plausible — today's 3005-tok prompt includes 2/3
-   "other mode noise" — but not demonstrated yet.
-
-3. **Do we need an `unmount` / `exitMode` for v2?** If the SDK supports
-   changing modes mid-diagram (currently it doesn't in practice), we'd
-   need pop semantics. For v1 mode is terminal; no pop needed.
-
-4. **Does RoPE re-shift survive TurboQuant compression?** K is stored
-   TQ-compressed. Re-shifting requires decode → rotate → re-encode. The
-   decode-encode roundtrip is lossy (polar quantisation); re-encoding a
-   re-rotated K might drift from the reference RoPE'd K by more than an
-   ULP. v2 blocker, needs conformance test.
-
----
-
-## Names considered
-
-- **Dynamic context window** — what user called it, keeps
-- Scoped context
-- Grammar-scoped KV
-- Context sub-shells
-- KV mount points
-- Context filesystem / `mount`/`umount`
-
-We use "dynamic context window" in docs and commit messages.
+1. **Model never calls setType.** Tracker doesn't fire, no mount, stay
+   on router. Router is a valid self-contained prompt for the narrow
+   case where the model can answer without per-type docs (rare).
+2. **Model calls setType with an unknown arg.** Regex doesn't match,
+   no mount, stay on router. Grammar doesn't currently mask this at
+   the token level — per-mode grammar (v2) would.
+3. **Second setType in the same generation.** ModeTracker's fire-once
+   guard returns false. No effect. Branch output's leading setType
+   (if it re-emits) is filtered from the editor by the suppressor.
+4. **Retry exhaustion.** After MAX_ATTEMPTS (3), surface best-effort
+   output, same as pre-dynamic-context behaviour.
+5. **Cache file version mismatch.** Magic + version header; on
+   mismatch the runtime logs a warning and falls back to fresh
+   prefill.
+6. **KV budget.** Worker pre-allocates for the largest branch plus
+   generation budget. Branches are swapped into the same slots.
