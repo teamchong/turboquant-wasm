@@ -7,6 +7,8 @@
 // loop in a single GPU thread per head — for a 2400-position cache that was
 // burning ~20 ms/token doing nothing while every other lane sat idle.
 
+enable subgroups;
+
 struct Params {
   n_cols: u32,        // packed stride (usually the cache length)
   window_start: u32,  // positions < ws are masked to -inf (sliding window floor)
@@ -31,45 +33,46 @@ fn mh_softmax(
   let row_start = head * n;
   let max_pos = params.query_pos + 1u;
   let win_start = params.window_start;
+  // Hi-Z loop bound: phases 2-4 only need positions in [win_start, scan_end).
+  // Prior phase 1 wrote -1e30 to out-of-window slots so downstream reads
+  // were harmless; with tighter bounds those slots are never read.
+  // Sliding-window layers (28/35) have window=512 but n grows to 3000+,
+  // so the old 0..n scan did ~6× the needed work here.
+  let scan_end = min(max_pos, n);
 
-  // Phase 1: causal + sliding-window mask. Each thread strides across `n`,
-  // setting out-of-window positions to -inf. Operates directly on `data`
-  // (no shared scratch) since positions are independent.
-  var i = tid;
-  while (i < n) {
-    if (i >= max_pos || i < win_start) {
-      data[row_start + i] = -1e30;
-    }
-    i += WG_SIZE;
-  }
-  workgroupBarrier();
-
-  // Phase 2: parallel max for numerical stability.
+  // Phase 2: parallel max for numerical stability. Subgroup butterfly
+  // reduction — max is order-invariant so no FP-reorder risk (unlike
+  // phase 3's sum which stays as a shared-memory tree reduction below).
   var local_max = -1e30f;
-  i = tid;
-  while (i < n) {
+  var i = win_start + tid;
+  while (i < scan_end) {
     let v = data[row_start + i];
     if (v > local_max) { local_max = v; }
     i += WG_SIZE;
   }
-  s_reduce[tid] = local_max;
+  // Intra-subgroup butterfly (5 strides for 32-wide subgroup).
+  local_max = max(local_max, subgroupShuffleXor(local_max, 1u));
+  local_max = max(local_max, subgroupShuffleXor(local_max, 2u));
+  local_max = max(local_max, subgroupShuffleXor(local_max, 4u));
+  local_max = max(local_max, subgroupShuffleXor(local_max, 8u));
+  local_max = max(local_max, subgroupShuffleXor(local_max, 16u));
+  if ((tid & 31u) == 0u) { s_reduce[tid >> 5u] = local_max; }
   workgroupBarrier();
-
-  var stride = WG_SIZE / 2u;
-  while (stride > 0u) {
-    if (tid < stride) {
-      let other = s_reduce[tid + stride];
-      if (other > s_reduce[tid]) { s_reduce[tid] = other; }
-    }
-    stride /= 2u;
-    workgroupBarrier();
-  }
+  // Cross-subgroup butterfly over 8 stashed maxes. Lanes ≥ 8 carry -inf;
+  // only lane 0's result is read. Called at top level for uniform flow.
+  var cross_max = -1e30f;
+  if (tid < 8u) { cross_max = s_reduce[tid]; }
+  cross_max = max(cross_max, subgroupShuffleXor(cross_max, 1u));
+  cross_max = max(cross_max, subgroupShuffleXor(cross_max, 2u));
+  cross_max = max(cross_max, subgroupShuffleXor(cross_max, 4u));
+  if (tid == 0u) { s_reduce[0] = cross_max; }
+  workgroupBarrier();
   let max_val = s_reduce[0];
 
-  // Phase 3: parallel exp + per-thread sum.
+  // Phase 3: parallel exp + per-thread sum. Same window-bounded scan.
   var local_sum = 0.0f;
-  i = tid;
-  while (i < n) {
+  i = win_start + tid;
+  while (i < scan_end) {
     let e = exp(data[row_start + i] - max_val);
     data[row_start + i] = e;
     local_sum += e;
@@ -78,7 +81,7 @@ fn mh_softmax(
   s_reduce[tid] = local_sum;
   workgroupBarrier();
 
-  stride = WG_SIZE / 2u;
+  var stride = WG_SIZE / 2u;
   while (stride > 0u) {
     if (tid < stride) {
       s_reduce[tid] += s_reduce[tid + stride];
@@ -88,10 +91,11 @@ fn mh_softmax(
   }
   let total = s_reduce[0];
 
-  // Phase 4: parallel normalize.
+  // Phase 4: parallel normalize. Window-bounded so out-of-window slots
+  // keep stale values (never read by wsum_p1's compact-list path below).
   let inv = 1.0f / total;
-  i = tid;
-  while (i < n) {
+  i = win_start + tid;
+  while (i < scan_end) {
     data[row_start + i] = data[row_start + i] * inv;
     i += WG_SIZE;
   }

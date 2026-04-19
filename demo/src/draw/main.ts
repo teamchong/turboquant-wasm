@@ -4,12 +4,26 @@
 import { AutoTokenizer } from "@huggingface/transformers";
 import { executeCode } from "./drawmode/executor.js";
 import { SDK_TYPES } from "./drawmode/sdk-types.js";
+import { BRANCHES, type BranchName, ROUTER_PROMPT } from "./prompts/index.js";
+import { parseSystemCache } from "./system-cache-container.js";
 import { loadWasm } from "./drawmode/layout.js";
 import drawmodeWasm from "./drawmode/drawmode-wasm.js";
 import { mountExcalidraw, updateDiagram, resetDiagram, fitToScreen, enterEditMode, exitEditMode, getMode, showThinkingCloud, clearThinkingCloud } from "./excalidraw-viewer.js";
 import { createEditor, setCode, appendCode, getCode } from "./code-editor.js";
 import EngineWorker from "./engine-worker.ts?worker";
-import { buildGrammar, NUM_STATES } from "./grammar.js";
+import {
+  buildGrammar,
+  NUM_STATES,
+  ModeTracker,
+  SDK_MODE_ARCHITECTURE,
+  SDK_MODE_SEQUENCE,
+  SDK_MODE_FLOWCHART,
+  SDK_MODE_STATE,
+  SDK_MODE_ORGCHART,
+  SDK_MODE_ER,
+  SDK_MODE_CLASS,
+  SDK_MODE_SWIMLANE,
+} from "./grammar.js";
 
 const TOKENIZER_ID = "onnx-community/gemma-4-E2B-it-ONNX";
 const GGUF_URL = "https://huggingface.co/unsloth/gemma-4-E2B-it-GGUF/resolve/main/gemma-4-E2B-it-Q4_K_M.gguf";
@@ -68,6 +82,10 @@ let prefillDebounce: ReturnType<typeof setTimeout> | null = null;
 let lastPrefillText = "";
 let userPrefilled = false;
 let eagerFirstToken = 0;
+// Snapshot of the token sequence prefilled by the most recent eager prefill,
+// so the generate() fast-path can hand it to currentAttemptPrefilled for
+// retry-LCP without re-tokenising.
+let lastEagerPrefilledTokens: number[] | null = null;
 // Set while doUserPrefill is in flight so generate() can await it instead of
 // stacking a second prefill on top — that double-post used to race the
 // engine's _stagingBuf.mapAsync (only one outstanding map allowed per buffer).
@@ -78,13 +96,30 @@ let eagerPrefillPromise: Promise<void> | null = null;
 // full restoreCache → re-prefill path — saves most of the ~1-2s re-prefill
 // cost on iterative prompts like "draw X" followed by "draw X with 5 nodes".
 let cachedUserTokens: number[] | null = null;
+// Resolves when the in-flight generate() call finishes its finally block.
+// Second click on the Generate button aborts the previous run and awaits this
+// before starting a new one — without this, the abort + restart race the
+// worker (double prefill, double stream, GPU buffer contention).
+let currentGeneration: Promise<void> | null = null;
+// Tokens prefilled for the CURRENT attempt inside the active generate() call.
+// Used by the retry branch to compute LCP against the new (post-failure)
+// conversation's tokenIds — the retry adds {assistant: code, user: error}
+// turns on top of the original user prompt, so the first user-turn portion
+// matches and can be skipped via rollbackKV. Cleared when generate() exits.
+let currentAttemptPrefilled: number[] | null = null;
 // Position where the system-prompt snapshot ends. Initialised at init-time
 // once we know systemTokenIds. LCP rollback targets are computed as
 // `systemCacheEnd + lcpLen`.
 let systemCacheEnd = 0;
 // Minimum shared prefix length to use the rollback fast-path. Below this the
-// savings don't outweigh the rollback/suffix-prefill overhead.
-const PREFIX_REUSE_MIN = 32;
+// savings don't outweigh the rollback (worker round-trip ~1-2ms) + suffix-
+// prefill overhead. Set to 8: the rollbackKV worker call is one postMessage
+// round-trip (~1ms) and each token in the reused prefix saves ~0.8ms of
+// prefill work, so 8 tokens is roughly breakeven and anything above is pure
+// win. Lowered from the original 32 after the retry-LCP change — short user
+// prompts (<32 tokens) were missing the retry fast-path despite having 25+
+// tokens of reusable prefix.
+const PREFIX_REUSE_MIN = 8;
 
 const SYSTEM_PROMPT = `Reply with JavaScript SDK calls only. Start with the first call, end with the last call.
 
@@ -246,6 +281,44 @@ function workerCall<T>(msg: any, responseType: string): Promise<T> {
 // orphans for every connected node whose label rendered through a bound
 // text element.)
 const NODE_TYPES = new Set(["rectangle", "ellipse", "diamond", "table", "class"]);
+// Mechanical quick-fix: given generated SDK code + a list of orphan
+// LABELS (first string arg to addXxx), strip the matching
+// `const VAR = addXxx("LABEL", ...)` declarations AND any subsequent
+// connect/message/addGroup/addLane calls that reference the dead VAR
+// names. Produces a smaller-but-valid diagram without a full model
+// regen. Runs before the retry path in generate(); if the result
+// still looks broken we fall through to the regular retry.
+function stripOrphanDeclarations(code: string, orphanLabels: string[]): string {
+  if (orphanLabels.length === 0) return code;
+  const labelSet = new Set(orphanLabels.map(s => s.trim()));
+  const deadVars = new Set<string>();
+  // Pass 1: find every `const VAR = addXxx("LABEL"` where LABEL is
+  // orphaned; collect VAR names. Regex is permissive about optional
+  // whitespace. Only matches the first string arg.
+  const declRe = /^(\s*)(?:const|let|var)\s+(\w+)\s*=\s*add\w+\s*\(\s*"((?:[^"\\]|\\.)*)"/gm;
+  let m: RegExpExecArray | null;
+  while ((m = declRe.exec(code)) !== null) {
+    const varName = m[2];
+    const label = m[3];
+    if (labelSet.has(label)) deadVars.add(varName);
+  }
+  if (deadVars.size === 0) return code;
+  // Pass 2: drop whole lines that declare a dead var OR reference one
+  // as a positional arg to connect/message/addGroup/addLane. Identifier
+  // boundaries use \b so "user" doesn't match "userInput".
+  const lines = code.split("\n");
+  const deadVarPattern = [...deadVars].map(v => v.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|");
+  const declLineRe = new RegExp(`^\\s*(?:const|let|var)\\s+(?:${deadVarPattern})\\s*=`);
+  const refRe = new RegExp(`\\b(?:${deadVarPattern})\\b`);
+  const kept: string[] = [];
+  for (const line of lines) {
+    if (declLineRe.test(line)) continue;     // drop the dead declaration
+    if (refRe.test(line)) continue;          // drop any reference (connect/message/addGroup arg)
+    kept.push(line);
+  }
+  return kept.join("\n");
+}
+
 function detectOrphanNodes(elements: any[]): string[] {
   const referenced = new Set<string>();
   for (const el of elements) {
@@ -266,6 +339,33 @@ function detectOrphanNodes(elements: any[]): string[] {
     orphans.push(bound?.text?.trim() || n.text?.trim() || n.id);
   }
   return orphans;
+}
+
+// Excalidraw text elements render plain text — so when the model emits
+// markdown in the thinking channel (headers, bold, bullets, fenced code),
+// the raw `**`, `##`, backticks etc. show up as literal characters. Strip
+// the syntax and keep the payload so the thinking cloud is readable.
+function stripMarkdown(md: string): string {
+  return md
+    // Fenced code blocks: drop the ``` fences, keep the body.
+    .replace(/```[a-zA-Z0-9]*\n?/g, "")
+    // Inline code: `x` → x
+    .replace(/`([^`]+)`/g, "$1")
+    // Headers: `### Foo` → `Foo`
+    .replace(/^\s{0,3}#{1,6}\s+/gm, "")
+    // Bold/strong: **x** or __x__ → x
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/__([^_]+)__/g, "$1")
+    // Italic/em: *x* or _x_ → x (avoid eating bullet-style "* item" by requiring non-space after the *).
+    .replace(/(^|[^*])\*([^*\s][^*]*?)\*/g, "$1$2")
+    .replace(/(^|[^_])_([^_\s][^_]*?)_/g, "$1$2")
+    // List bullets: `- item` / `* item` / `+ item` → `• item`
+    .replace(/^(\s*)[-*+]\s+/gm, "$1• ")
+    // Numbered lists: keep the number but drop trailing `)` if present → `1.` stays `1.`
+    // Links: [text](url) → text
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    // Blockquote prefix
+    .replace(/^\s{0,3}>\s+/gm, "");
 }
 
 // LRU-ish cache keyed by (full text, template flag) that memoises
@@ -369,10 +469,12 @@ async function doUserPrefill() {
     eagerFirstToken = r.firstToken;
     userPrefilled = true;
     cachedUserTokens = userTokenIds;
+    lastEagerPrefilledTokens = userTokenIds;
     console.log("[draw] eager prefill done, first token:", eagerFirstToken);
   } catch {
     userPrefilled = false;
     cachedUserTokens = null;
+    lastEagerPrefilledTokens = null;
   } finally {
     resolveEager();
     eagerPrefillPromise = null;
@@ -387,10 +489,24 @@ async function generate() {
   const prompt = promptEl.value.trim();
   if (!prompt) return;
 
-  if (busy) { aborted = true; worker?.postMessage({ type: "abort" }); return; }
+  // Cancel-and-restart: second click aborts the in-flight generation, waits
+  // for it to unwind (the stream loop checks `aborted` at every token + at
+  // retry-loop boundaries), then falls through to start a fresh run on the
+  // (possibly changed) prompt. Previously a second click only aborted —
+  // forcing the user to click twice to actually retry.
+  if (busy) {
+    aborted = true;
+    worker?.postMessage({ type: "abort" });
+    if (currentGeneration) {
+      generateBtn.innerHTML = '<span class="spinner"></span> Cancelling...';
+      await currentGeneration;
+    }
+  }
 
   busy = true;
   aborted = false;
+  let resolveCurrent!: () => void;
+  currentGeneration = new Promise<void>((r) => { resolveCurrent = r; });
 
   if (!modelReady) {
     generateBtn.innerHTML = '<span class="spinner"></span> Waiting for model...';
@@ -434,6 +550,9 @@ async function generate() {
     const conversation: Array<{ role: string; content: string }> = [
       { role: "user", content: textPart },
     ];
+    // Reset per-generate() retry-rollback state. Populated after each
+    // attempt's prefill so the NEXT attempt can LCP against it.
+    currentAttemptPrefilled = null;
 
     // Separate per-phase budgets so a long reasoning turn doesn't starve
     // the code stream. Previously a single MAX_NEW_TOKENS=1024 was shared
@@ -491,13 +610,53 @@ async function generate() {
       // chunk) so the final thinking-cloud frame doesn't flash the marker
       // before we clear.
       const visible = thinkingText.replace(/<channel\|>.*$/s, "");
-      if (visible) showThinkingCloud(visible);
+      if (visible) showThinkingCloud(stripMarkdown(visible));
       statusEl.textContent = `Thinking... ${tokenCount} tok`;
     };
+    // Branch-phase leading setType suppression. Branch prompts say
+    // "setType has been called" but the model often re-emits setType(...)
+    // as its first code line anyway (the branch's own examples start
+    // with setType). Since the editor was already seeded with the
+    // canonical setType on mount, we drop the duplicate first line —
+    // buffer branch chunks until the first newline, then decide:
+    // - first line is setType(...) → discard, flush rest
+    // - first line is anything else → flush whole buffer
+    // Reset before each attempt + each post-mount run.
+    let suppressLeadingSetType = false;
+    let leadingLineBuffer = "";
+
+    const normalizeBranchChunk = (chunk: string): string => {
+      if (!suppressLeadingSetType) return chunk;
+      leadingLineBuffer += chunk;
+      const nl = leadingLineBuffer.indexOf("\n");
+      if (nl < 0) {
+        // Still within the first line — keep buffering, emit nothing.
+        // Defensive cap: if the branch emits a very long first line
+        // without newline we don't want to swallow the entire response.
+        if (leadingLineBuffer.length > 256) {
+          const out = leadingLineBuffer;
+          leadingLineBuffer = "";
+          suppressLeadingSetType = false;
+          return out;
+        }
+        return "";
+      }
+      const firstLine = leadingLineBuffer.substring(0, nl);
+      const rest = leadingLineBuffer.substring(nl + 1);
+      leadingLineBuffer = "";
+      suppressLeadingSetType = false;
+      if (/^\s*setType\s*\(/.test(firstLine)) {
+        return rest; // drop the duplicate setType line
+      }
+      return firstLine + "\n" + rest;
+    };
+
     const renderCodeToken = (id: number) => {
       tokenCount++;
       updateSpeed();
-      const chunk = tokenizer.decode([id], { skip_special_tokens: true });
+      const raw = tokenizer.decode([id], { skip_special_tokens: true });
+      if (!raw) return;
+      const chunk = normalizeBranchChunk(raw);
       if (!chunk) return;
       generatedCode += chunk;
       appendCode(chunk);
@@ -528,6 +687,17 @@ async function generate() {
     const reminderTokenIds: number[] = Array.from(reminderEncoded);
     if (reminderTokenIds[0] === 2) reminderTokenIds.shift();  // strip BOS if present
 
+    // Thinking channel close marker. Prefilling this after the user turn
+    // (which ends with `<|channel>thought\n` from the chat template) skips
+    // the thinking phase entirely: the model enters code mode for its very
+    // first token. Used on the ROUTER run — the model only needs to emit
+    // setType(...) there; full planning-under-branch thinking happens in
+    // the post-mount do-over.
+    const CHANNEL_CLOSE_TEXT = "<channel|>";
+    const channelCloseEncoded = tokenizer.encode(CHANNEL_CLOSE_TEXT);
+    const channelCloseTokenIds: number[] = Array.from(channelCloseEncoded);
+    if (channelCloseTokenIds[0] === 2) channelCloseTokenIds.shift();  // strip BOS if present
+
     let lastError: string | undefined;
     let finalResult: any = null;
 
@@ -538,23 +708,29 @@ async function generate() {
       if (attempt === 0 && userPrefilled && textPart === lastPrefillText) {
         console.log("[draw] using eager prefill, first token:", eagerFirstToken);
         nextToken = eagerFirstToken;
+        // Capture the eager-prefilled token sequence so a retry can LCP
+        // against it. doUserPrefill stores it on the module-scope cache.
+        currentAttemptPrefilled = lastEagerPrefilledTokens;
       } else {
         const tokenIds = tokenizeConversation(conversation, true);
         const phase = attempt === 0 ? "Processing prompt" : `Fixing error (retry ${attempt}/${MAX_ATTEMPTS - 1})`;
         statusEl.innerHTML = `<span class="spinner"></span> ${phase}...`;
 
-        // Prefix reuse — on attempt 0, if the previous generate left a
-        // compatible token sequence in KV, roll back to the longest common
-        // prefix instead of restoring to the system snapshot and re-prefilling
-        // everything. Saves the (shared-prefix × ms-per-token) fraction of the
-        // prefill cost on iterative prompts. Skip on retries because the
-        // conversation structure changes mid-attempt (assistant turn added,
-        // user feedback appended) and the KV vs re-tokenised-conversation
-        // alignment past the first-attempt user turn is non-trivial.
+        // Prefix reuse — two sources of LCP:
+        //   (a) attempt 0: cross-call reuse from the previous generate()'s
+        //       `cachedUserTokens` (iterative prompts share a prefix).
+        //   (b) attempt > 0 (retry): reuse the PREVIOUS attempt's prefilled
+        //       tokens. The retry appends {assistant: code, user: error} to
+        //       the conversation — the chat template's output up through the
+        //       first `<|turn>model\n` matches attempt N's prefill exactly,
+        //       so LCP ≈ prev_attempt_prefill_len − thought_template (~8 tok).
+        //       Unique to the retry-loop architecture — nothing else in the
+        //       browser LLM space has an error-feedback retry step to reuse.
         let lcp = 0;
-        if (attempt === 0 && cachedUserTokens) {
-          const maxLcp = Math.min(cachedUserTokens.length, tokenIds.length - 1);
-          while (lcp < maxLcp && cachedUserTokens[lcp] === tokenIds[lcp]) lcp++;
+        const lcpSource = attempt === 0 ? cachedUserTokens : currentAttemptPrefilled;
+        if (lcpSource) {
+          const maxLcp = Math.min(lcpSource.length, tokenIds.length - 1);
+          while (lcp < maxLcp && lcpSource[lcp] === tokenIds[lcp]) lcp++;
           if (lcp < PREFIX_REUSE_MIN) lcp = 0;
         }
 
@@ -576,6 +752,7 @@ async function generate() {
           nextToken = prefillResult.firstToken;
         }
         cachedUserTokens = tokenIds;
+        currentAttemptPrefilled = tokenIds;
       }
       userPrefilled = false;
       lastPrefillText = "";
@@ -598,47 +775,113 @@ async function generate() {
         }
       };
 
-      // First token (from prefill) — it's the first reasoning token, render
-      // it into the thinking cloud. If the model ended the turn immediately
-      // (EOS on nextToken) we fall through with empty content and the retry
-      // loop handles it below.
-      if (!EOS_TOKENS.has(nextToken)) renderThinkingToken(nextToken);
-
-      // Phase A — stream thinking. Worker stops the moment grammar
-      // transitions out of S_IN_THINK (the `<channel|>` token just landed).
-      const phaseA = await workerStream(
-        {
-          type: "streamConstrained",
-          tokenId: nextToken,
-          maxTokens: MAX_THINKING_TOKENS,
-          eosIds: [...EOS_TOKENS],
-          startInThinking: true,
-        } as any,
-        (msg) => {
-          if (aborted) return;
-          if (EOS_TOKENS.has(msg.id)) return;
-          renderThinkingToken(msg.id);
-          onStreamMsg(msg);
-        },
-      );
-
-      // Thinking phase is over either way — drop the cloud.
-      clearThinkingCloud();
-
-      // Phase B — inject a "now emit code" reminder and run the constrained
-      // code stream. Always runs after phase A (even if thinking ran past
-      // its budget without closing the channel): the reminder is the only
-      // way out of the thinking loop, so dropping phase B would guarantee
-      // empty code. Prepending `<channel|>` into KV is only correct when
-      // thinking *did* close normally; when it didn't, the reminder's
-      // leading "\n\n" is enough of a separator.
+      // Dynamic-context mount detection. modeTracker scans decoded code-
+      // phase text for `setType("sequence"|"architecture")`. When it
+      // fires, pendingMount is set and we abort the stream so the caller
+      // can swap the system-cache branch and re-run phase A + phase B
+      // under the specialised context.
       //
-      // IMPORTANT: on thinkingEnded the worker emitted the `<channel|>`
-      // token but did NOT feed it back into KV (streamConstrained breaks
-      // before writing it), so we prepend its id to the reminder prefill.
-      // Without this the model would see continuous reasoning → reminder
-      // with no channel close in cache, violating its trained wire format.
-      if (!aborted) {
+      // One-shot per attempt: after the first mount we never swap again
+      // in this attempt (ModeTracker's own fire-once semantics). If a
+      // compile error triggers a retry, the outer attempt loop resets by
+      // returning to the router snapshot via restoreCache + prefill.
+      const modeTracker = new ModeTracker();
+      let pendingMount: BranchName | null = null;
+      // One handler per mode — each maps to its own branch with dense
+      // per-type content. Adding a new DiagramType value requires adding
+      // a handler here, a branch file in prompts/, an entry in BRANCHES,
+      // and a constant + route in grammar.ts.
+      modeTracker.onEnter(SDK_MODE_ARCHITECTURE, () => { pendingMount = "architecture"; });
+      modeTracker.onEnter(SDK_MODE_SEQUENCE,     () => { pendingMount = "sequence"; });
+      modeTracker.onEnter(SDK_MODE_FLOWCHART,    () => { pendingMount = "flowchart"; });
+      modeTracker.onEnter(SDK_MODE_STATE,        () => { pendingMount = "state"; });
+      modeTracker.onEnter(SDK_MODE_ORGCHART,     () => { pendingMount = "orgchart"; });
+      modeTracker.onEnter(SDK_MODE_ER,           () => { pendingMount = "er"; });
+      modeTracker.onEnter(SDK_MODE_CLASS,        () => { pendingMount = "class"; });
+      modeTracker.onEnter(SDK_MODE_SWIMLANE,     () => { pendingMount = "swimlane"; });
+
+      // Router-phase observer. Tokens emitted under the router branch are
+      // thrown away — real code is generated under the mounted branch.
+      // During the router run we ONLY feed decoded text to modeTracker
+      // (to detect the setType) and tick the token / speed counters so
+      // the UI shows progress. We deliberately do NOT:
+      //   - append anything to the code editor
+      //   - accumulate anything in generatedCode
+      //   - trigger the partial-executor
+      // Once mount fires, the editor is seeded with `setType("<target>");\n`
+      // and branch tokens append normally via renderCodeToken from there.
+      // Result: editor is never polluted by the partial / truncated router
+      // setType that was causing the "setType flickers / disappears" bug.
+      const observeForMount = (id: number): boolean => {
+        tokenCount++;
+        updateSpeed();
+        const chunk = tokenizer.decode([id], { skip_special_tokens: true });
+        if (chunk) modeTracker.observe(chunk);
+        return pendingMount !== null;
+      };
+
+      // Router code phase: stream, observe each token, never render. The
+      // moment observeForMount sees a completed setType(...) it sets
+      // pendingMount and we abort the worker so the mount + do-over
+      // flow takes over.
+      const runCodePhaseOnly = async (initialToken: number): Promise<{ mountTarget: BranchName | null }> => {
+        if (!EOS_TOKENS.has(initialToken)) {
+          if (observeForMount(initialToken)) return { mountTarget: pendingMount };
+        }
+
+        await workerStream(
+          {
+            type: "streamConstrained",
+            tokenId: initialToken,
+            maxTokens: MAX_CODE_TOKENS,
+            eosIds: [...EOS_TOKENS],
+            startInThinking: false,
+          } as any,
+          (msg) => {
+            if (aborted) return;
+            if (EOS_TOKENS.has(msg.id)) return;
+            if (observeForMount(msg.id)) {
+              worker!.postMessage({ type: "abort" });
+              return;
+            }
+            onStreamMsg(msg);
+          },
+        );
+
+        return { mountTarget: pendingMount };
+      };
+
+      // Phase A (thinking) + reminder + Phase B (code). Used for the
+      // post-mount do-over under the specialised branch: the model gets
+      // rich per-type context, plans the actual diagram, then emits code.
+      const runThinkingAndCode = async (initialToken: number): Promise<{ mountTarget: BranchName | null; phaseAReason: string }> => {
+        if (!EOS_TOKENS.has(initialToken)) renderThinkingToken(initialToken);
+
+        const phaseA = await workerStream(
+          {
+            type: "streamConstrained",
+            tokenId: initialToken,
+            maxTokens: MAX_THINKING_TOKENS,
+            eosIds: [...EOS_TOKENS],
+            startInThinking: true,
+          } as any,
+          (msg) => {
+            if (aborted) return;
+            if (EOS_TOKENS.has(msg.id)) return;
+            renderThinkingToken(msg.id);
+            onStreamMsg(msg);
+          },
+        );
+
+        clearThinkingCloud();
+
+        if (thinkingText) {
+          const visible = thinkingText.replace(/<channel\|>.*$/s, "").trim();
+          if (visible) console.log(`[draw] thinking (${thinkingText.length}ch):\n${visible}`);
+        }
+
+        if (aborted) return { mountTarget: null, phaseAReason: phaseA.reason };
+
         statusEl.textContent = "Generating diagram code...";
         const prefillTokens = phaseA.reason === "thinkingEnded"
           ? [phaseA.lastTokenId, ...reminderTokenIds]
@@ -648,7 +891,15 @@ async function generate() {
         );
         const codeStartToken = prefillResult.firstToken;
 
-        if (!EOS_TOKENS.has(codeStartToken)) renderCodeToken(codeStartToken);
+        // Observe the very first code token too — the model may have
+        // emitted setType as its first post-thinking token.
+        if (!EOS_TOKENS.has(codeStartToken)) {
+          renderCodeToken(codeStartToken);
+          modeTracker.observe(tokenizer.decode([codeStartToken], { skip_special_tokens: true }));
+          if (pendingMount) {
+            return { mountTarget: pendingMount, phaseAReason: phaseA.reason };
+          }
+        }
 
         await workerStream(
           {
@@ -661,15 +912,103 @@ async function generate() {
           (msg) => {
             if (aborted) return;
             if (EOS_TOKENS.has(msg.id)) return;
+            const text = tokenizer.decode([msg.id], { skip_special_tokens: true });
+            modeTracker.observe(text);
+            if (pendingMount) {
+              worker!.postMessage({ type: "abort" });
+              return;
+            }
             renderCodeToken(msg.id);
             onStreamMsg(msg);
           },
         );
+
+        return { mountTarget: pendingMount, phaseAReason: phaseA.reason };
+      };
+
+      // FIRST RUN under router: skip thinking entirely. The chat template
+      // left the cache at `...<|channel>thought\n`; prefilling <channel|>
+      // + reminder closes the thinking channel and primes code mode, so
+      // the model's first generated token IS the first code token. Saves
+      // ~5s of wasted router thinking that would be discarded anyway.
+      //
+      // The nextToken returned by the user-turn prefill was a thinking
+      // token (what the model would have emitted WITHOUT our follow-up
+      // prefill). We discard it — that's one forward pass of wasted
+      // compute, but vs re-running full phase A it's cheap.
+      statusEl.textContent = "Picking diagram type...";
+      const routerSkipPrefill = [...channelCloseTokenIds, ...reminderTokenIds];
+      const routerCodeStartResult = await workerCall<{ firstToken: number }>(
+        { type: "prefill", tokenIds: routerSkipPrefill }, "prefillDone",
+      );
+      const routerCodeStartToken = routerCodeStartResult.firstToken;
+
+      let { mountTarget } = await runCodePhaseOnly(routerCodeStartToken);
+      let phaseAReasonFinal = "skipped-under-router";
+
+      // Mount triggered? Do the full do-over on the specialised branch.
+      // runThinkingAndCode already set pendingMount and aborted the stream;
+      // we now mount the branch, re-prefill the user turn, and run the
+      // thinking + code phases fresh.
+      if (mountTarget && !aborted) {
+        console.log(`[draw] mid-stream mount: swap router → "${mountTarget}", re-prefilling + redoing thinking+code`);
+        // Router phase rendered nothing to the editor (observeForMount is
+        // pure observation). Seed the editor now with the canonical
+        // setType("<target>");\n — branch tokens will append below it
+        // once the do-over starts streaming. This is the SOURCE OF TRUTH
+        // for the visible code from this point on.
+        //
+        // generatedCode shadows editor content so the statement-boundary
+        // partial-executor in renderCodeToken has something to count from.
+        // It IS the editor content (plus whatever tokens arrive next).
+        //
+        // The branch's prompt says setType has been called, so the model
+        // usually does NOT re-emit it — output appends below as expected.
+        // If it does re-emit, the final dedupe step strips duplicate
+        // setType lines before executeCode.
+        const setTypeHeader = `setType("${mountTarget}");\n`;
+        generatedCode = setTypeHeader;
+        setCode(setTypeHeader);
+        // Arm the branch-phase leading-setType suppressor: the branch will
+        // typically re-emit setType(...) as its first code line (its
+        // examples all start with it); we drop that duplicate during
+        // streaming so the editor shows exactly one setType header
+        // throughout. Disarmed automatically after the first branch-code
+        // newline.
+        suppressLeadingSetType = true;
+        leadingLineBuffer = "";
+        // DON'T reset modeTracker: its fire-once semantics are what keep
+        // the second pass from aborting again. The model under the mounted
+        // branch may re-emit `setType("sequence")` as its first code line
+        // (the branch's examples show it); if the tracker were reset it
+        // would re-fire and abort the stream mid-string, truncating the
+        // code (observed pre-fix: 17ch of `setType("sequence` before EOS).
+        // Keeping the tracker "already fired" makes observe return false
+        // for the rest of the attempt.
+        pendingMount = null;
+        // Conversation tokens re-prefilled on the mounted branch (the
+        // mountBranchAndPrefill worker call does the prefill internally
+        // and returns the model's first-token prediction, which is the
+        // opening of a fresh thinking channel).
+        const { firstToken: postMountFirst } = await workerCall<{ firstToken: number; branch: string }>(
+          {
+            type: "mountBranchAndPrefill",
+            branch: mountTarget,
+            userTurnTokens: currentAttemptPrefilled ?? tokenizeConversation(conversation, true),
+          },
+          "mountBranchDone",
+        );
+        // Second run — under the mounted branch. pendingMount stays null
+        // throughout; ModeTracker's fire-once semantics mean a second
+        // setType in the branch's output won't trigger another mount.
+        const second = await runThinkingAndCode(postMountFirst);
+        phaseAReasonFinal = second.phaseAReason;
       }
 
       // Debug: capture how each phase actually terminated — invaluable for
       // diagnosing "attempt 0 empty / retry fills in" pathologies.
-      console.log(`[draw] attempt ${attempt + 1} phaseA=${phaseA.reason} thinking=${thinkingText.length}ch code=${generatedCode.length}ch tokCount=${tokenCount}`);
+      const mountedNote = mountTarget ? ` mount=${mountTarget}` : "";
+      console.log(`[draw] attempt ${attempt + 1} phaseA=${phaseAReasonFinal}${mountedNote} thinking=${thinkingText.length}ch code=${generatedCode.length}ch tokCount=${tokenCount}`);
       if (thinkingText.length > 0) {
         console.log(`[draw]   thinking[0..200]=${JSON.stringify(thinkingText.slice(0, 200))}`);
       }
@@ -680,6 +1019,33 @@ async function generate() {
       let code = generatedCode.trim();
       code = code.replace(/^```(?:javascript|js|typescript|ts)?\s*\n?/i, "");
       code = code.replace(/\n?```\s*$/i, "");
+      // If a mount fired, generatedCode was seeded with the canonical
+      // setType("<target>");\n at mount time. If the branch ALSO emitted
+      // setType(...) as its first code line (some branches prompt
+      // ambiguously), we'd have two setType calls — dedupe by removing
+      // any non-first setType lines whose arg matches the mount target.
+      // Defensive; most branches don't re-emit.
+      if (mountTarget) {
+        const canonical = `setType("${mountTarget}");`;
+        // Strip any DUPLICATE setType call whose target matches mountTarget,
+        // keeping only the first occurrence.
+        let seen = false;
+        code = code.replace(/setType\s*\(\s*"[^"]*"\s*\)\s*;?/g, (match) => {
+          if (!seen) {
+            seen = true;
+            return canonical;
+          }
+          return "";
+        });
+        // Also ensure setType is on its own line (strip leftover `;;` or
+        // blank-lines-with-whitespace from the dedupe).
+        code = code.replace(/\n\s*\n\s*\n+/g, "\n\n").trim();
+        // If somehow no setType made it in (e.g., the router's partial
+        // was truncated before we seeded), prepend canonical.
+        if (!/^\s*setType\s*\(/.test(code)) {
+          code = `${canonical}\n${code}`;
+        }
+      }
       setCode(code);
 
       statusEl.textContent = "Rendering diagram...";
@@ -697,7 +1063,7 @@ async function generate() {
       const totalNodes = elementsRendered.filter((el: any) => NODE_TYPES.has(el.type) && !el.customData?._group).length;
       const orphanRatio = totalNodes > 0 ? orphans.length / totalNodes : 0;
       const ORPHAN_RETRY_THRESHOLD = 0.4;
-      const hasOrphans = orphans.length > 0
+      let hasOrphans = orphans.length > 0
         && orphanRatio >= ORPHAN_RETRY_THRESHOLD
         && attempt < MAX_ATTEMPTS - 1;
 
@@ -708,9 +1074,40 @@ async function generate() {
       // "Diagram ready" with nothing on screen.
       const isEmpty = !code || totalNodes === 0;
 
+      // IDE-style quick-fix: before triggering a full model regen for orphan
+      // nodes, try mechanically stripping the `const ORPHAN = addXxx(...)`
+      // declarations and re-executing. If the trimmed code produces a
+      // connected diagram, skip the retry entirely — a ~15s regen saved
+      // whenever the model over-declared. Only nodes on the orphan list get
+      // stripped; connect/message/addGroup etc. lines are preserved even if
+      // they referenced the stripped names (those calls become no-ops since
+      // the names are undefined, but JS would throw — so we also drop lines
+      // that REFERENCE orphan names). This is the quick-fix codemod an IDE
+      // auto-applies; no other browser LLM stack has it because they lack
+      // a compile-gate + semantic orphan detector in-page.
+      if (!error && hasOrphans && !isEmpty) {
+        const stripped = stripOrphanDeclarations(code, orphans);
+        const { result: fixResult, error: fixError } = await executeCode(stripped);
+        const fixElements = fixResult.json?.elements || [];
+        const fixOrphans = fixError ? orphans : detectOrphanNodes(fixElements);
+        const fixTotal = fixElements.filter((el: any) => NODE_TYPES.has(el.type) && !el.customData?._group).length;
+        const fixRatio = fixTotal > 0 ? fixOrphans.length / fixTotal : 1;
+        if (!fixError && fixTotal > 0 && fixRatio < ORPHAN_RETRY_THRESHOLD) {
+          console.log(`[draw] attempt ${attempt + 1}: auto-fixed by stripping ${orphans.length} orphan(s): ${orphans.join(", ")}`);
+          code = stripped;
+          setCode(code);
+          finalResult = fixResult;
+          if (fixResult.json) updateDiagram(fixResult.json.elements || []);
+          hasOrphans = false;
+        }
+      }
+
       if (!error && !hasOrphans && !isEmpty) {
         currentCode = code;
-        if (result.json) { updateDiagram(result.json.elements || []); fitToScreen(); }
+        if (result.json || finalResult?.json) {
+          updateDiagram((finalResult?.json || result.json).elements || []);
+          fitToScreen();
+        }
         statusEl.textContent = attempt === 0 ? "Diagram ready" : `Diagram ready (fixed after ${attempt} ${attempt === 1 ? "retry" : "retries"})`;
         statusEl.classList.remove("error");
         break;
@@ -718,26 +1115,28 @@ async function generate() {
 
       // Render whatever compiled, then queue retry.
       if (result.json) updateDiagram(result.json.elements || []);
+      let retryFeedback: string;
       if (error) {
         console.log(`[draw] attempt ${attempt + 1} failed: ${error}`);
+        retryFeedback = `The code above failed at runtime with: ${error}\n\nRegenerate the full code, fixing the error.`;
         conversation.push({ role: "assistant", content: code });
-        conversation.push({ role: "user", content: `The code above failed at runtime with: ${error}\n\nRegenerate the full code, fixing the error.` });
+        conversation.push({ role: "user", content: retryFeedback });
       } else if (isEmpty) {
         console.log(`[draw] attempt ${attempt + 1}: empty output (no diagram produced)`);
+        retryFeedback = `The previous response produced no diagram code — only reasoning text or an empty string. Respond with the JavaScript SDK calls directly, no prose, no markdown. Start with the first call and end with the last.`;
         conversation.push({ role: "assistant", content: code });
-        conversation.push({
-          role: "user",
-          content: `The previous response produced no diagram code — only reasoning text or an empty string. Respond with the JavaScript SDK calls directly, no prose, no markdown. Start with the first call and end with the last.`,
-        });
+        conversation.push({ role: "user", content: retryFeedback });
         lastError = "empty output";
       } else {
         console.log(`[draw] attempt ${attempt + 1}: ${orphans.length} orphan node(s): ${orphans.join(", ")}`);
+        retryFeedback = `The code above runs, but these nodes are declared and never connected to anything: ${orphans.map(o => `"${o}"`).join(", ")}\n\nEither add connect/message edges that reference them, or remove them. Regenerate the full code.`;
         conversation.push({ role: "assistant", content: code });
-        conversation.push({
-          role: "user",
-          content: `The code above runs, but these nodes are declared and never connected to anything: ${orphans.map(o => `"${o}"`).join(", ")}\n\nEither add connect/message edges that reference them, or remove them. Regenerate the full code.`,
-        });
+        conversation.push({ role: "user", content: retryFeedback });
       }
+      // Dump the full user-feedback that the next retry will see — lets
+      // the curious user inspect what the model is being asked to fix
+      // before the retry starts.
+      console.log(`[draw] retry feedback for attempt ${attempt + 2}:\n${retryFeedback}`);
     }
 
     if (lastError && !aborted) {
@@ -766,6 +1165,8 @@ async function generate() {
 
   busy = false;
   generateBtn.textContent = "Generate Diagram";
+  resolveCurrent();
+  currentGeneration = null;
 }
 
 // =============================================================================
@@ -779,25 +1180,31 @@ async function generate() {
  * friendly message BEFORE we spawn anything.
  */
 async function checkWebGPUSupport(): Promise<string | null> {
+  const ua = navigator.userAgent || "";
+  const isIOS = /iPad|iPhone|iPod/.test(ua) || (ua.includes("Mac") && (navigator as any).maxTouchPoints > 1);
+  const isAndroid = /Android/.test(ua);
+  const isMobile = isIOS || isAndroid;
   const gpu = (navigator as any).gpu;
-  if (!gpu) {
-    return "WebGPU not available. This demo needs Chrome 114+, Edge 114+, or Safari 18+. Firefox needs 128+ (still gated behind flags on some channels). On mobile, iOS 18+ Safari works; Android Chrome may need chrome://flags/#enable-unsafe-webgpu.";
-  }
+  // Single answer on unsupported platforms: use desktop Chrome. Safari
+  // lacks the subgroups extension our matmul shaders need; mobile browsers
+  // cap per-tab memory below the 3 GB this model requires. Pointing users
+  // down "enable flag X" rabbit holes that don't actually work was worse.
+  const CHROME_MSG = "Please use desktop Chrome 134+ (Windows, macOS, or Linux). This demo needs the WebGPU subgroups extension that Safari hasn't shipped and the 3 GB model that mobile browsers can't hold in one tab.";
+  if (isMobile) return CHROME_MSG;
+  if (!gpu) return CHROME_MSG;
   let adapter: GPUAdapter | null;
   try {
     adapter = await gpu.requestAdapter();
   } catch (e) {
-    return `WebGPU adapter request failed: ${(e as Error).message}. Close other GPU-heavy tabs and retry.`;
+    return `WebGPU adapter request failed: ${(e as Error).message}. Close other GPU-heavy tabs and retry, or switch to desktop Chrome.`;
   }
   if (!adapter) {
-    return "WebGPU is enabled but no GPU adapter is available. Try closing other GPU-heavy tabs, or check chrome://gpu.";
+    return "WebGPU is enabled but no GPU adapter is available. Try closing other GPU-heavy tabs, check chrome://gpu, or switch to desktop Chrome.";
   }
   const missing: string[] = [];
   if (!adapter.features.has("shader-f16")) missing.push("shader-f16");
   if (!adapter.features.has("subgroups")) missing.push("subgroups");
-  if (missing.length > 0) {
-    return `This GPU adapter is missing required features: ${missing.join(", ")}. On Chrome/Edge try toggling chrome://flags/#enable-unsafe-webgpu and chrome://flags/#enable-webgpu-experimental-features. On older Intel iGPUs these extensions may simply not be available.`;
-  }
+  if (missing.length > 0) return CHROME_MSG;
   return null;
 }
 
@@ -821,6 +1228,37 @@ async function main() {
     return;
   }
 
+  // Singleton lock: only one tab runs the engine at a time. A second tab
+  // would allocate its own WebGPU device, duplicate the 3 GB model pointer
+  // in memory, and race for OPFS access — the browser would almost
+  // certainly OOM or throttle both. navigator.locks.request with
+  // `ifAvailable: true` returns null if another holder exists; holding the
+  // returned promise forever keeps the lock for this page's lifetime (it
+  // releases when the page unloads). Available on all WebGPU browsers
+  // (Chrome 69+, Firefox 96+, Safari 15.4+).
+  const lockAcquired = await new Promise<boolean>((resolve) => {
+    navigator.locks.request(
+      "turboquant-draw-engine",
+      { ifAvailable: true },
+      (lock) => {
+        if (lock === null) { resolve(false); return undefined; }
+        resolve(true);
+        return new Promise<void>(() => { /* held for page lifetime */ });
+      },
+    );
+  });
+  if (!lockAcquired) {
+    statusEl.innerHTML = `<span style="color:#f85149;">Already running in another tab</span>`;
+    statusEl.classList.add("error");
+    const errorCard = document.createElement("div");
+    errorCard.style.cssText = "padding:16px;margin:12px;background:#21262d;border:1px solid #f85149;border-radius:6px;color:#e6edf3;font-size:13px;line-height:1.6;";
+    errorCard.innerHTML = `<strong style="color:#f85149;">Already running in another tab</strong><br><br>This demo keeps a 3 GB Gemma 4 E2B model resident in GPU memory. Running it twice concurrently would OOM the browser. Close the other tab and reload this one.`;
+    codeArea.appendChild(errorCard);
+    generateBtn.disabled = true;
+    promptEl.disabled = true;
+    return;
+  }
+
   try {
     console.log("[draw] loading tokenizer...");
     tokenizer = await AutoTokenizer.from_pretrained(TOKENIZER_ID);
@@ -830,11 +1268,61 @@ async function main() {
     tokenizer.chat_template = CHAT_TEMPLATE;
     console.log("[draw] tokenizer ready");
 
-    const sysMessages = [{ role: "system", content: SYSTEM_PROMPT }];
-    const sysText = tokenizer.apply_chat_template(sysMessages, { tokenize: false, add_generation_prompt: false });
-    const sysEncoded = tokenizer.encode(sysText);
-    const systemTokenIds: number[] = Array.from(sysEncoded);
-    console.log("[draw] system prompt:", systemTokenIds.length, "tokens");
+    // Dynamic-context setup: tokenize every branch's prompt up-front. The
+    // router is what the engine actually boots with (its KV becomes the
+    // initial system cache); sequence + architecture are pre-registered on
+    // the engine so mountKV() can swap them in mid-stream when the grammar
+    // recognises a completed setType(...) call.
+    //
+    // Normal users never pass any query param — branch selection at
+    // runtime is driven by what the model emits, which is the whole point
+    // of the dynamic context design.
+    //
+    // ?buildBranch=<name> is an internal-only override used by the
+    // build-cache playwright test (tests/build-cache.spec.ts). It forces
+    // the boot branch's prompt to be <name> instead of "router" so the
+    // test can produce a TQKV dump per branch. The param is NEVER part of
+    // the normal user-facing flow.
+    const tokenizeBranchPrompt = (text: string): number[] => {
+      const msgs = [{ role: "system", content: text }];
+      const asText = tokenizer.apply_chat_template(msgs, { tokenize: false, add_generation_prompt: false });
+      return Array.from(tokenizer.encode(asText));
+    };
+    const branchTokenIds: Record<BranchName, number[]> = {
+      router: tokenizeBranchPrompt(BRANCHES.router),
+      sequence: tokenizeBranchPrompt(BRANCHES.sequence),
+      architecture: tokenizeBranchPrompt(BRANCHES.architecture),
+      flowchart: tokenizeBranchPrompt(BRANCHES.flowchart),
+      state: tokenizeBranchPrompt(BRANCHES.state),
+      orgchart: tokenizeBranchPrompt(BRANCHES.orgchart),
+      er: tokenizeBranchPrompt(BRANCHES.er),
+      class: tokenizeBranchPrompt(BRANCHES.class),
+      swimlane: tokenizeBranchPrompt(BRANCHES.swimlane),
+    };
+    console.log(
+      `[draw] branch token counts:\n` +
+      Object.entries(branchTokenIds)
+        .map(([name, ids]) => `  ${name.padEnd(14)} = ${ids.length}`)
+        .join("\n"),
+    );
+
+    const buildBranchParam = new URLSearchParams(location.search).get("buildBranch");
+    const bootBranch: BranchName =
+      buildBranchParam && (buildBranchParam in BRANCHES)
+        ? (buildBranchParam as BranchName)
+        : "router";
+    if (buildBranchParam && bootBranch !== "router") {
+      console.log(`[draw] BUILD-ONLY override: boot branch = "${bootBranch}" (via ?buildBranch=)`);
+    }
+
+    // The "live" system cache at boot is the bootBranch (router for real
+    // users; one of the other branches when the build-cache test is
+    // regenerating that specific branch's KV). User prompts prefill on
+    // top of this KV. Mid-stream, when setType fires, engine.mountKV
+    // replaces it with the chosen branch and the do-over re-prefills
+    // the user turn on top of the new branch.
+    const systemTokenIds: number[] = branchTokenIds[bootBranch];
+    console.log(`[draw] active boot branch: ${bootBranch}, ${systemTokenIds.length} tokens`);
     systemCacheEnd = systemTokenIds.length;
 
     worker = new EngineWorker();
@@ -915,18 +1403,15 @@ async function main() {
       }
       if (msg.type === "ready") { workerInitDone = true; markReadyIfBoth(); }
       if (msg.type === "grammarReady") { grammarInitDone = true; markReadyIfBoth(); }
-      // Worker did a fresh prefill (no cache, or rejected stale cache after
-      // a SYSTEM_PROMPT edit). Ship the new dump to the vite dev server so
-      // it can overwrite public/system-cache.bin — next reload gets the fast
-      // path. In production (no /api/write-system-cache endpoint) this just
-      // 404s and we log-and-move-on.
+      // Worker may dump a freshly-prefilled router KV if the on-disk cache
+      // was missing or stale. We used to forward this to the dev server to
+      // auto-replace public/system-cache.bin, but with the multi-branch
+      // TQKC format that convenience is actively dangerous: a single-branch
+      // TQKV post would overwrite all seven non-router branches with
+      // nothing. Ignore the dump — `bun run rebuild-cache` is the
+      // authoritative way to refresh every branch.
       if (msg.type === "cacheRebuilt") {
-        fetch("/api/write-system-cache", { method: "POST", body: msg.data })
-          .then(async (r) => {
-            if (r.ok) console.log(`[draw] system-cache.bin rewritten (${(msg.data.byteLength / 1e6).toFixed(1)} MB)`);
-            else console.warn(`[draw] cache auto-write failed: ${r.status} ${await r.text()}`);
-          })
-          .catch((e) => console.warn(`[draw] cache auto-write skipped: ${e.message}`));
+        console.log(`[draw] worker dumped ${(msg.data.byteLength / 1e6).toFixed(1)} MB (auto-write disabled — run 'bun run rebuild-cache' to refresh public/system-cache.bin)`);
       }
       if (msg.type === "error" && !busy) {
         statusEl.textContent = `Error: ${msg.message}`;
@@ -944,27 +1429,70 @@ async function main() {
     const initSystemTokenIds = skipSys ? [] : systemTokenIds;
     const enableProfile = new URLSearchParams(location.search).get("profile") === "1";
 
-    // Try to fetch the prebuilt system-prompt KV cache. If missing or any fetch
-    // error, we just fall through to the slow prefill path in the worker.
-    // `no-cache` (not `no-store`) revalidates with the server so HTTP caching
-    // still works, but avoids serving a stale 404/empty response from an
-    // earlier dev-server run.
-    let cacheBlob: ArrayBuffer | null = null;
+    // Fetch the prebuilt TQKC multi-branch cache. If missing or malformed,
+    // fall through to the slow prefill path (worker will prefill the router
+    // from scratch, then the mount infrastructure still works — just with a
+    // cold first boot).
+    //
+    // `no-cache` (not `no-store`) revalidates with the server so HTTP
+    // caching still works.
+    //
+    // Branch blobs are held in owned ArrayBuffers so postMessage transfer
+    // works across the worker boundary (can't transfer a slice of a parent
+    // buffer; slicing copies).
+    type BranchInit = { name: BranchName; blob: ArrayBuffer; tokenCount: number; tokenIds: number[] };
+    let cacheBlob: ArrayBuffer | null = null;             // router blob (the boot branch)
+    const extraBranchInits: BranchInit[] = [];             // sequence + architecture for later mount
     if (!skipSys && !skipBuiltCache) {
       try {
         const res = await fetch("./system-cache.bin", { cache: "no-cache" });
         if (res.ok && (res.headers.get("content-type") || "").includes("octet-stream")) {
-          cacheBlob = await res.arrayBuffer();
-          console.log(`[draw] prebuilt cache fetched: ${(cacheBlob.byteLength / 1e6).toFixed(1)} MB`);
+          const fullBuf = await res.arrayBuffer();
+          const parsed = parseSystemCache(fullBuf);
+          console.log(`[draw] cache fetched: ${(fullBuf.byteLength / 1e6).toFixed(1)} MB, ${parsed.branches.size} branches (version=${parsed.version})`);
+          for (const name of Object.keys(branchTokenIds) as BranchName[]) {
+            const entry = parsed.branches.get(name);
+            if (!entry) {
+              console.warn(`[draw] cache missing branch "${name}" — will prefill on mount`);
+              continue;
+            }
+            const owned = entry.blob.slice().buffer as ArrayBuffer;
+            if (name === "router") {
+              cacheBlob = owned;
+            } else {
+              extraBranchInits.push({
+                name,
+                blob: owned,
+                tokenCount: entry.tokenCount,
+                tokenIds: branchTokenIds[name],
+              });
+            }
+          }
         }
-      } catch { /* fall through to prefill */ }
+      } catch (e) {
+        console.warn(`[draw] cache fetch failed: ${(e as Error).message} — falling back to prefill`);
+      }
     }
 
     // ?benchUpload=1 makes the worker run every tensor-upload strategy once
     // and log timings — used to benchmark which OPFS read pattern wins.
     const benchUpload = new URLSearchParams(location.search).get("benchUpload") === "1";
-    const initMsg: any = { type: "init", ggufUrl: GGUF_URL, systemTokenIds: initSystemTokenIds, enableProfile, cacheBlob, benchUpload };
-    worker!.postMessage(initMsg, cacheBlob ? [cacheBlob] : []);
+    const initMsg: any = {
+      type: "init",
+      ggufUrl: GGUF_URL,
+      systemTokenIds: initSystemTokenIds,
+      enableProfile,
+      cacheBlob,
+      benchUpload,
+      // Non-active branches: worker registers each on the engine so
+      // mountKV() can later swap one of them into the live cache on setType
+      // detection. router is handled by cacheBlob (or fresh prefill) above.
+      extraBranches: extraBranchInits.map(({ name, blob, tokenCount, tokenIds }) => ({ name, blob, tokenCount, tokenIds })),
+    };
+    const transfers: Transferable[] = [];
+    if (cacheBlob) transfers.push(cacheBlob);
+    for (const b of extraBranchInits) transfers.push(b.blob);
+    worker!.postMessage(initMsg, transfers);
 
     // Grammar bitmaps: build in the background while the worker is busy
     // downloading/uploading the GGUF. Ship to the worker as soon as ready.

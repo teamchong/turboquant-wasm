@@ -3,14 +3,14 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Prompt → Diagram · in-browser LLM with TurboQuant KV cache</title>
-  <meta name="description" content="Gemma 4 E2B generating Excalidraw diagrams from text prompts, running entirely in your browser via WebGPU. KV cache compressed 2.4× using TurboQuant's polar+QJL algorithm reimplemented in WGSL compute shaders.">
-  <meta property="og:title" content="Prompt → Diagram — in-browser LLM with TurboQuant KV cache">
-  <meta property="og:description" content="Gemma 4 E2B runs locally in your browser. KV cache compressed 2.4× via WGSL compute shaders. 30+ tok/s on M1, no server, no API key.">
+  <title>Prompt → Diagram · Gemma 4 E2B in desktop Chrome (WebGPU)</title>
+  <meta name="description" content="Gemma 4 E2B generating Excalidraw diagrams from text prompts, running entirely in desktop Chrome via WebGPU. KV cache compressed 2.4× using TurboQuant's polar+QJL algorithm reimplemented in WGSL compute shaders. Requires Chrome 134+ on desktop — Safari/iOS not supported.">
+  <meta property="og:title" content="Prompt → Diagram — Gemma 4 E2B in desktop Chrome (WebGPU)">
+  <meta property="og:description" content="Gemma 4 E2B runs locally in desktop Chrome. KV cache compressed 2.4× via WGSL compute shaders. 30+ tok/s on M1, no server, no API key. Chrome 134+ desktop only — needs WebGPU subgroups + shader-f16.">
   <meta property="og:type" content="website">
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="Prompt → Diagram — in-browser LLM with TurboQuant KV cache">
-  <meta name="twitter:description" content="Gemma 4 E2B runs locally in your browser. KV cache compressed 2.4× via WGSL compute shaders. 30+ tok/s on M1, no server, no API key.">
+  <meta name="twitter:title" content="Prompt → Diagram — Gemma 4 E2B in desktop Chrome (WebGPU)">
+  <meta name="twitter:description" content="Gemma 4 E2B runs locally in desktop Chrome. KV cache compressed 2.4× via WGSL compute shaders. 30+ tok/s on M1, no server, no API key. Chrome 134+ desktop only.">
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
     body { font-family: system-ui, sans-serif; background: #0d1117; color: #e6edf3; height: 100vh; display: flex; flex-direction: column; }
@@ -54,8 +54,8 @@
 <body>
   <div id="header">
     <h1>TurboQuant <span class="dim">Prompt → Diagram</span></h1>
-    <p class="subtitle">Describe any diagram, Gemma 4 E2B generates it as Excalidraw — entirely in your browser.</p>
-    <p class="note">The LLM outputs compact code (~50 tokens) instead of raw Excalidraw JSON (~5,000 tokens). The TurboQuant algorithm (polar + QJL) compresses the KV cache ~2.4× so longer conversations fit in GPU memory.</p>
+    <p class="subtitle">Describe any diagram, Gemma 4 E2B generates it as Excalidraw — entirely in your browser. <strong style="color:#f0883e;">Desktop Chrome 134+ only.</strong></p>
+    <p class="note">The LLM outputs compact code (~50 tokens) instead of raw Excalidraw JSON (~5,000 tokens). The TurboQuant algorithm (polar + QJL) compresses the KV cache ~2.4× so longer conversations fit in GPU memory. Needs WebGPU subgroups (Safari/iOS not supported yet) and ~3 GB RAM (mobile browsers cap well below this).</p>
     <p class="note" style="font-size:11px;opacity:0.8;">This demo reimplements the TurboQuant algorithm in WGSL compute shaders so it runs on the GPU at 30+&nbsp;tok/s. The sibling <a href="https://www.npmjs.com/package/turboquant-wasm" style="color:#58a6ff;">turboquant-wasm</a> npm package implements the same algorithm in WASM+SIMD for CPU-side vector search.</p>
     <nav class="demo-nav"><a href="./">All demos</a> · <a href="https://www.npmjs.com/package/turboquant-wasm">npm</a> · <a href="https://github.com/teamchong/turboquant-wasm">GitHub</a></nav>
     <div style="display:flex;align-items:center;justify-content:center;gap:12px;margin-top:4px;">

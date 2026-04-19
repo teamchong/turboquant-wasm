@@ -164,6 +164,15 @@ class UniformMega {
   private nextOffset = 0;
   private align: number;
   private device: GPUDevice;
+  // Deduplication cache: exact-content string key → existing offset. Per
+  // WeInfer (ICLR '26 WebGPU paper), many dispatches within a single
+  // decode step post identical uniform blocks — rms-norm's [dim, eps, 0, 0]
+  // is identical across all 35 layers on the same width; matmul's
+  // [n_rows, n_cols] repeats for every Q/K/V/attn_out in a layer and
+  // across layers with matching shapes. Keying by exact byte content
+  // (not a hash — collisions would silently return another dispatch's
+  // slot) lets repeats share one slot + one writeBuffer byte range.
+  private cache: Map<string, number> = new Map();
 
   constructor(device: GPUDevice, maxSlots: number) {
     this.device = device;
@@ -173,28 +182,41 @@ class UniformMega {
     this.cpu = new Uint8Array(size);
   }
 
-  reset(): void { this.nextOffset = 0; }
+  reset(): void { this.nextOffset = 0; this.cache.clear(); }
 
-  /** Write 16 bytes, return binding 0 entry. */
+  /** Write 16 bytes, return binding 0 entry. Deduplicates by exact value. */
   get16(data: Uint32Array): GPUBindGroupEntry {
+    const key = `16|${data[0]}|${data[1]}|${data[2]}|${data[3]}`;
+    const cached = this.cache.get(key);
+    if (cached !== undefined) {
+      return { binding: 0, resource: { buffer: this.buf, offset: cached, size: 16 } };
+    }
     const offset = this.nextOffset;
     this.nextOffset += this.align;
     new Uint32Array(this.cpu.buffer, offset, 4).set(data);
+    this.cache.set(key, offset);
     return { binding: 0, resource: { buffer: this.buf, offset, size: 16 } };
   }
 
-  /** Write 32 bytes, return binding 0 entry. */
+  /** Write 32 bytes, return binding 0 entry. Deduplicates by exact value. */
   get32(data: ArrayBuffer): GPUBindGroupEntry {
+    const u = new Uint32Array(data, 0, 8);
+    const key = `32|${u[0]}|${u[1]}|${u[2]}|${u[3]}|${u[4]}|${u[5]}|${u[6]}|${u[7]}`;
+    const cached = this.cache.get(key);
+    if (cached !== undefined) {
+      return { binding: 0, resource: { buffer: this.buf, offset: cached, size: 32 } };
+    }
     const offset = this.nextOffset;
     this.nextOffset += this.align;
     new Uint8Array(this.cpu.buffer, offset, 32).set(new Uint8Array(data, 0, 32));
+    this.cache.set(key, offset);
     return { binding: 0, resource: { buffer: this.buf, offset, size: 32 } };
   }
 
   /** Upload all staged data to GPU in one call. Call before queue.submit(). */
   flush(): void {
     if (this.nextOffset > 0) {
-      this.device.queue.writeBuffer(this.buf, 0, this.cpu, 0, this.nextOffset);
+      this.device.queue.writeBuffer(this.buf, 0, this.cpu as Uint8Array<ArrayBuffer>, 0, this.nextOffset);
     }
   }
 }
@@ -414,11 +436,11 @@ export class InferenceEngine {
       }
       const buf = device.createBuffer({ size: mat.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
       const bufT = device.createBuffer({ size: matT.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-      device.queue.writeBuffer(buf, 0, mat);
-      device.queue.writeBuffer(bufT, 0, matT);
+      device.queue.writeBuffer(buf, 0, mat as Float32Array<ArrayBuffer>);
+      device.queue.writeBuffer(bufT, 0, matT as Float32Array<ArrayBuffer>);
       const signs = generateHadamardSigns(dim, 42);
       const signsBuf = device.createBuffer({ size: signs.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
-      device.queue.writeBuffer(signsBuf, 0, signs);
+      device.queue.writeBuffer(signsBuf, 0, signs as Int32Array<ArrayBuffer>);
       return [buf, bufT, signsBuf];
     };
 
@@ -1094,12 +1116,19 @@ export class InferenceEngine {
     this.position = 0;
   }
 
+  // Which branch was active when snapshotCache was called. Paired with
+  // _snapshot / _snapshotPosition so restoreCache can also put activeBranch
+  // bookkeeping back in sync (otherwise a mid-stream mountKV leaves
+  // activeBranch stale after a restoreCache).
+  private _snapshotBranch: string | null = null;
+
   /** Snapshot current KV cache state (GPU→GPU copy). Used to cache system prompt prefill. */
   snapshotCache(): void {
     const d = this.device;
     const enc = d.createCommandEncoder();
     this._snapshot = new Map();
     this._snapshotPosition = this.position;
+    this._snapshotBranch = this._activeBranch;
     for (const [layer, c] of this.kvCache) {
       const bufs: GPUBuffer[] = [c.kPolar, c.kQjl, c.kMaxR, c.kGamma, c.vPolar, c.vQjl, c.vMaxR, c.vGamma];
       const copies: GPUBuffer[] = [];
@@ -1129,6 +1158,12 @@ export class InferenceEngine {
     }
     d.queue.submit([enc.finish()]);
     this.position = this._snapshotPosition!;
+    // Roll activeBranch bookkeeping back to whatever was snapshotted.
+    // Keeps retry-after-mount paths coherent: restoreCache puts the KV
+    // back to router state, and activeBranch now correctly says "router"
+    // (or whatever the snapshot was taken under) so the next mountKV
+    // check is against accurate state.
+    this._activeBranch = this._snapshotBranch;
   }
 
   private _snapshot: Map<number, { bufs: GPUBuffer[]; length: number }> | null = null;
@@ -1343,6 +1378,62 @@ export class InferenceEngine {
   }
 
   // ===========================================================================
+  // Multi-branch KV: mount a pre-baked branch as the active system cache
+  // ===========================================================================
+  //
+  // v1 flat mount: a branch IS the system cache. mountKV(name) wipes any
+  // tokens past the previous system cache and replaces the system KV with
+  // the named branch's pre-baked KV. After mount, engine.position equals
+  // the branch's token count — caller is responsible for re-prefilling the
+  // user's turn + any seed tokens they want the model to see before
+  // resuming decode.
+  //
+  // Why no "splice onto the end of router" in v1: a branch's K was RoPE-
+  // encoded for positions [0, branch_len). Mounting it at position P > 0
+  // would make those K vectors point at the wrong positional phase, so
+  // attention would be wrong. v2 adds a re-RoPE pass (#102) that enables
+  // arbitrary-position mount and nested sub-shells.
+
+  private branches = new Map<string, { blob: ArrayBuffer; tokenIds: number[] }>();
+  private _activeBranch: string | null = null;
+
+  /** Get the name of the branch currently mounted as the system cache,
+   *  or null if no branch has been mounted (e.g. plain loadCache path). */
+  get activeBranch(): string | null { return this._activeBranch; }
+
+  /** Make a branch mountable later. Call once per branch at worker init,
+   *  after parsing the multi-branch system-cache container. Stores the
+   *  blob + tokens in CPU memory; does NOT touch the GPU until mountKV()
+   *  is called. */
+  registerBranch(name: string, blob: ArrayBuffer, tokenIds: number[]): void {
+    this.branches.set(name, { blob, tokenIds });
+  }
+
+  /** Mount the named branch as the active system cache. Equivalent to
+   *  loadCache(branch.blob, branch.tokenIds) plus bookkeeping. Throws if
+   *  the branch is not registered.
+   *
+   *  Side-effects:
+   *    - All GPU KV cache buffers are overwritten with the branch's bytes
+   *    - engine.position is set to the branch's token count
+   *    - engine.activeBranch is set to `name`
+   *    - snapshot state (if any) is invalidated — caller should re-snapshot
+   *      if they want restoreCache() to return to the new branch */
+  mountKV(name: string): void {
+    const entry = this.branches.get(name);
+    if (!entry) {
+      const available = [...this.branches.keys()].join(", ") || "(none registered)";
+      throw new Error(`mountKV: unknown branch "${name}". Registered: ${available}`);
+    }
+    this.loadCache(entry.blob, entry.tokenIds);
+    this._activeBranch = name;
+  }
+
+  /** List registered branch names (in insertion order). Useful for
+   *  diagnostics and for the worker's "which branches did we load?" log. */
+  get registeredBranches(): string[] { return [...this.branches.keys()]; }
+
+  // ===========================================================================
   // Run one decoder layer
   // ===========================================================================
 
@@ -1387,63 +1478,93 @@ export class InferenceEngine {
     this.rmsNorm(enc, inputBuf, this.weight(L + "attn_norm.weight"), s.normed, HIDDEN_SIZE);
     if (dumpL0) this.dumpForDebug(enc, s.normed, HIDDEN_SIZE, "attn_norm-0");
 
-    // 2. Q/K/V projections — merged into single pass (independent: all read normed)
+    // 2. Q/K/V projections. Shared-KV layers (15..34 in Gemma 4 E2B)
+    //    discard their K/V outputs — the cache was populated by the source
+    //    layer (13/14) and step 5 below guards tq_encode with `reuseLayer
+    //    < 0`. Skip the K and V matmuls here too. Each is ~1/4 of Q's
+    //    compute (kvSize=512 vs qSize=2048); saving 40 of them per step
+    //    (20 shared layers × 2 projections) takes a measurable slice out
+    //    of the matmul budget.
     const vTensor = this.model.tensors.get(L + "attn_v.weight")!;
-    this.multiDispatch(enc, "matmul", [
-      this.matmulOp(this.weight(L + "attn_q.weight"), s.normed, s.q, qSize, HIDDEN_SIZE),
-      this.matmulOp(this.weight(L + "attn_k.weight"), s.normed, s.k, kvSize, HIDDEN_SIZE),
-      this.matmulOp(vTensor.gpuBuffer!, s.normed, s.v, kvSize, HIDDEN_SIZE, vTensor.type === GGML_Q6_K),
-    ]);
+    if (reuseLayer < 0) {
+      this.multiDispatch(enc, "matmul", [
+        this.matmulOp(this.weight(L + "attn_q.weight"), s.normed, s.q, qSize, HIDDEN_SIZE),
+        this.matmulOp(this.weight(L + "attn_k.weight"), s.normed, s.k, kvSize, HIDDEN_SIZE),
+        this.matmulOp(vTensor.gpuBuffer!, s.normed, s.v, kvSize, HIDDEN_SIZE, vTensor.type === GGML_Q6_K),
+      ]);
+    } else {
+      this.matmul(enc, this.weight(L + "attn_q.weight"), s.normed, s.q, qSize, HIDDEN_SIZE);
+    }
     if (dumpL0) {
       this.dumpForDebug(enc, s.q, qSize, "Qcur-0");
-      this.dumpForDebug(enc, s.k, kvSize, "Kcur-0");
-      this.dumpForDebug(enc, s.v, kvSize, "Vcur-0");
+      if (reuseLayer < 0) {
+        this.dumpForDebug(enc, s.k, kvSize, "Kcur-0");
+        this.dumpForDebug(enc, s.v, kvSize, "Vcur-0");
+      }
     }
 
-    // 3. QK-norm + V-norm — merged (all three independent)
-    //    Gemma 4 normalizes V with unweighted RMS (ggml_rms_norm without weight),
-    //    so we pass a buffer of ones as the "weight".
+    // 3. QK-norm + V-norm. Shared-KV layers skip K-norm and V-norm.
+    //    Gemma 4 normalizes V with unweighted RMS (ggml_rms_norm without
+    //    weight), so we pass a buffer of ones as the "weight".
     {
       const normP = new ArrayBuffer(16);
       new Uint32Array(normP)[0] = dim;
       new Float32Array(normP)[1] = RMS_NORM_EPS;
-      this.multiDispatch(enc, "norm", [
-        { pl: this.pipelines.rmsNorm, wgX: NUM_HEADS, entries: [
+      if (reuseLayer < 0) {
+        this.multiDispatch(enc, "norm", [
+          { pl: this.pipelines.rmsNorm, wgX: NUM_HEADS, entries: [
+            this.u16(new Uint32Array(normP)),
+            { binding: 1, resource: { buffer: s.q } }, { binding: 2, resource: { buffer: this.weight(L + "attn_q_norm.weight") } },
+            { binding: 3, resource: { buffer: s.qNormed } },
+          ]},
+          { pl: this.pipelines.rmsNorm, wgX: NUM_KV_HEADS, entries: [
+            this.u16(new Uint32Array(normP)),
+            { binding: 1, resource: { buffer: s.k } }, { binding: 2, resource: { buffer: this.weight(L + "attn_k_norm.weight") } },
+            { binding: 3, resource: { buffer: s.kNormed } },
+          ]},
+          { pl: this.pipelines.rmsNorm, wgX: NUM_KV_HEADS, entries: [
+            this.u16(new Uint32Array(normP)),
+            { binding: 1, resource: { buffer: s.v } }, { binding: 2, resource: { buffer: s.onesWeight } },
+            { binding: 3, resource: { buffer: s.vNormed } },
+          ]},
+        ]);
+      } else {
+        this.dispatch(enc, this.pipelines.rmsNorm, [
           this.u16(new Uint32Array(normP)),
           { binding: 1, resource: { buffer: s.q } }, { binding: 2, resource: { buffer: this.weight(L + "attn_q_norm.weight") } },
           { binding: 3, resource: { buffer: s.qNormed } },
-        ]},
-        { pl: this.pipelines.rmsNorm, wgX: NUM_KV_HEADS, entries: [
-          this.u16(new Uint32Array(normP)),
-          { binding: 1, resource: { buffer: s.k } }, { binding: 2, resource: { buffer: this.weight(L + "attn_k_norm.weight") } },
-          { binding: 3, resource: { buffer: s.kNormed } },
-        ]},
-        { pl: this.pipelines.rmsNorm, wgX: NUM_KV_HEADS, entries: [
-          this.u16(new Uint32Array(normP)),
-          { binding: 1, resource: { buffer: s.v } }, { binding: 2, resource: { buffer: s.onesWeight } },
-          { binding: 3, resource: { buffer: s.vNormed } },
-        ]},
-      ]);
+        ], NUM_HEADS);
+      }
     }
     if (dumpL0) {
       this.dumpForDebug(enc, s.qNormed, qSize, "Qcur_normed-0");
-      this.dumpForDebug(enc, s.kNormed, kvSize, "Kcur_normed-0");
-      this.dumpForDebug(enc, s.vNormed, kvSize, "Vcur_normed-0");
+      if (reuseLayer < 0) {
+        this.dumpForDebug(enc, s.kNormed, kvSize, "Kcur_normed-0");
+        this.dumpForDebug(enc, s.vNormed, kvSize, "Vcur_normed-0");
+      }
     }
 
-    // 4. RoPE Q/K — merged (independent: in-place on qNormed, kNormed)
-    this.multiDispatch(enc, "rope", [
-      { pl: this.pipelines.rope, wgX: Math.ceil(NUM_HEADS * dim / 2 / 256), entries: [
+    // 4. RoPE Q (and K if own-KV). Shared-KV layers skip K RoPE.
+    if (reuseLayer < 0) {
+      this.multiDispatch(enc, "rope", [
+        { pl: this.pipelines.rope, wgX: Math.ceil(NUM_HEADS * dim / 2 / 256), entries: [
+          this.u32(mkRopeParams(NUM_HEADS)),
+          { binding: 1, resource: { buffer: s.qNormed } },
+          { binding: 2, resource: { buffer: ropeFreqsBuf } },
+        ]},
+        { pl: this.pipelines.rope, wgX: Math.ceil(NUM_KV_HEADS * dim / 2 / 256), entries: [
+          this.u32(mkRopeParams(NUM_KV_HEADS)),
+          { binding: 1, resource: { buffer: s.kNormed } },
+          { binding: 2, resource: { buffer: ropeFreqsBuf } },
+        ]},
+      ]);
+    } else {
+      this.dispatch(enc, this.pipelines.rope, [
         this.u32(mkRopeParams(NUM_HEADS)),
         { binding: 1, resource: { buffer: s.qNormed } },
         { binding: 2, resource: { buffer: ropeFreqsBuf } },
-      ]},
-      { pl: this.pipelines.rope, wgX: Math.ceil(NUM_KV_HEADS * dim / 2 / 256), entries: [
-        this.u32(mkRopeParams(NUM_KV_HEADS)),
-        { binding: 1, resource: { buffer: s.kNormed } },
-        { binding: 2, resource: { buffer: ropeFreqsBuf } },
-      ]},
-    ]);
+      ], Math.ceil(NUM_HEADS * dim / 2 / 256));
+    }
     if (dumpL0) {
       this.dumpForDebug(enc, s.qNormed, qSize, "Qcur_pos-0");
       this.dumpForDebug(enc, s.kNormed, kvSize, "Kcur_pos-0");
@@ -1745,13 +1866,17 @@ export class InferenceEngine {
     // 1. Pre-attention norm — nBatch rows of HIDDEN_SIZE.
     this.rmsNorm(enc, inputBuf, this.weight(L + "attn_norm.weight"), s.normed, HIDDEN_SIZE, nBatch);
 
-    // 2. Q/K/V projections — batched matmul (nBatch outputs per call).
+    // 2. Q/K/V projections — batched matmul. Shared-KV layers skip K and V;
+    //    tq_encode guard at step 5 already does this, so matching the skip
+    //    earlier avoids ~40 % of Q/K/V matmul work during prefill too.
     const vTensor = this.model.tensors.get(L + "attn_v.weight")!;
     this.matmulBatched(enc, this.weight(L + "attn_q.weight"), s.normed, s.q, qSize, HIDDEN_SIZE, nBatch, false);
-    this.matmulBatched(enc, this.weight(L + "attn_k.weight"), s.normed, s.k, kvSize, HIDDEN_SIZE, nBatch, false);
-    this.matmulBatched(enc, vTensor.gpuBuffer!, s.normed, s.v, kvSize, HIDDEN_SIZE, nBatch, vTensor.type === GGML_Q6_K);
+    if (reuseLayer < 0) {
+      this.matmulBatched(enc, this.weight(L + "attn_k.weight"), s.normed, s.k, kvSize, HIDDEN_SIZE, nBatch, false);
+      this.matmulBatched(enc, vTensor.gpuBuffer!, s.normed, s.v, kvSize, HIDDEN_SIZE, nBatch, vTensor.type === GGML_Q6_K);
+    }
 
-    // 3. QK-norm + V-norm — nBatch × NUM_HEADS rows for Q, nBatch × NUM_KV_HEADS rows for K/V.
+    // 3. QK-norm + V-norm. Shared-KV layers skip K-norm and V-norm.
     {
       const normP = new ArrayBuffer(16);
       new Uint32Array(normP)[0] = dim;
@@ -1762,21 +1887,23 @@ export class InferenceEngine {
         { binding: 2, resource: { buffer: this.weight(L + "attn_q_norm.weight") } },
         { binding: 3, resource: { buffer: s.qNormed } },
       ], nBatch * NUM_HEADS);
-      this.dispatch(enc, this.pipelines.rmsNorm, [
-        this.u16(new Uint32Array(normP)),
-        { binding: 1, resource: { buffer: s.k } },
-        { binding: 2, resource: { buffer: this.weight(L + "attn_k_norm.weight") } },
-        { binding: 3, resource: { buffer: s.kNormed } },
-      ], nBatch * NUM_KV_HEADS);
-      this.dispatch(enc, this.pipelines.rmsNorm, [
-        this.u16(new Uint32Array(normP)),
-        { binding: 1, resource: { buffer: s.v } },
-        { binding: 2, resource: { buffer: s.onesWeight } },
-        { binding: 3, resource: { buffer: s.vNormed } },
-      ], nBatch * NUM_KV_HEADS);
+      if (reuseLayer < 0) {
+        this.dispatch(enc, this.pipelines.rmsNorm, [
+          this.u16(new Uint32Array(normP)),
+          { binding: 1, resource: { buffer: s.k } },
+          { binding: 2, resource: { buffer: this.weight(L + "attn_k_norm.weight") } },
+          { binding: 3, resource: { buffer: s.kNormed } },
+        ], nBatch * NUM_KV_HEADS);
+        this.dispatch(enc, this.pipelines.rmsNorm, [
+          this.u16(new Uint32Array(normP)),
+          { binding: 1, resource: { buffer: s.v } },
+          { binding: 2, resource: { buffer: s.onesWeight } },
+          { binding: 3, resource: { buffer: s.vNormed } },
+        ], nBatch * NUM_KV_HEADS);
+      }
     }
 
-    // 4. RoPE Q/K — n_batch = nBatch (shader uses position = position_start + batch).
+    // 4. RoPE Q/K — n_batch = nBatch. Shared-KV layers skip K RoPE.
     {
       const mkRopeParamsBatched = (nHeads: number): ArrayBuffer => {
         const buf = new ArrayBuffer(32);
@@ -1795,11 +1922,13 @@ export class InferenceEngine {
         { binding: 1, resource: { buffer: s.qNormed } },
         { binding: 2, resource: { buffer: ropeFreqsBuf } },
       ], Math.ceil(nBatch * NUM_HEADS * dim / 2 / 256));
-      this.dispatch(enc, this.pipelines.rope, [
-        this.u32(mkRopeParamsBatched(NUM_KV_HEADS)),
-        { binding: 1, resource: { buffer: s.kNormed } },
-        { binding: 2, resource: { buffer: ropeFreqsBuf } },
-      ], Math.ceil(nBatch * NUM_KV_HEADS * dim / 2 / 256));
+      if (reuseLayer < 0) {
+        this.dispatch(enc, this.pipelines.rope, [
+          this.u32(mkRopeParamsBatched(NUM_KV_HEADS)),
+          { binding: 1, resource: { buffer: s.kNormed } },
+          { binding: 2, resource: { buffer: ropeFreqsBuf } },
+        ], Math.ceil(nBatch * NUM_KV_HEADS * dim / 2 / 256));
+      }
     }
 
     // 5. TQ-encode K/V — num_vectors = nBatch, write_pos = positionStart.

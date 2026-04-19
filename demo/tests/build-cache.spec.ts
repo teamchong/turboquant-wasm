@@ -1,13 +1,19 @@
 /**
- * Build step: run the engine against the fixed system prompt, dump the
- * resulting KV cache, and save it to `demo/public/system-cache.bin`.
+ * Build step: run the engine against each branch's system prompt, dump the
+ * resulting KV caches, pack them into a multi-branch TQKC container, and
+ * save to `demo/public/system-cache.bin`.
  *
  * Run manually with:
  *   cd demo && npx playwright test tests/build-cache.spec.ts
  *
- * Rerun this whenever the system prompt, model, or TQ polar config changes.
- * The runtime path verifies a hash of the prompt tokens at load time, so a
- * stale cache will be rejected (the worker then falls back to prefill).
+ * Rerun this whenever any branch prompt, the model, or TQ polar config
+ * changes. The runtime path verifies a hash of the prompt tokens at load
+ * time, so a stale cache will be rejected per-branch.
+ *
+ * Branches produced (in order):
+ *   router       — mode-picker preamble
+ *   sequence     — full sequence-mode docs + SDK typedef
+ *   architecture — full arch-mode docs (arch/flowchart/class/ER/swimlane)
  */
 
 import { test, chromium, type BrowserContext, type Page } from "@playwright/test";
@@ -15,6 +21,7 @@ import { resolve, dirname } from "path";
 import { writeFileSync, existsSync, readdirSync, rmSync } from "fs";
 import { execSync } from "child_process";
 import { fileURLToPath } from "url";
+import { packContainer, type BranchEntry } from "../src/draw/system-cache-container";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = resolve(HERE, "..", ".playwright-data");
@@ -23,6 +30,18 @@ const OUTPUT_PATH = resolve(HERE, "..", "public", "system-cache.bin");
 // chosen port so the test can find it regardless of who started vite.
 const DEV_PORT = process.env.PLAYWRIGHT_DEV_PORT ?? "5173";
 const BASE_URL = `http://localhost:${DEV_PORT}`;
+
+const BRANCH_ORDER = [
+  "router",
+  "sequence",
+  "architecture",
+  "flowchart",
+  "state",
+  "orgchart",
+  "er",
+  "class",
+  "swimlane",
+] as const;
 
 /**
  * Chrome's persistent-profile model writes SingletonLock / SingletonCookie /
@@ -62,40 +81,10 @@ function killOwnedBrowsers(dataDir: string): void {
 test.describe.serial("Build system prompt cache", () => {
   test.setTimeout(1_800_000);
   let context: BrowserContext;
-  let page: Page;
 
   test.beforeAll(async () => {
-    test.setTimeout(1_800_000);
     clearStaleSingletons(DATA_DIR);
     context = await chromium.launchPersistentContext(DATA_DIR, { channel: "chrome", args: [] });
-    page = context.pages()[0] || await context.newPage();
-    page.on("console", msg => {
-      const t = msg.text();
-      if (t.startsWith("[draw]") || t.startsWith("[engine]") || t.startsWith("[worker]")) console.log(t);
-    });
-    page.on("pageerror", err => console.log(`[pageerror] ${err.message}`));
-    // ?noCache=1 skips the fetch for an existing system-cache.bin so we build
-    // from scratch (otherwise the worker would just re-load whatever is there).
-    await page.goto(`${BASE_URL}/draw.html?noCache=1`);
-
-    // Heartbeat every 5s so the user watching `bun run build` output can see
-    // that we're waiting on the engine, not hung. Without this, the stretch
-    // between "[engine] Engine ready" and "[worker] prefill 100%" is quiet
-    // enough to feel frozen — triggering Ctrl+C, which leaves orphan
-    // chromes and an empty system-cache.bin.
-    const heartbeatStart = Date.now();
-    const heartbeat = setInterval(() => {
-      const s = Math.floor((Date.now() - heartbeatStart) / 1000);
-      console.log(`[build-cache] waiting for status=Ready... ${s}s elapsed`);
-    }, 5000);
-    try {
-      await page.waitForFunction(
-        () => document.querySelector("#status")?.textContent === "Ready",
-        {}, { timeout: 1_500_000 },
-      );
-    } finally {
-      clearInterval(heartbeat);
-    }
   });
 
   test.afterAll(async () => {
@@ -122,32 +111,86 @@ test.describe.serial("Build system prompt cache", () => {
     clearStaleSingletons(DATA_DIR);
   });
 
-  test("prefill system prompt and dump KV cache", async () => {
-    // Describe-level setTimeout can miss in some Playwright versions — set
-    // the test-body timeout explicitly. Dumping ~150 MB of KV + base64
-    // encoding over the RPC boundary takes 10-30s on M1.
-    test.setTimeout(1_800_000);
-    console.log("[build-cache] dumping KV cache...");
-    const cacheB64 = await page.evaluate(async () => {
-      const engine = (window as any).__engine;
-      // Snapshot is already taken inside the worker's init path right after
-      // the system-prompt prefill completes; dumpSystemCache() reads from the
-      // current in-flight cache (which is empty right after cache.restoreCache)
-      // so we restore first to be explicit about what we're dumping.
-      engine.restoreCache();
-      const buf: ArrayBuffer = await engine.dumpSystemCache();
-      // Return as base64 so we can carry it over the Playwright RPC boundary.
-      let binary = "";
-      const bytes = new Uint8Array(buf);
-      const CHUNK = 0x8000;
-      for (let i = 0; i < bytes.length; i += CHUNK) {
-        binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK)));
-      }
-      return btoa(binary);
-    });
+  // Dump one branch's KV in its own fresh page. Doing this per-page rather
+  // than per-engine-reset avoids bleed-through: model weights stay loaded
+  // across navigations (they live in OPFS + the GGUF cache), but the engine
+  // + its KV cache are rebuilt from scratch each navigation. That's exactly
+  // what we want — each branch gets a clean prefill of JUST its own prompt.
+  async function dumpBranch(branch: string): Promise<Uint8Array> {
+    console.log(`[build-cache] building branch "${branch}"...`);
+    const page = await context.newPage();
+    try {
+      page.on("console", (msg) => {
+        const t = msg.text();
+        if (t.startsWith("[draw]") || t.startsWith("[engine]") || t.startsWith("[worker]")) {
+          console.log(`[${branch}] ${t}`);
+        }
+      });
+      page.on("pageerror", (err) => console.log(`[${branch}] [pageerror] ${err.message}`));
 
-    const bytes = Buffer.from(cacheB64, "base64");
-    writeFileSync(OUTPUT_PATH, bytes);
-    console.log(`[build-cache] wrote ${(bytes.length / 1e6).toFixed(1)} MB → ${OUTPUT_PATH}`);
+      await page.goto(`${BASE_URL}/draw.html?noCache=1&buildBranch=${branch}`);
+
+      const heartbeatStart = Date.now();
+      const heartbeat = setInterval(() => {
+        const s = Math.floor((Date.now() - heartbeatStart) / 1000);
+        console.log(`[build-cache] ${branch}: waiting for status=Ready... ${s}s elapsed`);
+      }, 5000);
+      try {
+        await page.waitForFunction(
+          () => document.querySelector("#status")?.textContent === "Ready",
+          {}, { timeout: 1_500_000 },
+        );
+      } finally {
+        clearInterval(heartbeat);
+      }
+
+      const cacheB64 = await page.evaluate(async () => {
+        const engine = (window as any).__engine;
+        engine.restoreCache();
+        const buf: ArrayBuffer = await engine.dumpSystemCache();
+        let binary = "";
+        const bytes = new Uint8Array(buf);
+        const CHUNK = 0x8000;
+        for (let i = 0; i < bytes.length; i += CHUNK) {
+          binary += String.fromCharCode.apply(null, Array.from(bytes.subarray(i, i + CHUNK)));
+        }
+        return btoa(binary);
+      });
+      return Uint8Array.from(Buffer.from(cacheB64, "base64"));
+    } finally {
+      await page.close().catch(() => { /* ignore */ });
+    }
+  }
+
+  test("prefill each branch and pack into container", async () => {
+    test.setTimeout(1_800_000);
+
+    // The cached blob also records the branch's token count (first u32 after
+    // magic/version). Read it back out so the container index has it without
+    // having to plumb it separately over the page.evaluate RPC.
+    function readTokenCount(blob: Uint8Array): number {
+      const dv = new DataView(blob.buffer, blob.byteOffset, blob.byteLength);
+      const magic = dv.getUint32(0, true);
+      if (magic !== 0x564b5154) throw new Error(`expected TQKV magic, got 0x${magic.toString(16)}`);
+      const version = dv.getUint32(4, true);
+      if (version !== 1) throw new Error(`unsupported TQKV version ${version}`);
+      return dv.getUint32(8, true);
+    }
+
+    const entries: BranchEntry[] = [];
+    for (const branch of BRANCH_ORDER) {
+      const blob = await dumpBranch(branch);
+      const tokenCount = readTokenCount(blob);
+      console.log(`[build-cache] "${branch}": ${tokenCount} tokens, ${(blob.byteLength / 1e6).toFixed(1)} MB`);
+      entries.push({ name: branch, blob, tokenCount });
+    }
+
+    const packed = packContainer(entries);
+    writeFileSync(OUTPUT_PATH, packed);
+    const total = (packed.byteLength / 1e6).toFixed(1);
+    const breakdown = entries
+      .map((e) => `${e.name}=${(e.blob.byteLength / 1e6).toFixed(1)}MB`)
+      .join(", ");
+    console.log(`[build-cache] wrote ${total} MB TQKC container → ${OUTPUT_PATH} (${breakdown})`);
   });
 });
