@@ -4,12 +4,19 @@ import { existsSync, readFileSync, writeFileSync, statSync, readdirSync, rmSync 
 import { createHash } from "crypto";
 import { spawn, execSync } from "child_process";
 
-// Hash the files that determine the system-prompt token stream. If any of
-// these change, the baked system-cache.bin is stale and must be rebuilt.
+// Hash the files that determine the system-prompt token stream across ALL
+// branches. If any of these change, the baked system-cache.bin is stale and
+// must be rebuilt. The per-branch prompt modules under prompts/ each contain
+// one branch's text and must be included so a change to any single branch
+// invalidates the cache.
 function promptSourceHash(root: string): string {
   const srcs = [
     resolve(root, "src/draw/main.ts"),
     resolve(root, "src/draw/drawmode/sdk-types.ts"),
+    resolve(root, "src/draw/prompts/preamble.ts"),
+    resolve(root, "src/draw/prompts/router.ts"),
+    resolve(root, "src/draw/prompts/sequence.ts"),
+    resolve(root, "src/draw/prompts/architecture.ts"),
   ];
   const h = createHash("sha256");
   for (const p of srcs) {

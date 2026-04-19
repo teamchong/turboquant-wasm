@@ -4,6 +4,8 @@
 import { AutoTokenizer } from "@huggingface/transformers";
 import { executeCode } from "./drawmode/executor.js";
 import { SDK_TYPES } from "./drawmode/sdk-types.js";
+import { BRANCHES, type BranchName } from "./prompts/index.js";
+import { parseSystemCache } from "./system-cache-container.js";
 import { loadWasm } from "./drawmode/layout.js";
 import drawmodeWasm from "./drawmode/drawmode-wasm.js";
 import { mountExcalidraw, updateDiagram, resetDiagram, fitToScreen, enterEditMode, exitEditMode, getMode, showThinkingCloud, clearThinkingCloud } from "./excalidraw-viewer.js";
@@ -1024,7 +1026,23 @@ async function main() {
     tokenizer.chat_template = CHAT_TEMPLATE;
     console.log("[draw] tokenizer ready");
 
-    const sysMessages = [{ role: "system", content: SYSTEM_PROMPT }];
+    // ?branch=<name> selects which prompt to prefill. Used by the multi-
+    // branch cache build pipeline (tests/build-cache.spec.ts iterates over
+    // the known branches). For interactive testing you can also force a
+    // specific branch's prompt to be used end-to-end (router/sequence/
+    // architecture) to compare diagram quality per mode.
+    //
+    // Missing / unknown value falls back to the legacy monolithic
+    // SYSTEM_PROMPT — keeps today's users on the same path unchanged.
+    const branchParam = new URLSearchParams(location.search).get("branch");
+    const selectedBranch: BranchName | null =
+      branchParam && (branchParam in BRANCHES) ? (branchParam as BranchName) : null;
+    const sysPromptText = selectedBranch ? BRANCHES[selectedBranch] : SYSTEM_PROMPT;
+    if (selectedBranch) {
+      console.log(`[draw] using branch prompt: "${selectedBranch}" (${sysPromptText.length} chars)`);
+    }
+
+    const sysMessages = [{ role: "system", content: sysPromptText }];
     const sysText = tokenizer.apply_chat_template(sysMessages, { tokenize: false, add_generation_prompt: false });
     const sysEncoded = tokenizer.encode(sysText);
     const systemTokenIds: number[] = Array.from(sysEncoded);
@@ -1133,8 +1151,11 @@ async function main() {
     // tests can start generating immediately.
     const skipSys = new URLSearchParams(location.search).get("skipSysPrompt") === "1";
     // ?noCache=1 forces the worker down the prefill path — used by the build
-    // script to regenerate system-cache.bin from scratch.
-    const skipBuiltCache = new URLSearchParams(location.search).get("noCache") === "1";
+    // script to regenerate system-cache.bin from scratch. Also auto-forced
+    // when ?branch=<name> is present: the cached bin was built for the
+    // legacy SYSTEM_PROMPT, so its hash would mismatch the per-branch
+    // tokens anyway. Skipping the fetch saves the ~70 MB download.
+    const skipBuiltCache = new URLSearchParams(location.search).get("noCache") === "1" || selectedBranch !== null;
     const initSystemTokenIds = skipSys ? [] : systemTokenIds;
     const enableProfile = new URLSearchParams(location.search).get("profile") === "1";
 
@@ -1143,13 +1164,46 @@ async function main() {
     // `no-cache` (not `no-store`) revalidates with the server so HTTP caching
     // still works, but avoids serving a stale 404/empty response from an
     // earlier dev-server run.
+    //
+    // The cache file may be either:
+    //   - TQKV (single-blob, legacy): load as-is (matches selectedBranch=null)
+    //   - TQKC (multi-branch container): extract the matching branch and
+    //     load only that blob
+    //
+    // If the file is TQKC but we're on the legacy monolithic SYSTEM_PROMPT
+    // path (selectedBranch=null), there's no matching branch — skip cache
+    // and let the worker prefill from scratch. This is the one regression
+    // path for v1a: a user on the default path with a fresh TQKC cache
+    // pays the prefill cost once, then stays hot.
     let cacheBlob: ArrayBuffer | null = null;
     if (!skipSys && !skipBuiltCache) {
       try {
         const res = await fetch("./system-cache.bin", { cache: "no-cache" });
         if (res.ok && (res.headers.get("content-type") || "").includes("octet-stream")) {
-          cacheBlob = await res.arrayBuffer();
-          console.log(`[draw] prebuilt cache fetched: ${(cacheBlob.byteLength / 1e6).toFixed(1)} MB`);
+          const fullBuf = await res.arrayBuffer();
+          const magic = new DataView(fullBuf).getUint32(0, true);
+          const TQKV = 0x564b5154;
+          const TQKC = 0x434b5154;
+          if (magic === TQKV) {
+            // Legacy single-blob cache. Use as-is.
+            cacheBlob = fullBuf;
+            console.log(`[draw] prebuilt cache fetched (TQKV): ${(fullBuf.byteLength / 1e6).toFixed(1)} MB`);
+          } else if (magic === TQKC && selectedBranch) {
+            const parsed = parseSystemCache(fullBuf);
+            const entry = parsed.branches.get(selectedBranch);
+            if (entry) {
+              // Copy to an owned ArrayBuffer so postMessage transfer works
+              // (can't transfer a slice of the outer buffer).
+              cacheBlob = entry.blob.slice().buffer as ArrayBuffer;
+              console.log(`[draw] prebuilt cache fetched (TQKC): ${(fullBuf.byteLength / 1e6).toFixed(1)} MB, using branch "${selectedBranch}" (${(entry.blob.byteLength / 1e6).toFixed(1)} MB, ${entry.tokenCount} tokens)`);
+            } else {
+              console.warn(`[draw] TQKC container has no branch "${selectedBranch}" — falling back to prefill`);
+            }
+          } else if (magic === TQKC) {
+            console.log(`[draw] cache is TQKC but no ?branch= specified — falling back to prefill`);
+          } else {
+            console.warn(`[draw] cache has unknown magic 0x${magic.toString(16)} — falling back to prefill`);
+          }
         }
       } catch { /* fall through to prefill */ }
     }
