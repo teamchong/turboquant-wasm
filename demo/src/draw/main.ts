@@ -852,7 +852,14 @@ async function generate() {
         setCode("");
         resetDiagram();
         clearThinkingCloud();
-        modeTracker.reset();
+        // DON'T reset modeTracker: its fire-once semantics are what keep
+        // the second pass from aborting again. The model under the mounted
+        // branch will typically re-emit `setType("sequence")` as its first
+        // code line (the branch's examples show it), and if the tracker
+        // were reset it would re-fire and abort the stream mid-string,
+        // truncating the code (observed: 17ch of `setType("sequence`
+        // before EOS). Keeping the tracker "already fired" makes observe
+        // return false for the rest of the attempt.
         pendingMount = null;
         // Conversation tokens re-prefilled on the mounted branch (the
         // mountBranchAndPrefill worker call does the prefill internally
