@@ -29,32 +29,60 @@ relation values: "inheritance" | "composition" | "aggregation" | "dependency" | 
 
 Do NOT use addBox, addEllipse, addDiamond, addActor, message, addTable, addGroup, or addLane.
 
-UML CLASS example (4 classes, inheritance hierarchy — mirror this structure):
+UML CLASS example — abstract base + 4 subclasses pattern (mirror this
+structure exactly when the prompt asks for a base class with multiple
+subtypes; every class gets its own const + addClass, then one connect
+per inheritance edge at the end):
 setType("class");
-const animal = addClass("Animal", {
+const Shape = addClass("Shape", {
+  attributes: [{ name: "color", type: "string" }],
+  methods: [
+    { name: "area()", type: "number" },
+    { name: "draw()", type: "void" },
+  ],
+});
+const Circle = addClass("Circle", {
+  attributes: [{ name: "radius", type: "number" }],
+  methods: [
+    { name: "area()", type: "number" },
+    { name: "draw()", type: "void" },
+  ],
+});
+const Square = addClass("Square", {
+  attributes: [{ name: "side", type: "number" }],
+  methods: [
+    { name: "area()", type: "number" },
+    { name: "draw()", type: "void" },
+  ],
+});
+const Triangle = addClass("Triangle", {
   attributes: [
-    { name: "name", type: "string" },
-    { name: "age", type: "int" },
+    { name: "base", type: "number" },
+    { name: "height", type: "number" },
   ],
   methods: [
-    { name: "eat()", type: "void" },
-    { name: "sleep()", type: "void" },
+    { name: "area()", type: "number" },
+    { name: "draw()", type: "void" },
   ],
 });
-const dog = addClass("Dog", {
-  attributes: [{ name: "breed", type: "string" }],
-  methods: [{ name: "bark()", type: "void" }],
+const Rectangle = addClass("Rectangle", {
+  attributes: [
+    { name: "width", type: "number" },
+    { name: "height", type: "number" },
+  ],
+  methods: [
+    { name: "area()", type: "number" },
+    { name: "draw()", type: "void" },
+  ],
 });
-const cat = addClass("Cat", {
-  attributes: [{ name: "color", type: "string" }],
-  methods: [{ name: "meow()", type: "void" }],
-});
-const owner = addClass("Owner", {
-  attributes: [{ name: "name", type: "string" }],
-});
-connect(dog, animal, "extends", { relation: "inheritance" });
-connect(cat, animal, "extends", { relation: "inheritance" });
-connect(owner, dog, "owns", { relation: "composition" });
+connect(Circle, Shape, "extends", { relation: "inheritance" });
+connect(Square, Shape, "extends", { relation: "inheritance" });
+connect(Triangle, Shape, "extends", { relation: "inheritance" });
+connect(Rectangle, Shape, "extends", { relation: "inheritance" });
+
+connect arg order is ALWAYS (from, to, label, opts). Not
+(from, label, to, opts). For inheritance edges the child is "from"
+and the parent is "to": connect(Subclass, Base, "extends", { relation: "inheritance" }).
 
 Rules:
 - EVERY addClass call MUST be assigned to a const — on EVERY class, not just the first few. Writing bare "PayPal = addClass(...)" without "const" fails with "PayPal is not defined" at the next connect that references it.

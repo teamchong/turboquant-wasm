@@ -319,6 +319,68 @@ function stripOrphanDeclarations(code: string, orphanLabels: string[]): string {
   return kept.join("\n");
 }
 
+// IDE-style quick fix for the OPPOSITE of orphan nodes: lines that
+// REFERENCE identifiers the model never declared. Small models routinely
+// emit `addGroup("Hardware", [foo, Bar, baz])` where Bar was declared as
+// `const bar = addShape(...)` (case drift) or `connect(x, revenue, ...)`
+// where `revenue` was never an addXxx-returned const at all. Running
+// executeCode on that throws "<name> is not defined" — which kicks the
+// retry loop.
+//
+// We instead pre-strip any line (connect / message / addGroup / addLane)
+// whose positional args reference a bare identifier that doesn't appear
+// on the LHS of a `const <name> = addXxx(...)` line earlier in the code.
+// Other identifiers (string literals, option keys, option values) stay
+// untouched — we only look at bare-word tokens inside the call-args.
+//
+// This is the codemod an IDE applies when it sees "symbol not defined":
+// either rename or delete the offending reference. We delete, because
+// a renamed-but-wrong reference would still compile and land a
+// mis-connected edge.
+function stripUndeclaredReferences(code: string): string {
+  // Declared const names: LHS of any `const|let|var NAME = addXxx(...)`.
+  const declRe = /^\s*(?:const|let|var)\s+(\w+)\s*=\s*add\w+\s*\(/gm;
+  const declared = new Set<string>();
+  let dm: RegExpExecArray | null;
+  while ((dm = declRe.exec(code)) !== null) declared.add(dm[1]);
+  if (declared.size === 0) return code;
+
+  // Identifiers that appear in option-object keys / values across the
+  // SDK — not variable references, so they shouldn't trip the check.
+  // Kept small and conservative; anything else that's a real identifier
+  // reference must have a `const` declaration to not get stripped.
+  const optionIdents = new Set([
+    "row", "col", "color", "icon", "style", "strokeColor",
+    "startArrowhead", "endArrowhead", "labelPosition",
+    "cardinality", "relation", "visibility",
+    "name", "type", "key", "attributes", "methods",
+    "fillStyle", "roughness", "strokeStyle", "strokeWidth",
+    "direction", "theme", "opacity",
+    "true", "false", "null", "undefined",
+  ]);
+
+  const callRe = /^\s*(connect|message|addGroup|addLane)\s*\(([\s\S]*?)\)\s*;?\s*$/;
+  const lines = code.split("\n");
+  const kept: string[] = [];
+  for (const line of lines) {
+    const m = callRe.exec(line);
+    if (!m) { kept.push(line); continue; }
+    // Strip string literals so we only see code tokens.
+    const body = m[2].replace(/"(?:[^"\\]|\\.)*"/g, "");
+    // Bare identifiers in remaining body.
+    const idents = body.match(/\b([a-zA-Z_$][a-zA-Z0-9_$]*)\b/g) ?? [];
+    const missing = idents.filter((id) =>
+      !declared.has(id) && !optionIdents.has(id),
+    );
+    if (missing.length > 0) {
+      console.log(`[draw] strip undeclared (${missing.join(",")}): ${line.trim()}`);
+      continue;
+    }
+    kept.push(line);
+  }
+  return kept.join("\n");
+}
+
 function detectOrphanNodes(elements: any[]): string[] {
   const referenced = new Set<string>();
   for (const el of elements) {
@@ -1092,7 +1154,21 @@ async function generate() {
           code = `${canonical}\n${code}`;
         }
       }
-      setCode(code);
+      // Auto-strip lines that reference undeclared identifiers. Catches
+      // the common small-model failure mode where the model writes
+      // connect(foo, Bar, ...) or addGroup("X", [foo, Baz]) with Bar /
+      // Baz never declared (case drift or hallucinated name). Instead
+      // of throwing "<name> is not defined" and burning a retry, we
+      // just drop the broken line. The rest of the diagram still
+      // renders — usually with one missing edge / group member, which
+      // is a much better UX than "retry 1 of 2".
+      const stripped = stripUndeclaredReferences(code);
+      if (stripped !== code) {
+        code = stripped;
+        setCode(code);
+      } else {
+        setCode(code);
+      }
       if (code.trim().length > bestAttemptCode.trim().length) {
         bestAttemptCode = code;
       }
