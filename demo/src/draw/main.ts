@@ -613,10 +613,50 @@ async function generate() {
       if (visible) showThinkingCloud(stripMarkdown(visible));
       statusEl.textContent = `Thinking... ${tokenCount} tok`;
     };
+    // Branch-phase leading setType suppression. Branch prompts say
+    // "setType has been called" but the model often re-emits setType(...)
+    // as its first code line anyway (the branch's own examples start
+    // with setType). Since the editor was already seeded with the
+    // canonical setType on mount, we drop the duplicate first line —
+    // buffer branch chunks until the first newline, then decide:
+    // - first line is setType(...) → discard, flush rest
+    // - first line is anything else → flush whole buffer
+    // Reset before each attempt + each post-mount run.
+    let suppressLeadingSetType = false;
+    let leadingLineBuffer = "";
+
+    const normalizeBranchChunk = (chunk: string): string => {
+      if (!suppressLeadingSetType) return chunk;
+      leadingLineBuffer += chunk;
+      const nl = leadingLineBuffer.indexOf("\n");
+      if (nl < 0) {
+        // Still within the first line — keep buffering, emit nothing.
+        // Defensive cap: if the branch emits a very long first line
+        // without newline we don't want to swallow the entire response.
+        if (leadingLineBuffer.length > 256) {
+          const out = leadingLineBuffer;
+          leadingLineBuffer = "";
+          suppressLeadingSetType = false;
+          return out;
+        }
+        return "";
+      }
+      const firstLine = leadingLineBuffer.substring(0, nl);
+      const rest = leadingLineBuffer.substring(nl + 1);
+      leadingLineBuffer = "";
+      suppressLeadingSetType = false;
+      if (/^\s*setType\s*\(/.test(firstLine)) {
+        return rest; // drop the duplicate setType line
+      }
+      return firstLine + "\n" + rest;
+    };
+
     const renderCodeToken = (id: number) => {
       tokenCount++;
       updateSpeed();
-      const chunk = tokenizer.decode([id], { skip_special_tokens: true });
+      const raw = tokenizer.decode([id], { skip_special_tokens: true });
+      if (!raw) return;
+      const chunk = normalizeBranchChunk(raw);
       if (!chunk) return;
       generatedCode += chunk;
       appendCode(chunk);
@@ -929,6 +969,14 @@ async function generate() {
         const setTypeHeader = `setType("${mountTarget}");\n`;
         generatedCode = setTypeHeader;
         setCode(setTypeHeader);
+        // Arm the branch-phase leading-setType suppressor: the branch will
+        // typically re-emit setType(...) as its first code line (its
+        // examples all start with it); we drop that duplicate during
+        // streaming so the editor shows exactly one setType header
+        // throughout. Disarmed automatically after the first branch-code
+        // newline.
+        suppressLeadingSetType = true;
+        leadingLineBuffer = "";
         // DON'T reset modeTracker: its fire-once semantics are what keep
         // the second pass from aborting again. The model under the mounted
         // branch may re-emit `setType("sequence")` as its first code line

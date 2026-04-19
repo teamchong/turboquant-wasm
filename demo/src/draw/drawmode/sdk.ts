@@ -2340,6 +2340,12 @@ export class Diagram {
           updated: Date.now(),
           locked: false,
           link: null,
+          // Mark structural so orphan detection skips it. Without this flag
+          // the header-bg rectangle looks like a regular node to
+          // detectOrphanNodes — it has no customData._from/_to references
+          // pointing at its id, so it gets reported as "orphan" every time,
+          // triggering a retry loop on every swimlane diagram.
+          customData: { _group: true },
           seed: randSeed(),
           version: 1,
           versionNonce: randSeed(),
